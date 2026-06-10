@@ -16,9 +16,9 @@ exactly as a human would see it.
 - Sessions that survive disconnects: detach with `C-a d`, reattach with
   `boo attach`.
 - A full-screen session manager: `boo ui` lists sessions in a sidebar
-  with their titles and renders the focused one live next to it. Click
-  to switch, create, kill, or rename sessions; everything also works
-  from the keyboard.
+  with their titles and a live activity dot, and renders the focused
+  one next to it. Click to switch, create, kill, or rename sessions;
+  everything also works from the keyboard.
 - One command per session, named after your current directory by
   default. Sessions are cheap; run one per task.
 - Faithful redraws from libghostty terminal state, including SGR styles,

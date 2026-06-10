@@ -114,8 +114,9 @@ pub const commands = [_]Entry{
         \\usage: boo ui
         \\
         \\Manage sessions in a full-screen interface: a sidebar lists
-        \\every session and the focused session runs in a viewport on
-        \\the right, rendered live from terminal state.
+        \\every session (window title underneath, a green dot while
+        \\output is arriving) and the focused session runs in a
+        \\viewport on the right, rendered live from terminal state.
         \\
         \\mouse:
         \\  click a session     focus it (steals politely, like attach)
@@ -135,6 +136,7 @@ pub const commands = [_]Entry{
         \\  C-a d   quit the UI (sessions keep running)
         \\  C-a l   redraw
         \\  C-a a   send a literal C-a to the application
+        \\  C-a Esc cancel the armed prefix
         \\
         \\Pressing C-a alone lists these bindings in the bottom bar.
         \\

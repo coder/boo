@@ -1078,6 +1078,10 @@ test "ui: sidebar lists sessions and the focused session renders in the viewport
     try ui.waitFor("AA-TYPED-MARK");
     const peeked = try h.waitPeekContains("aa", "AA-TYPED-MARK");
     defer alloc.free(peeked);
+
+    // The session just produced output, so its sidebar row carries
+    // the activity dot.
+    try ui.waitFor("\xe2\x97\x8f");
 }
 
 test "ui: clicking a session in the sidebar focuses it" {
@@ -1115,10 +1119,10 @@ test "ui: create and kill sessions from the ui" {
     defer ui.deinit();
     try ui.waitFor("keep2");
 
-    // C-a c creates a session (named after the cwd or the creating
-    // pid) and focuses it.
-    try ui.send("\x01c");
-    try ui.waitFor("3 sessions");
+    // Clicking '+ new session' (the top sidebar row) creates a
+    // session (named after the cwd or the creating pid) and focuses
+    // it.
+    try ui.send("\x1b[<0;5;1M\x1b[<0;5;1m");
     try waitUiSessionCount(&h, 3);
 
     // C-a k asks for confirmation, then kills the focused (new)
@@ -1126,7 +1130,6 @@ test "ui: create and kill sessions from the ui" {
     try ui.send("\x01k");
     try ui.waitFor("? y/n");
     try ui.send("y");
-    try ui.waitFor("2 sessions");
     try waitUiSessionCount(&h, 2);
 
     // The pre-existing sessions survived.
@@ -1250,13 +1253,18 @@ test "ui: the status bar reveals keybinds and C-a r renames" {
     try ui.waitFor("oldname");
     try ui.waitFor("Press Ctrl+A for keybinds");
 
-    // Arming the prefix swaps the hint for the keybind list.
+    // Arming the prefix swaps the hint for the keybind list; Esc
+    // backs out and the hint returns.
     try ui.send("\x01");
     try ui.waitFor("r rename");
+    try ui.waitFor("esc cancel");
+    ui.clearOutput();
+    try ui.send("\x1b");
+    try ui.waitFor("Press Ctrl+A for keybinds");
 
     // C-a r opens the prompt pre-filled with the old name; erase it
     // and type a new one.
-    try ui.send("r");
+    try ui.send("\x01r");
     try ui.waitFor("rename oldname:");
     try ui.send("\x7f\x7f\x7f\x7f\x7f\x7f\x7f");
     try ui.send("fresh\r");

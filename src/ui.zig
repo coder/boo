@@ -34,6 +34,9 @@ const log = std.log.scoped(.ui);
 
 /// Refresh cadence for the sidebar's session list.
 const refresh_interval_ms: i64 = 1000;
+/// A session shows its activity dot while output landed within this
+/// window (matches the settle threshold of 'boo wait --idle').
+const active_threshold_ms: i64 = 2000;
 /// Transient status messages stay visible this long.
 const message_ttl_ms: i64 = 4000;
 /// Render coalescing: at most one repaint per interval while output
@@ -77,10 +80,10 @@ pub const Layout = struct {
         return self.sidebar_w + 1;
     }
 
-    /// Sidebar rows available for session entries between the header
-    /// and the new-session row.
+    /// Sidebar rows available for session entries between the
+    /// new-session row and the status bar.
     pub fn listRows(self: Layout) u16 {
-        return self.rows -| 3;
+        return self.rows -| 2;
     }
 
     /// Whole session entries that fit in the list area.
@@ -89,7 +92,6 @@ pub const Layout = struct {
     }
 
     pub const Hit = union(enum) {
-        header,
         /// Display row within the visible session list (entry_rows
         /// rows per session; scroll applied by the caller).
         session: struct { row: u16, kill: bool },
@@ -108,8 +110,7 @@ pub const Layout = struct {
             return .{ .viewport = .{ .x = x - self.viewportX(), .y = y } };
         }
         if (x >= self.sidebar_w) return .none; // separator column
-        if (y == 0) return .header;
-        if (y == self.rows -| 2) return .new_button;
+        if (y == 0) return .new_button;
         return .{ .session = .{
             .row = y - 1,
             .kill = self.sidebar_w >= 12 and x == self.sidebar_w - 2,
@@ -192,7 +193,11 @@ pub const InputParser = struct {
                 self.pending_prefix = false;
                 i += 1;
                 start = i;
-                try handler.event(.{ .prefix = byte });
+                // Esc backs out of the armed prefix; the byte is
+                // consumed without becoming a command.
+                if (byte != 0x1b) {
+                    try handler.event(.{ .prefix = byte });
+                }
                 continue;
             }
 
@@ -478,6 +483,9 @@ pub const Entry = struct {
     name: []u8,
     attached: bool,
     idle_ms: i64,
+    /// Output landed within the activity window: the session is
+    /// doing something right now.
+    active: bool,
     /// Owned by the list; sanitized to printable ASCII.
     title: []u8,
 };
@@ -490,21 +498,14 @@ fn freeEntries(alloc: std.mem.Allocator, entries: *std.ArrayList(Entry)) void {
     entries.deinit(alloc);
 }
 
-/// Short fixed-width ages for the sidebar: 3s, 12m, 99h.
-pub fn fmtAge(buf: []u8, ms: i64) []const u8 {
-    const s = @divTrunc(@max(0, ms), std.time.ms_per_s);
-    if (s < 60) return std.fmt.bufPrint(buf, "{d}s", .{s}) catch "?";
-    if (s < 3600) return std.fmt.bufPrint(buf, "{d}m", .{@divTrunc(s, 60)}) catch "?";
-    const h = @min(99, @divTrunc(s, 3600));
-    return std.fmt.bufPrint(buf, "{d}h", .{h}) catch "?";
-}
-
 // -- Sidebar rendering --------------------------------------------------------
 
 const sgr_reset = "\x1b[0m";
-const style_header = "\x1b[1m";
 const style_selected = "\x1b[7m";
 const style_dim = "\x1b[2m";
+/// The activity dot: green, then back to the default foreground so
+/// the row's dim/inverse state is preserved.
+const active_dot = "\x1b[32m\u{25cf}\x1b[39m";
 
 /// Append `text` clipped to `width` columns, then pad with spaces to
 /// exactly `width`. Only printable ASCII reaches the writer, so byte
@@ -524,10 +525,10 @@ fn appendClipped(
     while (used < width) : (used += 1) try out.append(alloc, ' ');
 }
 
-/// One sidebar session name row: attached marker, name, age, and a
-/// kill target in the last column. Exactly `width` display columns
-/// plus SGR codes; the inverse-video highlight alone marks the
-/// selected session.
+/// One sidebar session name row: attached marker, name, an activity
+/// dot while the session is producing output, and a kill target in
+/// the last column. Exactly `width` display columns plus SGR codes;
+/// the inverse-video highlight alone marks the selected session.
 pub fn appendSessionRow(
     alloc: std.mem.Allocator,
     out: *std.ArrayList(u8),
@@ -538,27 +539,25 @@ pub fn appendSessionRow(
     if (width == 0) return;
     if (selected) try out.appendSlice(alloc, style_selected);
 
-    var scratch: std.ArrayList(u8) = .empty;
-    defer scratch.deinit(alloc);
-
     // '*': attached by another client. The selected session is
     // attached by this UI itself, which is not worth a marker.
     const marker: u8 = if (!selected and entry.attached) '*' else ' ';
-    try scratch.append(alloc, marker);
+    try out.append(alloc, marker);
 
     if (width >= 12) {
-        // "<m><name...> <age> x": age right-aligned, kill target last.
-        var age_buf: [8]u8 = undefined;
-        const age = fmtAge(&age_buf, entry.idle_ms);
-        const name_w = width - 2 - age.len - 2 - 1;
-        try appendClipped(alloc, &scratch, entry.name, name_w);
-        try scratch.append(alloc, ' ');
-        try scratch.appendSlice(alloc, age);
-        try scratch.appendSlice(alloc, " x ");
+        // "<m><name...> <dot> x ": activity dot, kill target last.
+        const name_w = width - 1 - 1 - 1 - 3;
+        try appendClipped(alloc, out, entry.name, name_w);
+        try out.append(alloc, ' ');
+        if (entry.active) {
+            try out.appendSlice(alloc, active_dot);
+        } else {
+            try out.append(alloc, ' ');
+        }
+        try out.appendSlice(alloc, " x ");
     } else {
-        try appendClipped(alloc, &scratch, entry.name, width - 1);
+        try appendClipped(alloc, out, entry.name, width - 1);
     }
-    try out.appendSlice(alloc, scratch.items[0..@min(scratch.items.len, width)]);
     try out.appendSlice(alloc, sgr_reset);
 }
 
@@ -1167,6 +1166,7 @@ const Ui = struct {
                 .name = try self.alloc.dupe(u8, name),
                 .attached = info.attached,
                 .idle_ms = info.idle_ms,
+                .active = info.out_idle_ms < active_threshold_ms,
                 .title = try self.alloc.dupe(u8, info.title),
             });
         }
@@ -1592,7 +1592,7 @@ const Ui = struct {
     }
 
     const keybind_bar =
-        " C-a +  c new  k kill  r rename  n/p switch  d quit  C-a last  a literal  l redraw";
+        " C-a +  c new  k kill  r rename  n/p switch  d quit  C-a last  a literal  l redraw  esc cancel";
 
     /// The full-width bar on the last screen row: rename prompt, kill
     /// confirmation, the keybind list while the prefix is armed, a
@@ -1635,19 +1635,6 @@ const Ui = struct {
         const w = l.sidebar_w;
 
         if (y == 0) {
-            try out.appendSlice(alloc, style_header);
-            var text: std.ArrayList(u8) = .empty;
-            defer text.deinit(alloc);
-            try text.print(alloc, " boo  {d} session{s}", .{
-                self.sessions.items.len,
-                if (self.sessions.items.len == 1) "" else "s",
-            });
-            try appendClipped(alloc, out, text.items, w);
-            try out.appendSlice(alloc, sgr_reset);
-            return;
-        }
-
-        if (y == l.rows -| 2) {
             try out.appendSlice(alloc, style_dim);
             try appendClipped(alloc, out, " + new session", w);
             try out.appendSlice(alloc, sgr_reset);
@@ -1805,6 +1792,20 @@ test "parser: prefix split across feeds" {
     try std.testing.expectEqual(InputEvent{ .prefix = 'k' }, h.events.items[0]);
 }
 
+test "parser: esc backs out of an armed prefix" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    try p.feed("\x01\x1b", &h);
+    try std.testing.expectEqual(@as(usize, 0), h.events.items.len);
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+    try std.testing.expect(!p.pending_prefix);
+    // The prefix is disarmed: the next byte is plain input again.
+    try p.feed("x", &h);
+    try std.testing.expectEqualStrings("x", h.forwarded.items);
+    try std.testing.expectEqual(@as(usize, 0), h.events.items.len);
+}
+
 test "parser: sgr mouse press and release" {
     var h: TestHandler = .{ .alloc = std.testing.allocator };
     defer h.deinit();
@@ -1869,12 +1870,13 @@ test "layout: geometry and hit testing" {
     try std.testing.expectEqual(@as(u16, 75), l.viewportCols());
     try std.testing.expectEqual(@as(u16, 25), l.viewportX());
     try std.testing.expectEqual(@as(u16, 23), l.viewportRows());
+    try std.testing.expectEqual(@as(usize, 11), l.visibleEntries());
 
-    try std.testing.expectEqual(Layout.Hit.header, l.hit(3, 0));
-    // The status bar spans the full width of the last row.
+    // The new-session button is the top row; the status bar spans
+    // the full width of the last row.
+    try std.testing.expectEqual(Layout.Hit.new_button, l.hit(3, 0));
     try std.testing.expectEqual(Layout.Hit.status, l.hit(3, 23));
     try std.testing.expectEqual(Layout.Hit.status, l.hit(80, 23));
-    try std.testing.expectEqual(Layout.Hit.new_button, l.hit(3, 22));
     try std.testing.expectEqual(Layout.Hit.none, l.hit(24, 5)); // separator
 
     // Sessions take two display rows: name, then title.
@@ -1897,14 +1899,6 @@ test "layout: narrow terminals shrink the sidebar" {
     try std.testing.expect(l.viewportCols() > 0);
 }
 
-test "fmtAge" {
-    var buf: [8]u8 = undefined;
-    try std.testing.expectEqualStrings("0s", fmtAge(&buf, 1));
-    try std.testing.expectEqualStrings("59s", fmtAge(&buf, 59_999));
-    try std.testing.expectEqualStrings("3m", fmtAge(&buf, 3 * 60_000));
-    try std.testing.expectEqualStrings("99h", fmtAge(&buf, 1000 * 3_600_000));
-}
-
 test "sidebar session row is exactly the requested width" {
     const alloc = std.testing.allocator;
     var out: std.ArrayList(u8) = .empty;
@@ -1916,16 +1910,23 @@ test "sidebar session row is exactly the requested width" {
         .name = &name_buf,
         .attached = false,
         .idle_ms = 12_000,
+        .active = false,
         .title = &title_buf,
     };
 
+    // An idle row is pure ASCII: exactly `width` columns and bytes.
     try appendSessionRow(alloc, &out, entry, 24, false);
-    // Strip SGR wrapping: not selected, so only the trailing reset.
     const text = out.items[0 .. out.items.len - sgr_reset.len];
     try std.testing.expectEqual(@as(usize, 24), text.len);
     try std.testing.expect(std.mem.indexOf(u8, text, "work1234") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "12s") != null);
     try std.testing.expect(std.mem.endsWith(u8, text, "x "));
+
+    // An active session carries the green activity dot.
+    var live = entry;
+    live.active = true;
+    out.clearRetainingCapacity();
+    try appendSessionRow(alloc, &out, live, 24, false);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, active_dot) != null);
 
     // Selected rows are wrapped in inverse video; the highlight is
     // the only selection marker.
@@ -1946,6 +1947,7 @@ test "sidebar title row renders the title dim under the name" {
         .name = &name_buf,
         .attached = false,
         .idle_ms = 0,
+        .active = false,
         .title = &title_buf,
     };
 
