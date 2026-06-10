@@ -147,7 +147,7 @@ const Harness = struct {
 
     /// Type text into the session, followed by Enter.
     fn sendLine(self: *Harness, session: []const u8, text: []const u8) !void {
-        try self.runOk(&.{ "send", "-s", session, text, "--enter" });
+        try self.runOk(&.{ "send", session, "--text", text, "--enter" });
     }
 
     /// Poll the session's screen contents until `needle` shows up.
@@ -759,7 +759,7 @@ test "help: overview, command pages, topics, and version" {
     defer alloc.free(overview.stderr);
     try std.testing.expect(overview.term.Exited == 0);
     try std.testing.expect(std.mem.indexOf(u8, overview.stdout, "commands:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, overview.stdout, "exorcise") != null);
+    try std.testing.expect(std.mem.indexOf(u8, overview.stdout, "kill") != null);
 
     const send_page = try h.run(&.{ "help", "send" });
     defer alloc.free(send_page.stdout);
@@ -845,13 +845,13 @@ test "send --key presses named keys" {
     try h.startDetached("keys", &.{"cat"});
     // Type a line without Enter, then press Enter by name; cat only
     // echoes the line back once the key arrives.
-    try h.runOk(&.{ "send", "-s", "keys", "key-mark" });
-    try h.runOk(&.{ "send", "-s", "keys", "--key", "Enter" });
+    try h.runOk(&.{ "send", "keys", "--text", "key-mark" });
+    try h.runOk(&.{ "send", "keys", "--key", "Enter" });
     const content = try h.waitPeekContains("keys", "key-mark");
     defer alloc.free(content);
 }
 
-test "wait --for and --idle observe session output" {
+test "wait --text and --idle observe session output" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
     defer h.deinit();
@@ -859,14 +859,16 @@ test "wait --for and --idle observe session output" {
     try h.startDetached("w1", &.{"cat"});
     try h.sendLine("w1", "wait-mark");
 
-    // --for: returns once the text is on screen.
-    try h.runOk(&.{ "wait", "w1", "--for", "wait-mark", "--timeout", "10s" });
+    // --text: returns once the text is on screen. The =value flag
+    // spelling is accepted too.
+    try h.runOk(&.{ "wait", "w1", "--text=wait-mark", "--timeout", "10s" });
 
-    // --idle: cat produces no further output, so this settles quickly.
-    try h.runOk(&.{ "wait", "w1", "--idle", "200ms", "--timeout", "10s" });
+    // --idle: cat produces no further output, so this settles once
+    // the screen has been quiet for the built-in threshold.
+    try h.runOk(&.{ "wait", "w1", "--idle", "--timeout", "10s" });
 
     // Timeout: text that never appears exits with the documented code.
-    try h.runExit(&.{ "wait", "w1", "--for", "NEVER-APPEARS", "--timeout", "300ms" }, 4);
+    try h.runExit(&.{ "wait", "w1", "--text", "NEVER-APPEARS", "--timeout", "300ms" }, 4);
 }
 
 test "zero-arg boo prints the help overview" {
@@ -888,14 +890,14 @@ test "zero-arg boo prints the help overview" {
     try std.testing.expect(std.mem.indexOf(u8, ls.stdout, "No sessions") != null);
 }
 
-test "exorcise banishes every session" {
+test "kill --all banishes every session" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
     defer h.deinit();
 
     try h.startDetached("ghost1", &.{"cat"});
     try h.startDetached("ghost2", &.{"cat"});
-    try h.runOk(&.{"exorcise"});
+    try h.runOk(&.{ "kill", "--all" });
 
     var deadline = Deadline.init(default_timeout_ms);
     while (true) {
@@ -904,7 +906,7 @@ test "exorcise banishes every session" {
         alloc.free(result.stdout);
         alloc.free(result.stderr);
         if (empty) break;
-        try deadline.tick("sessions survived the exorcism");
+        try deadline.tick("sessions survived kill --all");
     }
     try h.runExit(&.{ "peek", "ghost1" }, 3);
 }
@@ -922,14 +924,16 @@ test "exit codes distinguish usage, missing sessions, and ambiguity" {
     try h.runExit(&.{ "attach", "nosuchzz" }, 3);
     try h.runExit(&.{ "kill", "nosuchzz" }, 3);
 
-    // Destructive commands never guess between sessions.
-    try h.runExit(&.{"kill"}, 3);
+    // Session names are required; nothing is guessed.
+    try h.runExit(&.{"kill"}, 2);
+    try h.runExit(&.{"attach"}, 2);
+    try h.runExit(&.{"peek"}, 2);
 
     // Usage errors exit 2.
     try h.runExit(&.{"frobnicate"}, 2);
     try h.runExit(&.{ "wait", "alpha" }, 2);
-    try h.runExit(&.{ "send", "-s", "alpha", "--key", "NoSuchKey" }, 2);
-    try h.runExit(&.{ "send", "-s", "alpha", "text", "--key", "Enter" }, 2);
+    try h.runExit(&.{ "send", "alpha", "--key", "NoSuchKey" }, 2);
+    try h.runExit(&.{ "send", "alpha", "--text", "text", "--key", "Enter" }, 2);
     try h.runExit(&.{ "help", "nosuchtopic" }, 2);
     try h.runExit(&.{ "kill", "--all", "alpha" }, 2);
 }
@@ -988,8 +992,8 @@ test "agent loop: new, send, wait, peek, kill" {
     // The documented automation loop, end to end, with no terminal.
     try h.startDetached("agent", &.{"sh"});
     try h.sendLine("agent", "echo result-$((40+2))");
-    try h.runOk(&.{ "wait", "agent", "--for", "result-42", "--timeout", "10s" });
-    try h.runOk(&.{ "wait", "agent", "--idle", "200ms", "--timeout", "10s" });
+    try h.runOk(&.{ "wait", "agent", "--text", "result-42", "--timeout", "10s" });
+    try h.runOk(&.{ "wait", "agent", "--idle", "--timeout=10s" });
 
     const content = try h.waitPeekContains("agent", "result-42");
     defer alloc.free(content);

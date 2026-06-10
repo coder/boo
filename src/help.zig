@@ -26,13 +26,12 @@ pub const overview =
     \\
     \\commands:
     \\  new [name] [-d] [-- cmd...]  start a session (attach unless -d)
-    \\  attach, at [name]            attach a session (steals politely)
+    \\  attach, at <name>            attach a session (steals politely)
     \\  ls [--json]                  list sessions
-    \\  send [-s name] [text]        type into a session
-    \\  peek [name]                  print the session's screen
-    \\  wait [name]                  block until output matches or settles
-    \\  kill [name | --all]          end a session
-    \\  exorcise                     end every session
+    \\  send <name> [flags]          type into a session
+    \\  peek <name>                  print the session's screen
+    \\  wait <name>                  block until output matches or settles
+    \\  kill <name | --all>          end a session, or all of them
     \\  version                      print the version
     \\  help [command | topic]       this overview, or detailed help
     \\
@@ -44,10 +43,8 @@ pub const overview =
     \\'boo help --all' to print every page at once.
     \\
     \\session selection:
-    \\  Commands taking [name] accept a unique prefix of the session
-    \\  name. With no name, the only session is used, or the most
-    \\  recently active one for read-only commands; commands that
-    \\  destroy state never guess between multiple sessions.
+    \\  Commands taking <name> accept a unique prefix of the session
+    \\  name (e.g. 'boo attach bu' for "build").
     \\
     \\environment:
     \\  BOO_DIR  socket directory
@@ -90,23 +87,22 @@ pub const commands = [_]Entry{
         .name = "attach",
         .alias = "at",
         .body =
-        \\usage: boo attach [name]
-        \\       boo at [name]
+        \\usage: boo attach <name>
+        \\       boo at <name>
         \\
         \\Attach this terminal to a session. The screen, scrollback,
         \\cursor, and title are restored from terminal state. If the
         \\session is attached elsewhere, the other client is detached
         \\(the session is stolen).
         \\
-        \\With no name: the only session, or the most recently active
-        \\one. A unique prefix of a name is accepted.
+        \\A unique prefix of the name is accepted.
         \\
         \\Inside the session, press C-a d to detach. See 'boo help
         \\keys' for all bindings.
         \\
         \\examples:
-        \\  boo attach           grab the most recent session
-        \\  boo at bu            attach "build" by prefix
+        \\  boo attach build     reattach "build"
+        \\  boo at bu            the same, by prefix
         \\
         ,
     },
@@ -129,35 +125,34 @@ pub const commands = [_]Entry{
     .{
         .name = "send",
         .body =
-        \\usage: boo send [-s session] [text] [flags]
+        \\usage: boo send <name> [--text <text>] [--key <list>] [flags]
         \\
         \\Type into a session, exactly as if the text had been typed
-        \\at the keyboard. Text is sent literally: no escape
+        \\at the keyboard. --text is sent literally: no escape
         \\processing and no implicit newline, so there is never a
-        \\quoting layer to fight. With no text and no --key, bytes
-        \\are read from stdin (binary safe, NUL excluded).
+        \\quoting layer to fight. With neither --text nor --key,
+        \\bytes are read from stdin (binary safe, NUL excluded).
         \\
         \\flags:
-        \\  -s <session>  target session (default: only/most recent)
-        \\  --enter       append Enter after everything else
-        \\  --key <list>  send named keys, comma separated:
-        \\                Enter, Tab, Escape, Space, Backspace,
-        \\                Up, Down, Left, Right, Home, End, C-a..C-z.
-        \\                Cannot be combined with text; use two calls.
-        \\  --stdin       force reading from stdin
+        \\  --text <text>  the text to type
+        \\  --enter        append Enter after everything else
+        \\  --key <list>   send named keys, comma separated:
+        \\                 Enter, Tab, Escape, Space, Backspace,
+        \\                 Up, Down, Left, Right, Home, End, C-a..C-z.
+        \\                 Cannot be combined with --text; use two calls.
+        \\  --stdin        force reading from stdin
         \\
         \\examples:
-        \\  boo send 'make test' --enter       run a command
-        \\  boo send -s build 'make' --enter   ...in session "build"
-        \\  boo send --key C-c                 interrupt the program
-        \\  printf 'y\n' | boo send -s build   pipe bytes in
+        \\  boo send build --text 'make test' --enter   run a command
+        \\  boo send build --key C-c                    interrupt it
+        \\  printf 'y\n' | boo send build               pipe bytes in
         \\
         ,
     },
     .{
         .name = "peek",
         .body =
-        \\usage: boo peek [name] [--scrollback] [--json]
+        \\usage: boo peek <name> [--scrollback] [--json]
         \\
         \\Print the session's rendered screen: what a human attached
         \\right now would see, reconstructed from terminal state (not
@@ -177,49 +172,38 @@ pub const commands = [_]Entry{
     .{
         .name = "wait",
         .body =
-        \\usage: boo wait [name] (--for <text> | --idle <dur>) [--timeout <dur>]
+        \\usage: boo wait <name> (--text <text> | --idle) [--timeout <dur>]
         \\
         \\Block until something happens in the session, then exit 0.
         \\Replaces sleep-and-poll loops in scripts.
         \\
         \\flags:
-        \\  --for <text>     until the rendered screen contains <text>
+        \\  --text <text>    until the rendered screen contains <text>
         \\                   (plain substring match)
-        \\  --idle <dur>     until the session has produced no output
-        \\                   for <dur>
+        \\  --idle           until the session has produced no output
+        \\                   for 2 seconds
         \\  --timeout <dur>  give up and exit 4 (default: 30s)
         \\
-        \\Durations are an integer with a unit: 500ms, 2s, 1m.
+        \\Durations are an integer with a unit: 500ms, 2s, 1m, 4h
+        \\(or 4hr), 1d. Flags also accept --flag=value.
         \\
         \\examples:
-        \\  boo wait build --for 'PASS' --timeout 2m
-        \\  boo wait build --idle 2s && boo peek build
+        \\  boo wait build --text 'PASS' --timeout 2m
+        \\  boo wait build --idle && boo peek build
         \\
         ,
     },
     .{
         .name = "kill",
         .body =
-        \\usage: boo kill [name | --all]
+        \\usage: boo kill <name | --all>
         \\
         \\End a session: its process receives SIGHUP and the daemon
-        \\exits. With multiple sessions a name is required unless
-        \\--all is given (also available as 'boo exorcise').
+        \\exits. --all ends every session and sweeps stale sockets.
         \\
         \\examples:
         \\  boo kill build
         \\  boo kill --all
-        \\
-        ,
-    },
-    .{
-        .name = "exorcise",
-        .body =
-        \\usage: boo exorcise
-        \\
-        \\Banish every session on this machine. The thorough form of
-        \\'boo kill --all': each session is terminated and stale
-        \\sockets are swept away. No ghost survives.
         \\
         ,
     },
@@ -270,11 +254,11 @@ pub const topics = [_]Entry{
         \\Everything except 'attach' works without a terminal. The
         \\canonical loop:
         \\
-        \\  boo new build -d -- bash           # 1. headless session
-        \\  boo send -s build 'make' --enter   # 2. type into it
-        \\  boo wait build --idle 2s           # 3. let output settle
-        \\  boo peek build --scrollback        # 4. read the screen
-        \\  boo kill build                     # 5. clean up
+        \\  boo new build -d -- bash               # 1. headless session
+        \\  boo send build --text 'make' --enter   # 2. type into it
+        \\  boo wait build --idle                  # 3. let output settle
+        \\  boo peek build --scrollback            # 4. read the screen
+        \\  boo kill build                         # 5. clean up
         \\
         \\reading state:
         \\  peek prints the rendered screen, not a raw byte stream:
@@ -282,8 +266,8 @@ pub const topics = [_]Entry{
         \\  history; --json adds size, cursor, and title.
         \\
         \\waiting (instead of sleep):
-        \\  boo wait <name> --for <text>   screen contains <text>
-        \\  boo wait <name> --idle <dur>   output quiet for <dur>
+        \\  boo wait <name> --text <text>   screen contains <text>
+        \\  boo wait <name> --idle          output quiet for 2 seconds
         \\  boo wait <name> ... --timeout <dur>   exit 4 on timeout
         \\
         \\sending input:
