@@ -6,6 +6,7 @@
 const std = @import("std");
 const posix = std.posix;
 const vt = @import("ghostty-vt");
+const altscreen = @import("altscreen.zig");
 const ptypkg = @import("pty.zig");
 const protocol = @import("protocol.zig");
 
@@ -27,6 +28,10 @@ pub const Window = struct {
     /// Controls whether query responses (DSR, DA, ...) are answered by
     /// the daemon or left to the client's real terminal.
     passthrough: bool = false,
+
+    /// Strips alternate-screen toggles from passthrough output; the
+    /// daemon repaints from terminal state on screen switches instead.
+    alt_filter: altscreen.Filter = .{ .discard_after_switch = true },
 
     term: vt.Terminal,
     stream: Stream,
@@ -181,10 +186,8 @@ pub const Window = struct {
     /// VT bytes that reproduce this window's full terminal state on a
     /// freshly sanitized terminal: contents, styles, cursor, and modes.
     pub fn repaint(self: *Window, alloc: std.mem.Allocator) ![]u8 {
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-
-        try out.writer.writeAll(sanitize_sequence);
+        var raw: std.Io.Writer.Allocating = .init(alloc);
+        defer raw.deinit();
 
         var formatter: vt.formatter.TerminalFormatter = .init(&self.term, .{ .emit = .vt });
         formatter.extra = .{
@@ -198,7 +201,16 @@ pub const Window = struct {
             .keyboard = true,
             .screen = .all,
         };
-        try out.writer.print("{f}", .{formatter});
+        try raw.writer.print("{f}", .{formatter});
+
+        // The formatter re-emits alternate-screen modes when the window
+        // is on the alt screen, but the client canvas always shows the
+        // active screen, so screen toggles must never reach it.
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.writeAll(sanitize_sequence);
+        var filter: altscreen.Filter = .{};
+        _ = try filter.feed(raw.writer.buffered(), &out.writer);
 
         // Tabstop and scrolling-region rehydration is emitted after the
         // screen extras and moves the cursor, so position it last.
@@ -220,17 +232,29 @@ pub const Window = struct {
     }
 };
 
-/// Reset a real terminal to a known state before replaying a window:
-/// leave alternate screens, soft reset, drop reporting modes the
-/// previous window may have enabled, then clear.
-pub const sanitize_sequence = "\x1b[?1049l\x1b[?1047l\x1b[?47l" ++ // exit alt screens
-    "\x1b[!p" ++ // DECSTR soft reset
+/// Resets every piece of terminal state a window's repaint or
+/// passthrough may have changed, without touching the screen choice or
+/// the saved cursor. DECSTR is deliberately avoided: it clears the
+/// cursor position that `1049h` saved, which the client needs intact
+/// for the final `1049l` restore on detach.
+pub const reset_state_sequence =
+    "\x0f\x1b(B" ++ // locking shift and G0 charset to ASCII
+    "\x1b[0m" ++ // SGR reset
+    "\x1b[0 q" ++ // default cursor style
+    "\x1b[?1l\x1b[?5l\x1b[?6l\x1b[?7h" ++ // cursor keys, reverse video, origin, autowrap
+    "\x1b[4l" ++ // insert mode off
+    "\x1b[r\x1b[?69l" ++ // scrolling margins reset
+    "\x1b[?25h" ++ // cursor visible
     "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l" ++ // mouse off
     "\x1b[?2004l" ++ // bracketed paste off
     "\x1b[?1004l" ++ // focus reporting off
     "\x1b[>4;0m" ++ // modifyOtherKeys off
-    "\x1b[=0;1u" ++ // kitty keyboard flags cleared
-    "\x1b[0m\x1b[H\x1b[2J"; // SGR reset, home, clear
+    "\x1b[=0;1u"; // kitty keyboard flags cleared
+
+/// Repaint preamble: reset state, then clear the client canvas. The
+/// canvas is the client terminal's own alternate screen, so no screen
+/// toggles belong here.
+pub const sanitize_sequence = reset_state_sequence ++ "\x1b[H\x1b[2J";
 
 test "window state machine without a child" {
     // Exercise the terminal+stream wiring directly (no PTY): construct

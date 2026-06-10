@@ -302,7 +302,10 @@ pub const Daemon = struct {
                 self.message(conn, "{s}", .{list});
             },
             .redraw => try self.repaintTo(conn),
-            .unknown => |byte| self.message(conn, "unknown key: ^A {c}", .{byte}),
+            .unknown => |byte| if (std.ascii.isPrint(byte))
+                self.message(conn, "unknown key: ^A {c}", .{byte})
+            else
+                self.message(conn, "unknown key: ^A ^{c}", .{byte ^ 0x40}),
         }
     }
 
@@ -421,7 +424,20 @@ pub const Daemon = struct {
         win.feed(buf[0..n]);
         if (win.passthrough) {
             if (self.attachedConn()) |conn| {
-                conn.send(.output, buf[0..n]);
+                // Forward raw bytes, minus alternate-screen toggles:
+                // the client canvas cannot switch screens. When the
+                // window switches, drop the rest of the chunk and
+                // repaint the new active screen from terminal state.
+                var out_buf: [32 * 1024 + 32]u8 = undefined;
+                var writer = std.Io.Writer.fixed(&out_buf);
+                const switched = win.alt_filter.feed(buf[0..n], &writer) catch true;
+                const filtered = writer.buffered();
+                if (filtered.len > 0) conn.send(.output, filtered);
+                if (switched) {
+                    self.repaintTo(conn) catch |err| {
+                        log.warn("repaint after screen switch failed: {}", .{err});
+                    };
+                }
             }
         }
     }
@@ -562,6 +578,9 @@ pub const Daemon = struct {
         const win = self.activeWindow() orelse return;
         const bytes = try win.repaint(self.alloc);
         defer self.alloc.free(bytes);
+        // The repaint covers everything fed so far; resume passthrough
+        // from a clean slate.
+        win.alt_filter.reset();
         conn.send(.output, bytes);
     }
 

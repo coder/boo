@@ -6,17 +6,16 @@ const posix = std.posix;
 
 const protocol = @import("protocol.zig");
 const ptypkg = @import("pty.zig");
+const window = @import("window.zig");
 
 const log = std.log.scoped(.client);
 
-/// Restore a terminal after detaching: undo anything the window's
-/// application may have enabled via passthrough, but do not clear the
-/// screen contents.
-const restore_sequence = "\x1b[?1049l\x1b[?1047l\x1b[?47l" ++
-    "\x1b[!p" ++
-    "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l" ++
-    "\x1b[?2004l\x1b[?1004l\x1b[>4;0m\x1b[=0;1u" ++
-    "\x1b[0m\x1b[?25h";
+/// The attached client renders inside the terminal's own alternate
+/// screen (like screen and tmux), so detaching restores the user's
+/// pre-attach shell view. `1049h` also saves the cursor, which the
+/// final `1049l` restores after undoing any state the session set.
+const enter_sequence = "\x1b[?1049h";
+const restore_sequence = window.reset_state_sequence ++ "\x1b[?1049l";
 
 pub const Outcome = enum { detached, stolen, ended, lost };
 
@@ -70,12 +69,14 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
         .flags = 0,
     }, null);
 
-    // Raw mode.
+    // Raw mode, then move the terminal onto its alternate screen so
+    // the session view never disturbs the user's shell scrollback.
     const saved = try posix.tcgetattr(tty);
     var raw = saved;
     rawMode(&raw);
     try posix.tcsetattr(tty, .FLUSH, raw);
     defer restoreTty(tty, saved);
+    try protocol.writeAll(1, enter_sequence);
 
     // Handshake with our current size.
     const ws = ptypkg.getSize(tty) catch ptypkg.makeWinsize(24, 80);

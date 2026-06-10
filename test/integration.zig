@@ -550,3 +550,103 @@ fn waitFileEquals(alloc: std.mem.Allocator, path: []const u8, expected: []const 
         };
     }
 }
+
+test "attached client renders inside the terminal's alternate screen" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    var client = try PtyClient.spawn(&h, &.{ "-S", "wrap", "cat" }, 24, 80);
+    defer client.deinit();
+    try h.waitSessionUp("wrap");
+
+    try client.send("inside-the-canvas\r");
+    try client.waitFor("inside-the-canvas");
+
+    // The client enters the alternate screen before any session content.
+    const enter = std.mem.indexOf(u8, client.output.items, "\x1b[?1049h") orelse
+        return error.MissingAltScreenEnter;
+    const content = std.mem.indexOf(u8, client.output.items, "inside-the-canvas").?;
+    try std.testing.expect(enter < content);
+
+    try client.send("\x01d"); // C-a d
+    try client.waitFor("detached from wrap");
+    try std.testing.expectEqual(@as(u32, 0), try client.waitExit());
+
+    // Detach leaves the alternate screen, restoring the user's shell
+    // view, before the detach notice is printed.
+    const leave = std.mem.lastIndexOf(u8, client.output.items, "\x1b[?1049l").?;
+    const notice = std.mem.indexOf(u8, client.output.items, "detached from wrap").?;
+    try std.testing.expect(leave < notice);
+}
+
+test "C-a C-d detaches like GNU screen" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    var client = try PtyClient.spawn(&h, &.{ "-S", "ctrld", "cat" }, 24, 80);
+    defer client.deinit();
+    try h.waitSessionUp("ctrld");
+
+    try client.send("\x01\x04"); // C-a C-d
+    try client.waitFor("detached from ctrld");
+    try std.testing.expectEqual(@as(u32, 0), try client.waitExit());
+
+    const result = try h.control("ctrld", &.{"info"});
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Detached") != null);
+}
+
+test "alt screen apps: toggles are filtered and screens repaint from state" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("altapp", &.{"sh"});
+
+    // Put a marker on the primary screen.
+    try h.mustControl("altapp", &.{ "stuff", "echo PRIMARY-MARK\\n" });
+    const hc = try h.waitHardcopyContains("altapp", "PRIMARY-MARK");
+    alloc.free(hc);
+
+    var client = try PtyClient.spawn(&h, &.{ "-r", "altapp" }, 24, 80);
+    defer client.deinit();
+    try client.waitFor("PRIMARY-MARK");
+    client.clearOutput();
+
+    // The app enters the alternate screen. The raw toggle must never
+    // reach the client (its canvas cannot switch screens); the alt
+    // content arrives via a repaint instead. The echoed command line
+    // also contains "ALT-MARK", so wait for the marker to show up
+    // after a repaint's canvas clear specifically.
+    try h.mustControl("altapp", &.{
+        "stuff", "printf '\\\\033[?1049h\\\\033[H\\\\033[2JALT-MARK\\\\n'\\n",
+    });
+    var deadline = Deadline.init(default_timeout_ms);
+    while (true) {
+        if (std.mem.lastIndexOf(u8, client.output.items, "\x1b[H\x1b[2J")) |clear_pos| {
+            if (std.mem.indexOfPos(u8, client.output.items, clear_pos, "ALT-MARK") != null) break;
+        }
+        _ = try client.pump(100);
+        try deadline.tick("alt screen repaint never arrived");
+    }
+    try std.testing.expect(
+        std.mem.indexOf(u8, client.output.items, "\x1b[?1049h") == null,
+    );
+    client.clearOutput();
+
+    // The app leaves the alternate screen: still no raw toggle, and
+    // the primary screen content is repainted from terminal state
+    // rather than left blank.
+    try h.mustControl("altapp", &.{ "stuff", "printf '\\\\033[?1049l'\\n" });
+    try client.waitFor("PRIMARY-MARK");
+    try std.testing.expect(
+        std.mem.indexOf(u8, client.output.items, "\x1b[?1049l") == null,
+    );
+
+    try client.send("\x01d");
+    try client.waitFor("detached from altapp");
+    _ = try client.waitExit();
+}

@@ -1,6 +1,6 @@
 .{
     .name = .ghostscreen,
-    .version = "0.0.2",
+    .version = "0.0.3",
     .fingerprint = 0x7f49a7ee9c9a6c3,
     .minimum_zig_version = "0.15.2",
     .dependencies = .{

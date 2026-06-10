@@ -19,6 +19,11 @@ plain-text hardcopies.
 - Faithful redraws from libghostty terminal state, including SGR styles,
   cursor position, scrolling regions, and terminal modes (alt screen,
   bracketed paste, mouse reporting, kitty keyboard, ...).
+- Screen-style terminal etiquette: the attached client renders inside
+  your terminal's alternate screen, so attaching never disturbs your
+  shell scrollback and detaching restores your pre-attach view.
+  Alternate-screen switches by apps inside a window are tracked in
+  terminal state and repainted, never passed through raw.
 - Scriptable control commands (`-X`), including `stuff` and `hardcopy`.
 - Resize propagation end to end (SIGWINCH -> client -> daemon -> window
   PTY -> application).
@@ -65,16 +70,19 @@ ghostscreen -S work -X hardcopy /tmp/screen.txt # dump screen as text
 
 ### Key bindings (prefix `C-a`)
 
+Bindings follow GNU screen's defaults, including the `C-x` variants
+(`C-a C-d` detaches just like `C-a d`).
+
 | Keys      | Action                              |
 |-----------|-------------------------------------|
-| `C-a c`   | new window                          |
+| `C-a c`, `C-a C-c` | new window                 |
 | `C-a n` / `C-a p` / `C-a <space>` | next / previous window |
 | `C-a 0`..`C-a 9` | select window by number      |
 | `C-a C-a` | toggle to the previously used window |
-| `C-a d`   | detach                              |
-| `C-a k`   | kill the current window             |
-| `C-a w`   | list windows in the message line    |
-| `C-a l`   | redraw                              |
+| `C-a d`, `C-a C-d` | detach                     |
+| `C-a k`, `C-a C-k` | kill the current window    |
+| `C-a w`, `C-a C-w` | list windows in the message line |
+| `C-a l`, `C-a C-l` | redraw                     |
 | `C-a a`   | send a literal `C-a`                |
 
 ### Control commands (`-X`)
