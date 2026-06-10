@@ -71,7 +71,7 @@ boo ls                     # list sessions
 boo attach work            # reattach (steals if attached elsewhere)
 boo at w                   # same: alias + unique-prefix matching
 boo kill work              # end a session
-boo exorcise               # end every session
+boo kill --all             # end every session
 ```
 
 With no name, `boo new` names the session after the current directory,
@@ -102,21 +102,22 @@ natural sandbox for scripts and AI agents driving interactive programs.
 The canonical loop:
 
 ```sh
-boo new build -d -- bash           # 1. headless session
-boo send -s build 'make' --enter   # 2. type into it
-boo wait build --idle 2s           # 3. let output settle
-boo peek build --scrollback        # 4. read the screen
-boo kill build                     # 5. clean up
+boo new build -d -- bash               # 1. headless session
+boo send build --text 'make' --enter   # 2. type into it
+boo wait build --idle                  # 3. let output settle
+boo peek build --scrollback            # 4. read the screen
+boo kill build                         # 5. clean up
 ```
 
 - **Reading state**: `peek` prints the rendered screen reconstructed
   from terminal state, not a raw byte log: ordered, fully redrawn, and
   stable. `--scrollback` includes history; `--json` adds size, cursor,
   and title.
-- **Waiting**: `wait --for <text>` blocks until the screen contains the
-  text; `wait --idle <dur>` until output settles; `--timeout <dur>`
-  exits 4 instead of hanging forever. No more sleep-and-poll loops.
-- **Sending input**: `send` is literal: no escape processing, no
+- **Waiting**: `wait --text <text>` blocks until the screen contains
+  the text; `wait --idle` until output has been quiet for 2 seconds;
+  `--timeout <dur>` exits 4 instead of hanging forever (durations:
+  `500ms`, `2s`, `1m`, `4h`, `1d`). No more sleep-and-poll loops.
+- **Sending input**: `send --text` is literal: no escape processing, no
   implicit newline, no quoting layer to fight. `--enter` submits,
   `--key Enter,C-c,Up` names control keys, and stdin mode is binary
   safe.

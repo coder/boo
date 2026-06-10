@@ -11,7 +11,7 @@ const paths = @import("paths.zig");
 const protocol = @import("protocol.zig");
 const ui = @import("ui.zig");
 
-pub const version = "0.3.0";
+pub const version = "0.4.0";
 
 /// Exit codes, documented in `boo help`.
 const exit_runtime: u8 = 1;
@@ -70,8 +70,7 @@ pub fn main() !void {
     if (eql(cmd, "send")) return cmdSend(alloc, rest);
     if (eql(cmd, "peek")) return cmdPeek(alloc, rest);
     if (eql(cmd, "wait")) return cmdWait(alloc, rest);
-    if (eql(cmd, "kill")) return cmdKill(alloc, rest, "kill");
-    if (eql(cmd, "exorcise")) return cmdKill(alloc, rest, "exorcise");
+    if (eql(cmd, "kill")) return cmdKill(alloc, rest);
     if (eql(cmd, "version") or eql(cmd, "-V") or eql(cmd, "--version")) return cmdVersion(alloc);
     if (eql(cmd, "help") or eql(cmd, "-h") or eql(cmd, "--help")) return cmdHelp(alloc, rest);
     fail(exit_usage, "unknown command '{s}' (run 'boo help')", .{cmd});
@@ -81,20 +80,33 @@ fn isHelpFlag(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help");
 }
 
+/// Match a flag that carries a value, in both spellings: `--flag value`
+/// (consuming the next argument) and `--flag=value`. Returns null when
+/// `args[i]` is some other argument.
+fn flagValue(
+    comptime cmd: []const u8,
+    comptime flag: []const u8,
+    args: []const [:0]const u8,
+    i: *usize,
+) ?[]const u8 {
+    const arg = args[i.*];
+    if (std.mem.eql(u8, arg, flag)) {
+        i.* += 1;
+        if (i.* >= args.len) usageFail(cmd, flag ++ " requires a value", .{});
+        return args[i.*];
+    }
+    if (std.mem.startsWith(u8, arg, flag ++ "=")) {
+        return arg[flag.len + 1 ..];
+    }
+    return null;
+}
+
 fn printHelpPage(name: []const u8) !void {
     const entry = help.find(name) orelse unreachable;
     try stdoutWrite(entry.body);
 }
 
 // -- Session resolution ---------------------------------------------------
-
-/// How to pick a session when no name was given and several exist.
-const Pick = enum {
-    /// Read-only commands fall back to the most recently active session.
-    read,
-    /// Destructive commands never guess.
-    destructive,
-};
 
 fn joinNames(alloc: std.mem.Allocator, names: []const []u8) []const u8 {
     var out: std.ArrayList(u8) = .empty;
@@ -105,13 +117,12 @@ fn joinNames(alloc: std.mem.Allocator, names: []const []u8) []const u8 {
     return out.items;
 }
 
-/// Resolve an optional session name to an owned, existing session name.
+/// Resolve a session name to an owned, existing session name.
 /// Accepts unique prefixes. Exits with code 3 when nothing matches.
 fn resolveSession(
     alloc: std.mem.Allocator,
     dir: []const u8,
-    explicit: ?[]const u8,
-    pick: Pick,
+    want: []const u8,
 ) ![]u8 {
     const sessions = try paths.listSessions(alloc, dir);
     defer {
@@ -119,63 +130,22 @@ fn resolveSession(
         alloc.free(sessions);
     }
 
-    if (explicit) |want| {
-        for (sessions) |s| {
-            if (std.mem.eql(u8, s, want)) return alloc.dupe(u8, s);
-        }
-        var match: ?[]const u8 = null;
-        var count: usize = 0;
-        for (sessions) |s| {
-            if (std.mem.startsWith(u8, s, want)) {
-                match = s;
-                count += 1;
-            }
-        }
-        if (count == 1) return alloc.dupe(u8, match.?);
-        if (count > 1) fail(exit_no_session, "ambiguous session '{s}': matches {s}", .{
-            want, joinNames(alloc, sessions),
-        });
-        fail(exit_no_session, "no session matching '{s}' (run 'boo ls')", .{want});
+    for (sessions) |s| {
+        if (std.mem.eql(u8, s, want)) return alloc.dupe(u8, s);
     }
-
-    if (sessions.len == 0) {
-        fail(exit_no_session, "no sessions (run 'boo' or 'boo new' to start one)", .{});
-    }
-    if (sessions.len == 1) return alloc.dupe(u8, sessions[0]);
-
-    switch (pick) {
-        .destructive => fail(exit_no_session, "multiple sessions; name one of: {s}", .{
-            joinNames(alloc, sessions),
-        }),
-        .read => {
-            if (try pickMostRecent(alloc, dir)) |name| return name;
-            fail(exit_no_session, "no sessions (run 'boo' or 'boo new' to start one)", .{});
-        },
-    }
-}
-
-/// The live session with the smallest idle time. Cleans up stale
-/// sockets along the way. Returns null when no session is alive.
-fn pickMostRecent(alloc: std.mem.Allocator, dir: []const u8) !?[]u8 {
-    const sessions = try paths.listSessions(alloc, dir);
-    defer {
-        for (sessions) |s| alloc.free(s);
-        alloc.free(sessions);
-    }
-
-    var best: ?[]u8 = null;
-    errdefer if (best) |b| alloc.free(b);
-    var best_idle: i64 = std.math.maxInt(i64);
-    for (sessions) |name| {
-        const info = sessionInfo(alloc, dir, name) catch continue orelse continue;
-        defer alloc.free(info.text);
-        if (best == null or info.idle_ms < best_idle) {
-            if (best) |b| alloc.free(b);
-            best = try alloc.dupe(u8, name);
-            best_idle = info.idle_ms;
+    var match: ?[]const u8 = null;
+    var count: usize = 0;
+    for (sessions) |s| {
+        if (std.mem.startsWith(u8, s, want)) {
+            match = s;
+            count += 1;
         }
     }
-    return best;
+    if (count == 1) return alloc.dupe(u8, match.?);
+    if (count > 1) fail(exit_no_session, "ambiguous session '{s}': matches {s}", .{
+        want, joinNames(alloc, sessions),
+    });
+    fail(exit_no_session, "no session matching '{s}' (run 'boo ls')", .{want});
 }
 
 pub const SessionInfo = struct {
@@ -329,10 +299,11 @@ fn cmdAttach(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
         if (name_arg != null) usageFail("attach", "unexpected argument '{s}'", .{arg});
         name_arg = arg;
     }
+    const want = name_arg orelse usageFail("attach", "a session name is required", .{});
 
     const dir = try paths.socketDir(alloc);
     defer alloc.free(dir);
-    const name = try resolveSession(alloc, dir, name_arg, .read);
+    const name = try resolveSession(alloc, dir, want);
     defer alloc.free(name);
     try attachLoop(alloc, dir, name);
 }
@@ -458,7 +429,7 @@ fn cutTab(rest: *[]const u8) ?[]const u8 {
 }
 
 fn cmdSend(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
-    var session: ?[]const u8 = null;
+    var name_arg: ?[]const u8 = null;
     var text: ?[]const u8 = null;
     var keys_arg: ?[]const u8 = null;
     var enter = false;
@@ -468,38 +439,35 @@ fn cmdSend(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (isHelpFlag(arg)) return printHelpPage("send");
-        if (std.mem.eql(u8, arg, "-s")) {
-            i += 1;
-            if (i >= args.len) usageFail("send", "-s requires a session name", .{});
-            session = args[i];
-        } else if (std.mem.eql(u8, arg, "--enter")) {
+        if (std.mem.eql(u8, arg, "--enter")) {
             enter = true;
         } else if (std.mem.eql(u8, arg, "--stdin")) {
             stdin = true;
-        } else if (std.mem.eql(u8, arg, "--key")) {
-            i += 1;
-            if (i >= args.len) usageFail("send", "--key requires a key list", .{});
-            keys_arg = args[i];
+        } else if (flagValue("send", "--text", args, &i)) |v| {
+            text = v;
+        } else if (flagValue("send", "--key", args, &i)) |v| {
+            keys_arg = v;
         } else if (arg.len > 0 and arg[0] == '-') {
             usageFail("send", "unknown flag '{s}'", .{arg});
-        } else if (text == null) {
-            text = arg;
+        } else if (name_arg == null) {
+            name_arg = arg;
         } else {
-            usageFail("send", "multiple text arguments; quote the text", .{});
+            usageFail("send", "unexpected argument '{s}'", .{arg});
         }
     }
 
     if (text != null and keys_arg != null) {
-        usageFail("send", "text and --key cannot be combined; use two calls", .{});
+        usageFail("send", "--text and --key cannot be combined; use two calls", .{});
     }
     if (stdin and (text != null or keys_arg != null)) {
-        usageFail("send", "--stdin cannot be combined with text or --key", .{});
+        usageFail("send", "--stdin cannot be combined with --text or --key", .{});
     }
+    const want = name_arg orelse usageFail("send", "a session name is required", .{});
 
     // Resolve the session before potentially blocking on stdin.
     const dir = try paths.socketDir(alloc);
     defer alloc.free(dir);
-    const name = try resolveSession(alloc, dir, session, .read);
+    const name = try resolveSession(alloc, dir, want);
     defer alloc.free(name);
 
     var payload: std.ArrayList(u8) = .empty;
@@ -629,10 +597,11 @@ fn cmdPeek(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
             usageFail("peek", "unexpected argument '{s}'", .{arg});
         }
     }
+    const want = name_arg orelse usageFail("peek", "a session name is required", .{});
 
     const dir = try paths.socketDir(alloc);
     defer alloc.free(dir);
-    const name = try resolveSession(alloc, dir, name_arg, .read);
+    const name = try resolveSession(alloc, dir, want);
     defer alloc.free(name);
 
     const result = try mustControl(alloc, dir, name, &.{
@@ -670,28 +639,25 @@ fn cmdPeek(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     try stdoutWrite(out.items);
 }
 
+/// How long output must stay quiet for `wait --idle` to fire.
+const idle_settle_ms: i64 = 2000;
+
 fn cmdWait(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     var name_arg: ?[]const u8 = null;
-    var for_text: ?[]const u8 = null;
-    var idle_str: ?[]const u8 = null;
+    var text: ?[]const u8 = null;
+    var idle = false;
     var timeout_str: []const u8 = "30s";
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (isHelpFlag(arg)) return printHelpPage("wait");
-        if (std.mem.eql(u8, arg, "--for")) {
-            i += 1;
-            if (i >= args.len) usageFail("wait", "--for requires text", .{});
-            for_text = args[i];
-        } else if (std.mem.eql(u8, arg, "--idle")) {
-            i += 1;
-            if (i >= args.len) usageFail("wait", "--idle requires a duration", .{});
-            idle_str = args[i];
-        } else if (std.mem.eql(u8, arg, "--timeout")) {
-            i += 1;
-            if (i >= args.len) usageFail("wait", "--timeout requires a duration", .{});
-            timeout_str = args[i];
+        if (std.mem.eql(u8, arg, "--idle")) {
+            idle = true;
+        } else if (flagValue("wait", "--text", args, &i)) |v| {
+            text = v;
+        } else if (flagValue("wait", "--timeout", args, &i)) |v| {
+            timeout_str = v;
         } else if (arg.len > 0 and arg[0] == '-') {
             usageFail("wait", "unknown flag '{s}'", .{arg});
         } else if (name_arg == null) {
@@ -701,25 +667,21 @@ fn cmdWait(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
     }
 
-    if ((for_text == null) == (idle_str == null)) {
-        usageFail("wait", "exactly one of --for or --idle is required", .{});
+    if ((text != null) == idle) {
+        usageFail("wait", "exactly one of --text or --idle is required", .{});
     }
+    const want = name_arg orelse usageFail("wait", "a session name is required", .{});
     const timeout_ms = parseDurationMs(timeout_str) orelse
-        usageFail("wait", "bad duration '{s}' (use 500ms, 2s, 1m)", .{timeout_str});
-    const idle_ms: i64 = if (idle_str) |s|
-        @intCast(parseDurationMs(s) orelse
-            usageFail("wait", "bad duration '{s}' (use 500ms, 2s, 1m)", .{s}))
-    else
-        0;
+        usageFail("wait", "bad duration '{s}' (use 500ms, 2s, 1m, 4h, 1d)", .{timeout_str});
 
     const dir = try paths.socketDir(alloc);
     defer alloc.free(dir);
-    const name = try resolveSession(alloc, dir, name_arg, .read);
+    const name = try resolveSession(alloc, dir, want);
     defer alloc.free(name);
 
     const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
     while (true) {
-        if (for_text) |needle| {
+        if (text) |needle| {
             const result = try mustControl(alloc, dir, name, &.{ "peek", "screen" });
             defer alloc.free(result.text);
             if (!result.ok) fail(exit_runtime, "{s}", .{result.text});
@@ -730,7 +692,7 @@ fn cmdWait(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
             const info = try sessionInfo(alloc, dir, name) orelse
                 fail(exit_no_session, "no session named {s}", .{name});
             defer alloc.free(info.text);
-            if (info.out_idle_ms >= idle_ms) return;
+            if (info.out_idle_ms >= idle_settle_ms) return;
         }
         if (std.time.milliTimestamp() >= deadline) {
             fail(exit_timeout, "wait: timed out after {s}", .{timeout_str});
@@ -739,27 +701,23 @@ fn cmdWait(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     }
 }
 
-fn cmdKill(alloc: std.mem.Allocator, args: []const [:0]const u8, comptime cmd: []const u8) !void {
-    const is_exorcise = comptime std.mem.eql(u8, cmd, "exorcise");
-    var all = is_exorcise;
+fn cmdKill(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
+    var all = false;
     var name_arg: ?[]const u8 = null;
     for (args) |arg| {
-        if (isHelpFlag(arg)) return printHelpPage(cmd);
+        if (isHelpFlag(arg)) return printHelpPage("kill");
         if (std.mem.eql(u8, arg, "--all")) {
-            if (is_exorcise) usageFail(cmd, "unexpected flag '--all'", .{});
             all = true;
         } else if (arg.len > 0 and arg[0] == '-') {
-            usageFail(cmd, "unknown flag '{s}'", .{arg});
-        } else if (is_exorcise or all) {
-            usageFail(cmd, "unexpected argument '{s}'", .{arg});
+            usageFail("kill", "unknown flag '{s}'", .{arg});
         } else if (name_arg == null) {
             name_arg = arg;
         } else {
-            usageFail(cmd, "unexpected argument '{s}'", .{arg});
+            usageFail("kill", "unexpected argument '{s}'", .{arg});
         }
     }
     if (all and name_arg != null) {
-        usageFail(cmd, "--all cannot be combined with a session name", .{});
+        usageFail("kill", "--all cannot be combined with a session name", .{});
     }
 
     const dir = try paths.socketDir(alloc);
@@ -784,7 +742,8 @@ fn cmdKill(alloc: std.mem.Allocator, args: []const [:0]const u8, comptime cmd: [
         return;
     }
 
-    const name = try resolveSession(alloc, dir, name_arg, .destructive);
+    const want = name_arg orelse usageFail("kill", "a session name or --all is required", .{});
+    const name = try resolveSession(alloc, dir, want);
     defer alloc.free(name);
     const result = try mustControl(alloc, dir, name, &.{"quit"});
     defer alloc.free(result.text);
@@ -854,19 +813,24 @@ fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayList(u8), s: []cons
     try out.append(alloc, '"');
 }
 
-/// Parse durations like 500ms, 2s, 1m. Returns milliseconds.
+/// Parse a duration like 500ms, 2s, 1m, 4h (or 4hr), 1d. Returns
+/// milliseconds.
 fn parseDurationMs(s: []const u8) ?u64 {
-    if (std.mem.endsWith(u8, s, "ms")) {
-        const n = std.fmt.parseInt(u64, s[0 .. s.len - 2], 10) catch return null;
-        return n;
-    }
-    if (std.mem.endsWith(u8, s, "s")) {
-        const n = std.fmt.parseInt(u64, s[0 .. s.len - 1], 10) catch return null;
-        return n * std.time.ms_per_s;
-    }
-    if (std.mem.endsWith(u8, s, "m")) {
-        const n = std.fmt.parseInt(u64, s[0 .. s.len - 1], 10) catch return null;
-        return n * std.time.ms_per_min;
+    const Unit = struct { suffix: []const u8, ms: u64 };
+    // "ms" must match before "s", and "hr" before "h".
+    const units = [_]Unit{
+        .{ .suffix = "ms", .ms = 1 },
+        .{ .suffix = "hr", .ms = std.time.ms_per_hour },
+        .{ .suffix = "s", .ms = std.time.ms_per_s },
+        .{ .suffix = "m", .ms = std.time.ms_per_min },
+        .{ .suffix = "h", .ms = std.time.ms_per_hour },
+        .{ .suffix = "d", .ms = std.time.ms_per_day },
+    };
+    for (units) |unit| {
+        if (std.mem.endsWith(u8, s, unit.suffix)) {
+            const n = std.fmt.parseInt(u64, s[0 .. s.len - unit.suffix.len], 10) catch return null;
+            return std.math.mul(u64, n, unit.ms) catch null;
+        }
     }
     return null;
 }
@@ -953,9 +917,13 @@ test "parseDurationMs" {
     try std.testing.expectEqual(@as(?u64, 500), parseDurationMs("500ms"));
     try std.testing.expectEqual(@as(?u64, 2000), parseDurationMs("2s"));
     try std.testing.expectEqual(@as(?u64, 60_000), parseDurationMs("1m"));
+    try std.testing.expectEqual(@as(?u64, 4 * 3_600_000), parseDurationMs("4h"));
+    try std.testing.expectEqual(@as(?u64, 4 * 3_600_000), parseDurationMs("4hr"));
+    try std.testing.expectEqual(@as(?u64, 10 * 86_400_000), parseDurationMs("10d"));
     try std.testing.expectEqual(@as(?u64, null), parseDurationMs("2"));
     try std.testing.expectEqual(@as(?u64, null), parseDurationMs("s"));
-    try std.testing.expectEqual(@as(?u64, null), parseDurationMs("2h"));
+    try std.testing.expectEqual(@as(?u64, null), parseDurationMs("hr"));
+    try std.testing.expectEqual(@as(?u64, null), parseDurationMs("2x"));
 }
 
 test "appendKey named keys" {
