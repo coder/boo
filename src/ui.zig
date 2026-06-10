@@ -34,9 +34,6 @@ const log = std.log.scoped(.ui);
 
 /// Refresh cadence for the sidebar's session list.
 const refresh_interval_ms: i64 = 1000;
-/// A session shows its activity dot while output landed within this
-/// window (matches the settle threshold of 'boo wait --idle').
-const active_threshold_ms: i64 = 2000;
 /// Transient status messages stay visible this long.
 const message_ttl_ms: i64 = 4000;
 /// Render coalescing: at most one repaint per interval while output
@@ -191,13 +188,21 @@ pub const InputParser = struct {
 
             if (self.pending_prefix) {
                 self.pending_prefix = false;
+                if (byte == 0x1b) {
+                    // Esc backs out of the armed prefix. A lone Esc
+                    // is the cancel key and is consumed; when more
+                    // bytes follow immediately it starts a key or
+                    // mouse sequence, which must be reprocessed so
+                    // its tail is not typed into the application.
+                    if (i + 1 == input.len) {
+                        i += 1;
+                    }
+                    start = i;
+                    continue;
+                }
                 i += 1;
                 start = i;
-                // Esc backs out of the armed prefix; the byte is
-                // consumed without becoming a command.
-                if (byte != 0x1b) {
-                    try handler.event(.{ .prefix = byte });
-                }
+                try handler.event(.{ .prefix = byte });
                 continue;
             }
 
@@ -483,9 +488,6 @@ pub const Entry = struct {
     name: []u8,
     attached: bool,
     idle_ms: i64,
-    /// Output landed within the activity window: the session is
-    /// doing something right now.
-    active: bool,
     /// Owned by the list; sanitized to printable ASCII.
     title: []u8,
 };
@@ -503,9 +505,6 @@ fn freeEntries(alloc: std.mem.Allocator, entries: *std.ArrayList(Entry)) void {
 const sgr_reset = "\x1b[0m";
 const style_selected = "\x1b[7m";
 const style_dim = "\x1b[2m";
-/// The activity dot: green, then back to the default foreground so
-/// the row's dim/inverse state is preserved.
-const active_dot = "\x1b[32m\u{25cf}\x1b[39m";
 
 /// Append `text` clipped to `width` columns, then pad with spaces to
 /// exactly `width`. Only printable ASCII reaches the writer, so byte
@@ -525,10 +524,10 @@ fn appendClipped(
     while (used < width) : (used += 1) try out.append(alloc, ' ');
 }
 
-/// One sidebar session name row: attached marker, name, an activity
-/// dot while the session is producing output, and a kill target in
-/// the last column. Exactly `width` display columns plus SGR codes;
-/// the inverse-video highlight alone marks the selected session.
+/// One sidebar session name row: attached marker, name, and a kill
+/// target in the last column. Exactly `width` display columns plus
+/// SGR codes; the inverse-video highlight alone marks the selected
+/// session.
 pub fn appendSessionRow(
     alloc: std.mem.Allocator,
     out: *std.ArrayList(u8),
@@ -545,15 +544,9 @@ pub fn appendSessionRow(
     try out.append(alloc, marker);
 
     if (width >= 12) {
-        // "<m><name...> <dot> x ": activity dot, kill target last.
-        const name_w = width - 1 - 1 - 1 - 3;
+        // "<m><name...> x ": kill target in the last columns.
+        const name_w = width - 1 - 3;
         try appendClipped(alloc, out, entry.name, name_w);
-        try out.append(alloc, ' ');
-        if (entry.active) {
-            try out.appendSlice(alloc, active_dot);
-        } else {
-            try out.append(alloc, ' ');
-        }
         try out.appendSlice(alloc, " x ");
     } else {
         try appendClipped(alloc, out, entry.name, width - 1);
@@ -694,11 +687,20 @@ const Ui = struct {
     mouse_pressed: bool = false,
     mouse_last_cell: ?vt.Coordinate = null,
 
+    /// Viewport text selection in viewport cell coordinates, used
+    /// when the focused application has not requested mouse
+    /// reporting. Anchor is where the drag started; head follows the
+    /// pointer. Both ends are inclusive.
+    select_anchor: ?CellPos = null,
+    select_head: CellPos = .{ .x = 0, .y = 0 },
+
     /// Incremented on every attach; detects view switches that happen
     /// between poll() and the socket read.
     view_gen: u64 = 0,
 
     quitting: bool = false,
+
+    const CellPos = struct { x: u16, y: u16 };
 
     fn deinit(self: *Ui) void {
         if (self.view) |v| v.destroy();
@@ -799,6 +801,9 @@ const Ui = struct {
                 log.warn("viewport resize failed: {}", .{err});
             };
         }
+        // Cell coordinates shift with the layout, so any in-progress
+        // selection no longer points at the text the user dragged over.
+        self.select_anchor = null;
         self.full_render = true;
         self.need_render = true;
     }
@@ -967,6 +972,12 @@ const Ui = struct {
             self.need_render = true;
         }
 
+        // An in-progress viewport selection captures the drag and the
+        // release wherever the pointer wanders.
+        if (self.select_anchor != null and !m.isWheel() and (m.isMotion() or m.release)) {
+            return self.dragSelection(m, x -| self.layout.viewportX(), y);
+        }
+
         if (m.isWheel() and !m.release) {
             switch (self.layout.hit(x, y)) {
                 .viewport => return self.forwardMouse(m),
@@ -986,7 +997,19 @@ const Ui = struct {
         }
 
         switch (self.layout.hit(x, y)) {
-            .viewport => return self.forwardMouse(m),
+            .viewport => |cell| {
+                // Applications that asked for mouse reporting get the
+                // events; otherwise a left press starts a selection.
+                const v = self.liveView() orelse return;
+                if (v.term.flags.mouse_event != .none) return self.forwardMouse(m);
+                if (m.release or m.isMotion() or m.code & 3 != 0) return;
+                self.select_anchor = .{
+                    .x = @min(cell.x, v.term.cols -| 1),
+                    .y = @min(cell.y, v.term.rows -| 1),
+                };
+                self.select_head = self.select_anchor.?;
+                self.need_render = true;
+            },
             .session => |s| {
                 if (m.release or m.isMotion()) return;
                 const idx = self.scroll + s.row / Layout.entry_rows;
@@ -1061,6 +1084,80 @@ const Ui = struct {
         vt.input.encodeMouse(&writer, event, opts) catch return;
         const encoded = writer.buffered();
         if (encoded.len > 0) v.sendInput(encoded) catch self.markViewLost();
+    }
+
+    /// Update an in-progress selection from a drag or release. On
+    /// release the selected text is copied to the clipboard.
+    fn dragSelection(self: *Ui, m: Mouse, x: u16, y: u16) void {
+        const v = self.liveView() orelse {
+            self.select_anchor = null;
+            return;
+        };
+        const head: CellPos = .{
+            .x = @min(x, v.term.cols -| 1),
+            .y = @min(y, v.term.rows -| 1),
+        };
+        if (head.x != self.select_head.x or head.y != self.select_head.y) {
+            self.select_head = head;
+            self.need_render = true;
+        }
+        if (!m.release) return;
+
+        const anchor = self.select_anchor.?;
+        if (anchor.x != self.select_head.x or anchor.y != self.select_head.y) {
+            self.copySelection(v);
+        }
+        self.select_anchor = null;
+        self.need_render = true;
+    }
+
+    /// The selection's inclusive span on viewport row `y`, or null
+    /// when the row is outside the selection.
+    fn selectionSpan(self: *Ui, y: u16, cols: u16) ?struct { x0: u16, x1: u16 } {
+        const anchor = self.select_anchor orelse return null;
+        if (cols == 0) return null;
+        var s = anchor;
+        var e = self.select_head;
+        if (e.y < s.y or (e.y == s.y and e.x < s.x)) std.mem.swap(CellPos, &s, &e);
+        if (y < s.y or y > e.y) return null;
+        const x0: u16 = if (y == s.y) @min(s.x, cols - 1) else 0;
+        const x1: u16 = if (y == e.y) @min(e.x, cols - 1) else cols - 1;
+        if (x0 > x1) return null;
+        return .{ .x0 = x0, .x1 = x1 };
+    }
+
+    /// Copy the selected viewport text to the clipboard via OSC 52,
+    /// which works over SSH and through nested multiplexers.
+    fn copySelection(self: *Ui, v: *View) void {
+        const alloc = self.alloc;
+
+        var s = self.select_anchor.?;
+        var e = self.select_head;
+        if (e.y < s.y or (e.y == s.y and e.x < s.x)) std.mem.swap(CellPos, &s, &e);
+
+        const screen = v.term.screens.active;
+        const start = screen.pages.pin(.{ .active = .{ .x = s.x, .y = s.y } }) orelse return;
+        const end = screen.pages.pin(.{ .active = .{ .x = e.x, .y = e.y } }) orelse return;
+
+        var formatter: vt.formatter.ScreenFormatter = .init(screen, .plain);
+        formatter.content = .{ .selection = vt.Selection.init(start, end, false) };
+
+        var aw: std.Io.Writer.Allocating = .init(alloc);
+        defer aw.deinit();
+        aw.writer.print("{f}", .{formatter}) catch return;
+        const text = aw.writer.buffered();
+        if (text.len == 0) return;
+
+        const encoder = std.base64.standard.Encoder;
+        var seq: std.ArrayList(u8) = .empty;
+        defer seq.deinit(alloc);
+        seq.appendSlice(alloc, "\x1b]52;c;") catch return;
+        const b64 = seq.addManyAsSlice(alloc, encoder.calcSize(text.len)) catch return;
+        _ = encoder.encode(b64, text);
+        seq.appendSlice(alloc, "\x07") catch return;
+        protocol.writeAll(1, seq.items) catch {};
+
+        self.setMessage("copied {d} characters", .{text.len});
     }
 
     fn sgrButton(m: Mouse) ?vt.input.MouseButton {
@@ -1166,7 +1263,6 @@ const Ui = struct {
                 .name = try self.alloc.dupe(u8, name),
                 .attached = info.attached,
                 .idle_ms = info.idle_ms,
-                .active = info.out_idle_ms < active_threshold_ms,
                 .title = try self.alloc.dupe(u8, info.title),
             });
         }
@@ -1245,6 +1341,7 @@ const Ui = struct {
             self.setMessage("attach {s} failed: {s}", .{ name, @errorName(err) });
             return;
         };
+        self.select_anchor = null;
         self.view_gen += 1;
         self.full_render = true;
         self.need_render = true;
@@ -1592,7 +1689,7 @@ const Ui = struct {
     }
 
     const keybind_bar =
-        " C-a +  c new  k kill  r rename  n/p switch  d quit  C-a last  a literal  l redraw  esc cancel";
+        " c new  k kill  r rename  n/p switch  d quit  C-a last  a literal  l redraw  esc cancel";
 
     /// The full-width bar on the last screen row: rename prompt, kill
     /// confirmation, the keybind list while the prefix is armed, a
@@ -1623,7 +1720,7 @@ const Ui = struct {
         } else if (self.message.items.len > 0) {
             try text.print(alloc, " {s}", .{self.message.items});
         } else {
-            try text.appendSlice(alloc, " Press Ctrl+A for keybinds");
+            try text.appendSlice(alloc, " Keybinds: Ctrl+A");
         }
         try appendClipped(alloc, out, text.items, w);
         try out.appendSlice(alloc, sgr_reset);
@@ -1685,6 +1782,18 @@ const Ui = struct {
         }
         try out.appendSlice(alloc, sgr_reset);
         try out.appendSlice(alloc, "\x1b[K");
+
+        // An in-progress mouse selection is highlighted by repainting
+        // the selected cells in reverse video over the row content.
+        if (self.selectionSpan(y, v.term.cols)) |span| {
+            try out.print(alloc, "\x1b[{d};{d}H", .{
+                y + 1,
+                self.layout.viewportX() + span.x0 + 1,
+            });
+            try out.appendSlice(alloc, style_selected);
+            try appendPlainSpan(alloc, &v.term, y, span.x0, span.x1, out);
+            try out.appendSlice(alloc, sgr_reset);
+        }
     }
 
     fn composeEmptyRow(
@@ -1741,6 +1850,30 @@ pub fn appendTermRow(
     if (std.mem.indexOf(u8, bytes, "\x1b]8;") != null) {
         try out.appendSlice(alloc, "\x1b]8;;\x1b\\");
     }
+}
+
+/// Append one row's cells in [x0, x1] inclusive as plain text, with
+/// trailing blanks trimmed. Used to repaint the selection highlight
+/// over already-rendered row content.
+fn appendPlainSpan(
+    alloc: std.mem.Allocator,
+    term: *vt.Terminal,
+    y: u16,
+    x0: u16,
+    x1: u16,
+    out: *std.ArrayList(u8),
+) !void {
+    const screen = term.screens.active;
+    const start = screen.pages.pin(.{ .active = .{ .x = x0, .y = y } }) orelse return;
+    const end = screen.pages.pin(.{ .active = .{ .x = x1, .y = y } }) orelse return;
+
+    var formatter: vt.formatter.ScreenFormatter = .init(screen, .plain);
+    formatter.content = .{ .selection = vt.Selection.init(start, end, false) };
+
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    aw.writer.print("{f}", .{formatter}) catch return error.OutOfMemory;
+    try out.appendSlice(alloc, aw.writer.buffered());
 }
 
 // -- Tests --------------------------------------------------------------------
@@ -1804,6 +1937,23 @@ test "parser: esc backs out of an armed prefix" {
     try p.feed("x", &h);
     try std.testing.expectEqualStrings("x", h.forwarded.items);
     try std.testing.expectEqual(@as(usize, 0), h.events.items.len);
+}
+
+test "parser: a mouse click while the prefix is armed cancels it cleanly" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    // Esc with trailing bytes is the start of a sequence, not a lone
+    // cancel: the sequence must parse instead of leaking into the pty.
+    try p.feed("\x01\x1b[<0;5;7M", &h);
+    try std.testing.expect(!p.pending_prefix);
+    try std.testing.expectEqual(@as(usize, 1), h.events.items.len);
+    const m = h.events.items[0].mouse;
+    try std.testing.expectEqual(@as(u16, 0), m.code);
+    try std.testing.expectEqual(@as(u16, 5), m.x);
+    try std.testing.expectEqual(@as(u16, 7), m.y);
+    try std.testing.expect(!m.release);
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
 }
 
 test "parser: sgr mouse press and release" {
@@ -1910,7 +2060,6 @@ test "sidebar session row is exactly the requested width" {
         .name = &name_buf,
         .attached = false,
         .idle_ms = 12_000,
-        .active = false,
         .title = &title_buf,
     };
 
@@ -1920,13 +2069,6 @@ test "sidebar session row is exactly the requested width" {
     try std.testing.expectEqual(@as(usize, 24), text.len);
     try std.testing.expect(std.mem.indexOf(u8, text, "work1234") != null);
     try std.testing.expect(std.mem.endsWith(u8, text, "x "));
-
-    // An active session carries the green activity dot.
-    var live = entry;
-    live.active = true;
-    out.clearRetainingCapacity();
-    try appendSessionRow(alloc, &out, live, 24, false);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, active_dot) != null);
 
     // Selected rows are wrapped in inverse video; the highlight is
     // the only selection marker.
@@ -1947,7 +2089,6 @@ test "sidebar title row renders the title dim under the name" {
         .name = &name_buf,
         .attached = false,
         .idle_ms = 0,
-        .active = false,
         .title = &title_buf,
     };
 

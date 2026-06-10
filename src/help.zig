@@ -114,9 +114,9 @@ pub const commands = [_]Entry{
         \\usage: boo ui
         \\
         \\Manage sessions in a full-screen interface: a sidebar lists
-        \\every session (window title underneath, a green dot while
-        \\output is arriving) and the focused session runs in a
-        \\viewport on the right, rendered live from terminal state.
+        \\every session (window title underneath) and the focused
+        \\session runs in a viewport on the right, rendered live from
+        \\terminal state.
         \\
         \\mouse:
         \\  click a session     focus it (steals politely, like attach)
@@ -124,7 +124,9 @@ pub const commands = [_]Entry{
         \\  click + new session start a session running $SHELL
         \\  scroll the sidebar  scroll the session list
         \\  in the viewport     forwarded to the application when it
-        \\                      asked for mouse reporting
+        \\                      asked for mouse reporting; otherwise
+        \\                      dragging selects text and copies it on
+        \\                      release (OSC 52)
         \\
         \\keys (prefix C-a, control variants match GNU screen):
         \\  C-a c   create a session and focus it

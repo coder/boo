@@ -1078,10 +1078,35 @@ test "ui: sidebar lists sessions and the focused session renders in the viewport
     try ui.waitFor("AA-TYPED-MARK");
     const peeked = try h.waitPeekContains("aa", "AA-TYPED-MARK");
     defer alloc.free(peeked);
+}
 
-    // The session just produced output, so its sidebar row carries
-    // the activity dot.
-    try ui.waitFor("\xe2\x97\x8f");
+test "ui: dragging in the viewport selects text and copies it via osc 52" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("cp", &.{"cat"});
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("+ new session");
+
+    // The echoed line lands on the session's first row, rendered at
+    // screen row 1 starting at column 26 (24-column sidebar plus the
+    // separator).
+    try h.sendLine("cp", "COPYTEXT");
+    try ui.waitFor("COPYTEXT");
+
+    // Press on the C, drag right, release on the final T. cat never
+    // asked for mouse reporting, so the UI selects instead of
+    // forwarding, then copies as OSC 52 with base64("COPYTEXT").
+    ui.clearOutput();
+    try ui.send("\x1b[<0;26;1M");
+    try ui.send("\x1b[<32;30;1M");
+    try ui.send("\x1b[<32;33;1M");
+    try ui.send("\x1b[<0;33;1m");
+    try ui.waitFor("\x1b]52;c;Q09QWVRFWFQ=");
+    try ui.waitFor("copied");
 }
 
 test "ui: clicking a session in the sidebar focuses it" {
@@ -1251,7 +1276,7 @@ test "ui: the status bar reveals keybinds and C-a r renames" {
     var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
     defer ui.deinit();
     try ui.waitFor("oldname");
-    try ui.waitFor("Press Ctrl+A for keybinds");
+    try ui.waitFor("Keybinds: Ctrl+A");
 
     // Arming the prefix swaps the hint for the keybind list; Esc
     // backs out and the hint returns.
@@ -1260,7 +1285,7 @@ test "ui: the status bar reveals keybinds and C-a r renames" {
     try ui.waitFor("esc cancel");
     ui.clearOutput();
     try ui.send("\x1b");
-    try ui.waitFor("Press Ctrl+A for keybinds");
+    try ui.waitFor("Keybinds: Ctrl+A");
 
     // C-a r opens the prompt pre-filled with the old name; erase it
     // and type a new one.
