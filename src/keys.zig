@@ -15,16 +15,9 @@ const std = @import("std");
 pub const escape_byte: u8 = 0x01; // C-a
 
 pub const Command = union(enum) {
-    /// Bytes to forward to the active window.
+    /// Bytes to forward to the window.
     forward: []const u8,
-    new_window,
-    next_window,
-    prev_window,
-    other_window,
-    select_window: u4,
     detach,
-    kill_window,
-    list_windows,
     redraw,
     unknown: u8,
 };
@@ -207,14 +200,7 @@ pub const Parser = struct {
 
     fn dispatch(byte: u8, handler: anytype) !void {
         switch (byte) {
-            'c', 0x03 => try handler.command(.new_window),
-            'n', ' ', 0x0e => try handler.command(.next_window),
-            'p', 0x10, 0x08, 0x7f => try handler.command(.prev_window),
-            escape_byte => try handler.command(.other_window),
-            '0'...'9' => try handler.command(.{ .select_window = @intCast(byte - '0') }),
             'd', 0x04 => try handler.command(.detach),
-            'k', 0x0b => try handler.command(.kill_window),
-            'w', 0x17 => try handler.command(.list_windows),
             'l', 0x0c => try handler.command(.redraw),
             'a' => try handler.command(.{ .forward = &.{escape_byte} }),
             else => try handler.command(.{ .unknown = byte }),
@@ -286,21 +272,20 @@ test "prefix commands" {
     var h: TestHandler = .{ .alloc = std.testing.allocator };
     defer h.deinit();
     var p: Parser = .{};
-    try p.feed("ab\x01cde\x013f", false, &h);
+    try p.feed("ab\x01lde\x01df", false, &h);
     try std.testing.expectEqualStrings("abdef", h.forwarded.items);
     try std.testing.expectEqual(@as(usize, 2), h.cmds.items.len);
-    try std.testing.expectEqual(Command.new_window, h.cmds.items[0]);
-    try std.testing.expectEqual(Command{ .select_window = 3 }, h.cmds.items[1]);
+    try std.testing.expectEqual(Command.redraw, h.cmds.items[0]);
+    try std.testing.expectEqual(Command.detach, h.cmds.items[1]);
 }
 
-test "literal escape via C-a a and C-a C-a toggles" {
+test "literal escape via C-a a" {
     var h: TestHandler = .{ .alloc = std.testing.allocator };
     defer h.deinit();
     var p: Parser = .{};
-    try p.feed("\x01a\x01\x01", false, &h);
+    try p.feed("\x01a", false, &h);
     try std.testing.expectEqualStrings("\x01", h.forwarded.items);
-    try std.testing.expectEqual(@as(usize, 1), h.cmds.items.len);
-    try std.testing.expectEqual(Command.other_window, h.cmds.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), h.cmds.items.len);
 }
 
 test "prefix split across feeds" {
@@ -319,15 +304,10 @@ test "control variants match screen defaults" {
     var h: TestHandler = .{ .alloc = std.testing.allocator };
     defer h.deinit();
     var p: Parser = .{};
-    try p.feed("\x01\x04\x01\x03\x01\x0e\x01\x10\x01\x0b\x01\x17\x01\x0c", false, &h);
-    try std.testing.expectEqual(@as(usize, 7), h.cmds.items.len);
+    try p.feed("\x01\x04\x01\x0c", false, &h);
+    try std.testing.expectEqual(@as(usize, 2), h.cmds.items.len);
     try std.testing.expectEqual(Command.detach, h.cmds.items[0]);
-    try std.testing.expectEqual(Command.new_window, h.cmds.items[1]);
-    try std.testing.expectEqual(Command.next_window, h.cmds.items[2]);
-    try std.testing.expectEqual(Command.prev_window, h.cmds.items[3]);
-    try std.testing.expectEqual(Command.kill_window, h.cmds.items[4]);
-    try std.testing.expectEqual(Command.list_windows, h.cmds.items[5]);
-    try std.testing.expectEqual(Command.redraw, h.cmds.items[6]);
+    try std.testing.expectEqual(Command.redraw, h.cmds.items[1]);
     try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
 }
 

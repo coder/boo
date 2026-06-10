@@ -4,29 +4,30 @@ Sessions that haunt your terminal. A GNU `screen` style terminal
 multiplexer built on [libghostty](https://github.com/ghostty-org/ghostty)
 (`libghostty-vt`), written in Zig.
 
-Every window's output is parsed through Ghostty's terminal emulation
-core, so boo always knows the exact screen state of every window:
+Every session's output is parsed through Ghostty's terminal emulation
+core, so boo always knows the exact screen state of every session:
 contents, styles, cursor, scrollback, and terminal modes. That state is
-used to rehydrate your terminal on attach and window switches, to
-answer terminal queries for background windows, and to let scripts and
-AI agents read the screen exactly as a human would see it.
+used to rehydrate your terminal on attach, to answer terminal queries
+for detached sessions, and to let scripts and AI agents read the screen
+exactly as a human would see it.
 
 ## Features
 
 - Sessions that survive disconnects: detach with `C-a d`, reattach with
   `boo attach`.
-- Multiple windows per session with screen-style `C-a` key bindings.
+- One command per session, named after your current directory by
+  default. Sessions are cheap; run one per task.
 - Faithful redraws from libghostty terminal state, including SGR styles,
   cursor position, scrolling regions, window title, and terminal modes
   (alt screen, bracketed paste, mouse reporting, kitty keyboard, ...).
 - Screen-style terminal etiquette: the attached client renders inside
   your terminal's alternate screen, so attaching never disturbs your
   shell scrollback and detaching restores your pre-attach view.
-  Alternate-screen switches by apps inside a window are tracked in
+  Alternate-screen switches by apps inside a session are tracked in
   terminal state and repainted, never passed through raw.
 - Agent-friendly automation primitives: `send`, `peek`, `wait`, and
   `--json` output, all usable without a terminal.
-- Resize propagation end to end (SIGWINCH -> client -> daemon -> window
+- Resize propagation end to end (SIGWINCH -> client -> daemon ->
   PTY -> application).
 
 ## Install
@@ -70,6 +71,9 @@ boo kill work              # end a session
 boo exorcise               # end every session
 ```
 
+With no name, `boo new` names the session after the current directory,
+falling back to the process id when that name is taken or unusable.
+
 Run `boo help` for the full overview, `boo help <command>` for flags
 and examples, and `boo help --all` to print every help page at once.
 
@@ -80,13 +84,7 @@ Bindings follow GNU screen's defaults, including the `C-x` variants
 
 | Keys      | Action                              |
 |-----------|-------------------------------------|
-| `C-a c`, `C-a C-c` | new window                 |
-| `C-a n` / `C-a p` / `C-a <space>` | next / previous window |
-| `C-a 0`..`C-a 9` | select window by number      |
-| `C-a C-a` | toggle to the previously used window |
 | `C-a d`, `C-a C-d` | detach                     |
-| `C-a k`, `C-a C-k` | kill the current window    |
-| `C-a w`, `C-a C-w` | list windows in the message line |
 | `C-a l`, `C-a C-l` | redraw                     |
 | `C-a a`   | send a literal `C-a`                |
 
@@ -107,7 +105,7 @@ boo kill build                     # 5. clean up
 - **Reading state**: `peek` prints the rendered screen reconstructed
   from terminal state, not a raw byte log: ordered, fully redrawn, and
   stable. `--scrollback` includes history; `--json` adds size, cursor,
-  window id, and title.
+  and title.
 - **Waiting**: `wait --for <text>` blocks until the screen contains the
   text; `wait --idle <dur>` until output settles; `--timeout <dur>`
   exits 4 instead of hanging forever. No more sleep-and-poll loops.
@@ -115,8 +113,7 @@ boo kill build                     # 5. clean up
   implicit newline, no quoting layer to fight. `--enter` submits,
   `--key Enter,C-c,Up` names control keys, and stdin mode is binary
   safe.
-- **Machine-readable output**: `ls --json`, `windows --json`, and
-  `peek --json`.
+- **Machine-readable output**: `ls --json` and `peek --json`.
 - **Exit codes**: `0` success, `1` error, `2` usage error, `3` no such
   session, `4` wait timed out.
 
@@ -132,34 +129,32 @@ See `boo help automation` for the full page.
 
 ```
 your terminal <-(raw tty)-> boo client <-(unix socket)-> session daemon
-                                                         |- window 0: PTY + ghostty-vt Terminal
-                                                         |- window 1: PTY + ghostty-vt Terminal
-                                                         `- ...
+                                                         `- PTY + ghostty-vt Terminal
 ```
 
 - The **client** puts your TTY in raw mode and shuttles bytes over a
   framed Unix-socket protocol (`src/protocol.zig`).
-- The **daemon** (forked on session creation) owns the windows. Each
-  window is a PTY-attached child whose output feeds a persistent
+- The **daemon** (forked on session creation) owns the session's
+  command: a PTY-attached child whose output feeds a persistent
   `ghostty-vt` `TerminalStream` (`src/window.zig`).
-- The **active window** is passed through to your terminal byte for
-  byte. On attach and window switches the daemon sanitizes your
-  terminal and replays the window from libghostty state using its VT
-  `TerminalFormatter`.
-- Terminal queries (DSR, DA, XTWINOPS, ...) from background or detached
-  windows are answered by libghostty's stream handler; for the active
-  passthrough window your real terminal answers, avoiding double
-  replies.
+- While attached, output is passed through to your terminal byte for
+  byte. On attach the daemon sanitizes your terminal and replays the
+  screen from libghostty state using its VT `TerminalFormatter`.
+- Terminal queries (DSR, DA, XTWINOPS, ...) while detached are answered
+  by libghostty's stream handler; while attached your real terminal
+  answers, avoiding double replies.
 
 ## Caveats
 
 This is a young project, not a drop-in GNU screen replacement:
 
 - One attached client per session (attaching steals); no `-x` sharing.
+- One window per session: no splits, tabs, or window juggling. Run one
+  session per task instead.
 - The `C-a` prefix is not yet configurable, and pasted bytes containing
   `0x01` are interpreted as the prefix (GNU screen has the same quirk).
 - No status line, monitoring, copy mode, or split regions yet.
-- Windows run with `TERM=xterm-256color`.
+- Sessions run with `TERM=xterm-256color`.
 
 ## License
 

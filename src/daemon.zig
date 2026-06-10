@@ -1,9 +1,9 @@
-//! The session daemon: owns windows (PTY + libghostty terminal state),
-//! accepts client connections on a Unix socket, routes input/output, and
-//! executes control commands.
+//! The session daemon: owns the window (PTY + libghostty terminal
+//! state), accepts client connections on a Unix socket, routes
+//! input/output, and executes control commands.
 //!
 //! Single-threaded poll(2) loop. One client may be attached at a time
-//! (attaching steals); any number of transient control (-X) connections
+//! (attaching steals); any number of transient control connections
 //! may come and go.
 
 const std = @import("std");
@@ -53,10 +53,7 @@ pub const Daemon = struct {
     alloc: std.mem.Allocator,
     opts: Options,
 
-    windows: std.ArrayList(*Window) = .empty,
-    next_window_id: u16 = 0,
-    active: ?usize = null,
-    last_active_id: ?u16 = null,
+    win: ?*Window = null,
 
     conns: std.ArrayList(*Conn) = .empty,
     key_parser: keys.Parser = .{},
@@ -103,15 +100,13 @@ pub const Daemon = struct {
             .flags = 0,
         }, null);
 
-        _ = try self.createWindow(opts.argv);
-        self.active = 0;
+        self.win = try createWindow(self.alloc, opts.name, opts.argv, self.rows, self.cols);
 
         try self.loop();
     }
 
     fn deinit(self: *Daemon) void {
-        for (self.windows.items) |w| w.destroy();
-        self.windows.deinit(self.alloc);
+        if (self.win) |w| w.destroy();
         for (self.conns.items) |c| {
             posix.close(c.fd);
             c.decoder.deinit();
@@ -152,10 +147,11 @@ pub const Daemon = struct {
                 try fds.append(self.alloc, .{ .fd = c.fd, .events = posix.POLL.IN, .revents = 0 });
                 try refs.append(self.alloc, .{ .conn = c });
             }
-            for (self.windows.items) |w| {
-                if (w.pty_fd < 0 or w.dead) continue;
-                try fds.append(self.alloc, .{ .fd = w.pty_fd, .events = posix.POLL.IN, .revents = 0 });
-                try refs.append(self.alloc, .{ .window = w });
+            if (self.liveWindow()) |w| {
+                if (w.pty_fd >= 0) {
+                    try fds.append(self.alloc, .{ .fd = w.pty_fd, .events = posix.POLL.IN, .revents = 0 });
+                    try refs.append(self.alloc, .{ .window = w });
+                }
             }
 
             _ = try posix.poll(fds.items, -1);
@@ -172,8 +168,8 @@ pub const Daemon = struct {
             }
 
             self.sweep();
-            if (self.windows.items.len == 0) {
-                self.broadcastExit("all windows closed");
+            if (self.liveWindow() == null) {
+                self.broadcastExit("command exited");
                 break;
             }
         }
@@ -241,7 +237,7 @@ pub const Daemon = struct {
                 }
                 conn.attached = true;
                 self.key_parser = .{};
-                self.resizeAll(size.rows, size.cols);
+                self.resizeWindow(size.rows, size.cols);
                 self.updatePassthrough();
                 try self.repaintTo(conn);
             },
@@ -256,17 +252,17 @@ pub const Daemon = struct {
                         try h.daemon.handleKeyCommand(h.conn, cmd);
                     }
                 };
-                // When the active window runs the kitty keyboard
-                // protocol, the client's terminal mirrors it and sends
-                // the prefix key CSI-u encoded.
-                const kitty = if (self.activeWindow()) |w| w.kittyKeysActive() else false;
+                // When the window runs the kitty keyboard protocol,
+                // the client's terminal mirrors it and sends the
+                // prefix key CSI-u encoded.
+                const kitty = if (self.liveWindow()) |w| w.kittyKeysActive() else false;
                 try self.key_parser.feed(msg.payload, kitty, Handler{ .daemon = self, .conn = conn });
             },
 
             .resize => {
                 if (!conn.attached) return;
                 const size = try protocol.SizePayload.decode(msg.payload);
-                self.resizeAll(size.rows, size.cols);
+                self.resizeWindow(size.rows, size.cols);
             },
 
             .detach_req => {
@@ -282,36 +278,10 @@ pub const Daemon = struct {
 
     fn handleKeyCommand(self: *Daemon, conn: *Conn, cmd: keys.Command) !void {
         switch (cmd) {
-            .forward => |bytes| if (self.activeWindow()) |w| {
+            .forward => |bytes| if (self.liveWindow()) |w| {
                 w.writeInput(bytes) catch {};
             },
-            .new_window => {
-                const idx = try self.createWindow(&.{});
-                self.switchTo(idx);
-            },
-            .next_window => self.switchRelative(1),
-            .prev_window => self.switchRelative(-1),
-            .other_window => {
-                if (self.last_active_id) |id| {
-                    if (self.windowIndexById(id)) |idx| self.switchTo(idx);
-                }
-            },
-            .select_window => |n| {
-                if (self.windowIndexById(n)) |idx| {
-                    self.switchTo(idx);
-                } else {
-                    self.message(conn, "no window {d}", .{n});
-                }
-            },
             .detach => self.detachConn(conn, "detached"),
-            .kill_window => if (self.activeWindow()) |w| {
-                posix.kill(w.child_pid, posix.SIG.HUP) catch {};
-            },
-            .list_windows => {
-                const list = try self.windowList();
-                defer self.alloc.free(list);
-                self.message(conn, "{s}", .{list});
-            },
             .redraw => try self.repaintTo(conn),
             .unknown => |byte| if (std.ascii.isPrint(byte))
                 self.message(conn, "unknown key: ^A {c}", .{byte})
@@ -335,17 +305,17 @@ pub const Daemon = struct {
                 conn.send(.err, "usage: send <bytes>");
                 return;
             }
-            if (self.activeWindow()) |w| {
+            if (self.liveWindow()) |w| {
                 w.writeInput(argv[1]) catch {
                     conn.send(.err, "window write failed");
                     return;
                 };
                 self.last_activity_ms = now;
                 conn.send(.ok, "");
-            } else conn.send(.err, "no active window");
+            } else conn.send(.err, "no window");
         } else if (std.mem.eql(u8, cmd, "peek")) {
             const scrollback = argv.len > 1 and std.mem.eql(u8, argv[1], "scrollback");
-            if (self.activeWindow()) |w| {
+            if (self.liveWindow()) |w| {
                 const text = if (scrollback)
                     try w.plainScrollback(self.alloc)
                 else
@@ -357,12 +327,11 @@ pub const Daemon = struct {
                 var out: std.ArrayList(u8) = .empty;
                 defer out.deinit(self.alloc);
                 const cursor = &w.term.screens.active.cursor;
-                try out.print(self.alloc, "{d}\t{d}\t{d}\t{d}\t{d}\t", .{
+                try out.print(self.alloc, "{d}\t{d}\t{d}\t{d}\t", .{
                     self.rows,
                     self.cols,
                     cursor.y + 1,
                     cursor.x + 1,
-                    w.id,
                 });
                 for (w.title()) |byte| {
                     if (byte < 0x20 or byte == 0x7f) continue;
@@ -374,38 +343,28 @@ pub const Daemon = struct {
                     out.shrinkRetainingCapacity(protocol.max_payload);
                 }
                 conn.send(.ok, out.items);
-            } else conn.send(.err, "no active window");
-        } else if (std.mem.eql(u8, cmd, "windows")) {
-            var out: std.ArrayList(u8) = .empty;
-            defer out.deinit(self.alloc);
-            for (self.windows.items, 0..) |w, i| {
-                if (out.items.len > 0) try out.append(self.alloc, '\n');
-                const active: u8 = if (self.active != null and self.active.? == i) '1' else '0';
-                const idle: i64 = @max(0, now - w.last_output_ms);
-                try out.print(self.alloc, "{d}\t{c}\t{d}\t{s}\t", .{ w.id, active, idle, w.command_title });
-                for (w.title()) |byte| {
-                    if (byte < 0x20 or byte == 0x7f) continue;
-                    try out.append(self.alloc, byte);
-                }
-            }
-            conn.send(.ok, out.items);
+            } else conn.send(.err, "no window");
         } else if (std.mem.eql(u8, cmd, "info")) {
             var attached = false;
             for (self.conns.items) |c| {
                 if (c.attached and !c.closed) attached = true;
             }
             const idle: i64 = @max(0, now - self.last_activity_ms);
+            const out_idle: i64 = if (self.liveWindow()) |w|
+                @max(0, now - w.last_output_ms)
+            else
+                0;
             var out: std.ArrayList(u8) = .empty;
             defer out.deinit(self.alloc);
-            try out.print(self.alloc, "{s}\t{d}\t{s}\t{d}\t", .{
+            try out.print(self.alloc, "{s}\t{s}\t{d}\t{d}\t", .{
                 self.opts.name,
-                self.windows.items.len,
                 if (attached) "Attached" else "Detached",
                 idle,
+                out_idle,
             });
-            // Active window title last; sanitized, so it cannot
-            // contain the tabs that separate the fields.
-            if (self.activeWindow()) |w| {
+            // Window title last; sanitized, so it cannot contain the
+            // tabs that separate the fields.
+            if (self.liveWindow()) |w| {
                 for (w.title()) |byte| {
                     if (byte < 0x20 or byte == 0x7f) continue;
                     try out.append(self.alloc, byte);
@@ -414,7 +373,7 @@ pub const Daemon = struct {
             conn.send(.ok, out.items);
         } else if (std.mem.eql(u8, cmd, "quit")) {
             conn.send(.ok, "");
-            for (self.windows.items) |w| {
+            if (self.win) |w| {
                 posix.kill(w.child_pid, posix.SIG.HUP) catch {};
             }
             self.broadcastExit("session terminated");
@@ -428,7 +387,7 @@ pub const Daemon = struct {
         const n = posix.read(win.pty_fd, buf) catch |err| n: {
             // EIO means the slave side is fully closed: window is done.
             if (err != error.InputOutput) {
-                log.warn("window {d} read error: {}", .{ win.id, err });
+                log.warn("window read error: {}", .{err});
             }
             break :n 0;
         };
@@ -473,8 +432,8 @@ pub const Daemon = struct {
         }
     }
 
-    /// Remove closed conns and dead windows. Runs after every poll
-    /// dispatch so iteration above never sees mutation.
+    /// Remove closed conns. Runs after every poll dispatch so
+    /// iteration above never sees mutation.
     fn sweep(self: *Daemon) void {
         var ci: usize = 0;
         while (ci < self.conns.items.len) {
@@ -488,62 +447,32 @@ pub const Daemon = struct {
             self.alloc.destroy(c);
             _ = self.conns.swapRemove(ci);
         }
-
-        var wi: usize = 0;
-        var active_died = false;
-        while (wi < self.windows.items.len) {
-            const w = self.windows.items[wi];
-            if (!w.dead) {
-                wi += 1;
-                continue;
-            }
-            if (self.active) |a| {
-                if (a == wi) active_died = true;
-            }
-            if (self.last_active_id == w.id) self.last_active_id = null;
-            w.destroy();
-            _ = self.windows.orderedRemove(wi);
-            // Fix up active index after removal.
-            if (self.active) |a| {
-                if (a > wi) self.active = a - 1;
-            }
-        }
-
-        if (self.windows.items.len == 0) return;
-        if (active_died or self.active == null or self.active.? >= self.windows.items.len) {
-            self.switchTo(@min(
-                self.active orelse 0,
-                self.windows.items.len - 1,
-            ));
-        }
     }
 
     // -- Window management ------------------------------------------------
 
-    fn createWindow(self: *Daemon, argv: []const []const u8) !usize {
-        var env = try std.process.getEnvMap(self.alloc);
+    fn createWindow(
+        alloc: std.mem.Allocator,
+        session_name: []const u8,
+        argv: []const []const u8,
+        rows: u16,
+        cols: u16,
+    ) !*Window {
+        var env = try std.process.getEnvMap(alloc);
         defer env.deinit();
         try env.put("TERM", "xterm-256color");
-        try env.put("BOO", self.opts.name);
+        try env.put("BOO", session_name);
 
         var default_argv: [1][]const u8 = .{env.get("SHELL") orelse "/bin/sh"};
         const child_argv: []const []const u8 = if (argv.len > 0) argv else &default_argv;
 
-        const id = self.next_window_id;
-        var idbuf: [8]u8 = undefined;
-        try env.put("WINDOW", std.fmt.bufPrint(&idbuf, "{d}", .{id}) catch unreachable);
-
-        const win = try Window.create(self.alloc, id, child_argv, &env, self.rows, self.cols);
-        errdefer win.destroy();
-        try self.windows.append(self.alloc, win);
-        self.next_window_id += 1;
-        return self.windows.items.len - 1;
+        return Window.create(alloc, child_argv, &env, rows, cols);
     }
 
-    fn activeWindow(self: *Daemon) ?*Window {
-        const idx = self.active orelse return null;
-        if (idx >= self.windows.items.len) return null;
-        return self.windows.items[idx];
+    fn liveWindow(self: *Daemon) ?*Window {
+        const w = self.win orelse return null;
+        if (w.dead) return null;
+        return w;
     }
 
     fn attachedConn(self: *Daemon) ?*Conn {
@@ -553,60 +482,24 @@ pub const Daemon = struct {
         return null;
     }
 
-    fn windowIndexById(self: *Daemon, id: u16) ?usize {
-        for (self.windows.items, 0..) |w, i| {
-            if (w.id == id) return i;
-        }
-        return null;
-    }
-
-    fn switchTo(self: *Daemon, idx: usize) void {
-        if (idx >= self.windows.items.len) return;
-        if (self.active) |a| {
-            if (a != idx and a < self.windows.items.len) {
-                self.last_active_id = self.windows.items[a].id;
-            }
-        }
-        self.active = idx;
-        self.updatePassthrough();
-        if (self.attachedConn()) |conn| {
-            self.repaintTo(conn) catch |err| {
-                log.warn("repaint failed: {}", .{err});
-            };
-        }
-    }
-
-    fn switchRelative(self: *Daemon, dir: i32) void {
-        const len = self.windows.items.len;
-        if (len == 0) return;
-        const cur = self.active orelse 0;
-        const next = if (dir > 0)
-            (cur + 1) % len
-        else
-            (cur + len - 1) % len;
-        self.switchTo(next);
-    }
-
     fn updatePassthrough(self: *Daemon) void {
         const attached = self.attachedConn() != null;
-        for (self.windows.items, 0..) |w, i| {
-            w.passthrough = attached and self.active != null and self.active.? == i;
-        }
+        if (self.liveWindow()) |w| w.passthrough = attached;
     }
 
-    fn resizeAll(self: *Daemon, rows: u16, cols: u16) void {
+    fn resizeWindow(self: *Daemon, rows: u16, cols: u16) void {
         if (rows == 0 or cols == 0) return;
         self.rows = rows;
         self.cols = cols;
-        for (self.windows.items) |w| {
+        if (self.liveWindow()) |w| {
             w.resize(rows, cols) catch |err| {
-                log.warn("resize window {d} failed: {}", .{ w.id, err });
+                log.warn("resize window failed: {}", .{err});
             };
         }
     }
 
     fn repaintTo(self: *Daemon, conn: *Conn) !void {
-        const win = self.activeWindow() orelse return;
+        const win = self.liveWindow() orelse return;
         const bytes = try win.repaint(self.alloc);
         defer self.alloc.free(bytes);
         // The repaint covers everything fed so far; resume passthrough
@@ -629,19 +522,6 @@ pub const Daemon = struct {
             c.closed = true;
         }
         self.quitting = true;
-    }
-
-    fn windowList(self: *Daemon) ![]u8 {
-        var out: std.ArrayList(u8) = .empty;
-        errdefer out.deinit(self.alloc);
-        for (self.windows.items, 0..) |w, i| {
-            if (out.items.len > 0) try out.append(self.alloc, '\n');
-            const marker: u8 = if (self.active != null and self.active.? == i) '*' else ' ';
-            const line = try std.fmt.allocPrint(self.alloc, "{d}{c} {s}", .{ w.id, marker, w.title() });
-            defer self.alloc.free(line);
-            try out.appendSlice(self.alloc, line);
-        }
-        return out.toOwnedSlice(self.alloc);
     }
 
     fn message(self: *Daemon, conn: *Conn, comptime fmt: []const u8, args: anytype) void {

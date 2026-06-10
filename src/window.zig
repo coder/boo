@@ -14,7 +14,6 @@ const log = std.log.scoped(.window);
 
 pub const Window = struct {
     alloc: std.mem.Allocator,
-    id: u16,
 
     /// PTY master; -1 once the child is gone.
     pty_fd: posix.fd_t,
@@ -52,7 +51,6 @@ pub const Window = struct {
     /// @fieldParentPtr.
     pub fn create(
         alloc: std.mem.Allocator,
-        id: u16,
         argv: []const []const u8,
         env: *std.process.EnvMap,
         rows: u16,
@@ -70,7 +68,6 @@ pub const Window = struct {
 
         self.* = .{
             .alloc = alloc,
-            .id = id,
             .pty_fd = spawned.master,
             .child_pid = spawned.pid,
             .command_title = try alloc.dupe(u8, argv[0]),
@@ -128,7 +125,7 @@ pub const Window = struct {
         if (self.passthrough and !self.feeding_discarded) return;
         if (self.pty_fd < 0) return;
         protocol.writeAll(self.pty_fd, data) catch |err| {
-            log.warn("window {d}: failed writing query response: {}", .{ self.id, err });
+            log.warn("window: failed writing query response: {}", .{err});
         };
     }
 

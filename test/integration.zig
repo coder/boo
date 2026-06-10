@@ -60,9 +60,24 @@ const Harness = struct {
     }
 
     fn run(self: *Harness, argv: []const []const u8) !std.process.Child.RunResult {
+        return self.runIn(null, argv);
+    }
+
+    /// Run a CLI command with an explicit working directory; cwd null
+    /// inherits the test runner's directory.
+    fn runIn(
+        self: *Harness,
+        cwd: ?[]const u8,
+        argv: []const []const u8,
+    ) !std.process.Child.RunResult {
+        // exe_path is relative to the build root; resolve it so a
+        // custom cwd does not break spawning.
+        var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const exe_abs = try std.fs.cwd().realpath(exe_path, &exe_buf);
+
         var full_argv: std.ArrayList([]const u8) = .empty;
         defer full_argv.deinit(self.alloc);
-        try full_argv.append(self.alloc, exe_path);
+        try full_argv.append(self.alloc, exe_abs);
         try full_argv.appendSlice(self.alloc, argv);
 
         var env = try std.process.getEnvMap(self.alloc);
@@ -72,6 +87,7 @@ const Harness = struct {
         return std.process.Child.run(.{
             .allocator = self.alloc,
             .argv = full_argv.items,
+            .cwd = cwd,
             .env_map = &env,
         });
     }
@@ -121,7 +137,7 @@ const Harness = struct {
     fn waitSessionUp(self: *Harness, session: []const u8) !void {
         var deadline = Deadline.init(default_timeout_ms);
         while (true) {
-            const result = try self.run(&.{ "windows", session });
+            const result = try self.run(&.{ "peek", session });
             defer self.alloc.free(result.stdout);
             defer self.alloc.free(result.stderr);
             if (result.term == .Exited and result.term.Exited == 0) return;
@@ -129,12 +145,12 @@ const Harness = struct {
         }
     }
 
-    /// Type text into the session's active window, followed by Enter.
+    /// Type text into the session, followed by Enter.
     fn sendLine(self: *Harness, session: []const u8, text: []const u8) !void {
         try self.runOk(&.{ "send", "-s", session, text, "--enter" });
     }
 
-    /// Poll the active window's screen contents until `needle` shows up.
+    /// Poll the session's screen contents until `needle` shows up.
     /// Returns the matching peek output; caller frees.
     fn waitPeekContains(self: *Harness, session: []const u8, needle: []const u8) ![]u8 {
         var deadline = Deadline.init(default_timeout_ms);
@@ -469,33 +485,40 @@ test "window size: initial attach size and SIGWINCH resize reach the app" {
     }
 }
 
-test "multiple windows: create, switch, and list" {
+test "default session name comes from the working directory" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
     defer h.deinit();
 
-    var client = try PtyClient.spawn(&h, &.{ "new", "t6", "--", "cat" }, 24, 80);
-    defer client.deinit();
-    try h.waitSessionUp("t6");
+    // A directory whose basename is a valid session name. Living under
+    // h.dir gets it cleaned up with the harness; the daemon ignores
+    // non-socket entries there.
+    const proj = try std.fs.path.join(alloc, &.{ h.dir, "spooky-proj" });
+    defer alloc.free(proj);
+    try std.fs.cwd().makePath(proj);
 
-    try client.send("first-window-data\r");
-    try client.waitFor("first-window-data");
+    const first = try h.runIn(proj, &.{ "new", "-d", "--", "cat" });
+    defer alloc.free(first.stdout);
+    defer alloc.free(first.stderr);
+    try std.testing.expect(first.term.Exited == 0);
+    try std.testing.expectEqualStrings("spooky-proj\n", first.stdout);
+    try h.waitSessionUp("spooky-proj");
 
-    // C-a c: new window (running the default shell); give it a marker.
-    try client.send("\x01c");
-    try client.send("echo second-window-data\r");
-    try client.waitFor("second-window-data");
+    // The name is taken now, so the next session falls back to the
+    // creating process id.
+    const second = try h.runIn(proj, &.{ "new", "-d", "--", "cat" });
+    defer alloc.free(second.stdout);
+    defer alloc.free(second.stderr);
+    try std.testing.expect(second.term.Exited == 0);
+    const pid_name = std.mem.trimRight(u8, second.stdout, "\n");
+    try std.testing.expect(pid_name.len > 0);
+    for (pid_name) |c| try std.testing.expect(std.ascii.isDigit(c));
 
-    // C-a p: back to window 0; the repaint comes from ghostty state.
-    client.clearOutput();
-    try client.send("\x01p");
-    try client.waitFor("first-window-data");
-
-    const result = try h.run(&.{ "windows", "t6" });
-    defer alloc.free(result.stdout);
-    defer alloc.free(result.stderr);
-    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "0*") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "1 ") != null);
+    const ls = try h.run(&.{"ls"});
+    defer alloc.free(ls.stdout);
+    defer alloc.free(ls.stderr);
+    try std.testing.expect(std.mem.indexOf(u8, ls.stdout, "spooky-proj") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ls.stdout, pid_name) != null);
 }
 
 test "session listing shows attach state" {
@@ -510,8 +533,8 @@ test "session listing shows attach state" {
     defer alloc.free(detached.stderr);
     try std.testing.expect(std.mem.indexOf(u8, detached.stdout, "listed") != null);
     try std.testing.expect(std.mem.indexOf(u8, detached.stdout, "detached") != null);
-    // The listing includes the active window's title (the launch
-    // command until the app sets one).
+    // The listing includes the session's title (the launch command
+    // until the app sets one).
     try std.testing.expect(std.mem.indexOf(u8, detached.stdout, "TITLE") != null);
     try std.testing.expect(std.mem.indexOf(u8, detached.stdout, "cat") != null);
 
@@ -543,7 +566,7 @@ test "kill ends the session and notifies the attached client" {
     try std.testing.expectEqual(@as(u32, 0), try client.waitExit());
 
     // The socket is gone: session commands now fail with exit 3.
-    try h.runExit(&.{ "windows", "t8" }, 3);
+    try h.runExit(&.{ "peek", "t8" }, 3);
 }
 
 test "attach without a tty fails cleanly" {
@@ -698,28 +721,22 @@ test "reattach restores the window title" {
 
     try h.startDetached("ttl", &.{"sh"});
 
-    // Set the title from inside the window. The title is assembled
+    // Set the title from inside the session. The title is assembled
     // from two printf arguments so the echoed command line (which
     // ends up in the repainted screen content) never contains the
     // assembled marker.
     try h.sendLine("ttl", "printf '\\033]2;TTL-%s\\007' MARK");
 
-    // The window list reflects the OSC title once processed.
+    // The session listing reflects the OSC title once processed.
     var deadline = Deadline.init(default_timeout_ms);
     while (true) {
-        const result = try h.run(&.{ "windows", "ttl" });
+        const result = try h.run(&.{"ls"});
         const found = std.mem.indexOf(u8, result.stdout, "TTL-MARK") != null;
         alloc.free(result.stdout);
         alloc.free(result.stderr);
         if (found) break;
-        try deadline.tick("window title never updated");
+        try deadline.tick("session title never updated");
     }
-
-    // The session listing shows the same title.
-    const ls = try h.run(&.{"ls"});
-    defer alloc.free(ls.stdout);
-    defer alloc.free(ls.stderr);
-    try std.testing.expect(std.mem.indexOf(u8, ls.stdout, "TTL-MARK") != null);
 
     // Reattach: the repaint must restore the title on the client's
     // terminal, not just the screen contents.
@@ -769,7 +786,7 @@ test "help: overview, command pages, topics, and version" {
     try std.testing.expect(std.mem.startsWith(u8, ver.stdout, "boo "));
 }
 
-test "ls and windows emit machine-readable JSON" {
+test "ls emits machine-readable JSON" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
     defer h.deinit();
@@ -788,24 +805,8 @@ test "ls and windows emit machine-readable JSON" {
         const obj = sessions[0].object;
         try std.testing.expectEqualStrings("js", obj.get("name").?.string);
         try std.testing.expectEqual(false, obj.get("attached").?.bool);
-        try std.testing.expectEqual(@as(i64, 1), obj.get("windows").?.integer);
         try std.testing.expect(obj.get("idle_ms").?.integer >= 0);
         try std.testing.expectEqualStrings("cat", obj.get("title").?.string);
-    }
-
-    const wins = try h.run(&.{ "windows", "js", "--json" });
-    defer alloc.free(wins.stdout);
-    defer alloc.free(wins.stderr);
-    try std.testing.expect(wins.term.Exited == 0);
-    {
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, wins.stdout, .{});
-        defer parsed.deinit();
-        const windows = parsed.value.array.items;
-        try std.testing.expectEqual(@as(usize, 1), windows.len);
-        const obj = windows[0].object;
-        try std.testing.expectEqual(@as(i64, 0), obj.get("id").?.integer);
-        try std.testing.expectEqual(true, obj.get("active").?.bool);
-        try std.testing.expectEqualStrings("cat", obj.get("command").?.string);
     }
 }
 
@@ -828,7 +829,6 @@ test "peek --json includes geometry, cursor, and screen content" {
     defer parsed.deinit();
     const obj = parsed.value.object;
     try std.testing.expectEqualStrings("pj", obj.get("session").?.string);
-    try std.testing.expectEqual(@as(i64, 0), obj.get("window").?.integer);
     try std.testing.expect(obj.get("rows").?.integer > 0);
     try std.testing.expect(obj.get("cols").?.integer > 0);
     try std.testing.expect(obj.get("cursor").?.object.get("row").?.integer >= 1);
@@ -921,7 +921,7 @@ test "exorcise banishes every session" {
         if (empty) break;
         try deadline.tick("sessions survived the exorcism");
     }
-    try h.runExit(&.{ "windows", "ghost1" }, 3);
+    try h.runExit(&.{ "peek", "ghost1" }, 3);
 }
 
 test "exit codes distinguish usage, missing sessions, and ambiguity" {
@@ -932,8 +932,8 @@ test "exit codes distinguish usage, missing sessions, and ambiguity" {
     try h.startDetached("alike", &.{"cat"});
 
     // Unique prefix resolves; ambiguous prefix and unknown names exit 3.
-    try h.runOk(&.{ "windows", "alp" });
-    try h.runExit(&.{ "windows", "al" }, 3);
+    try h.runOk(&.{ "peek", "alp" });
+    try h.runExit(&.{ "peek", "al" }, 3);
     try h.runExit(&.{ "attach", "nosuchzz" }, 3);
     try h.runExit(&.{ "kill", "nosuchzz" }, 3);
 
@@ -1005,5 +1005,5 @@ test "agent loop: new, send, wait, peek, kill" {
     defer alloc.free(content);
 
     try h.runOk(&.{ "kill", "agent" });
-    try h.runExit(&.{ "windows", "agent" }, 3);
+    try h.runExit(&.{ "peek", "agent" }, 3);
 }

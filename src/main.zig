@@ -10,7 +10,7 @@ const help = @import("help.zig");
 const paths = @import("paths.zig");
 const protocol = @import("protocol.zig");
 
-pub const version = "0.1.1";
+pub const version = "0.2.0";
 
 /// Exit codes, documented in `boo help`.
 const exit_runtime: u8 = 1;
@@ -65,7 +65,6 @@ pub fn main() !void {
     if (eql(cmd, "new")) return cmdNew(alloc, rest);
     if (eql(cmd, "attach") or eql(cmd, "at")) return cmdAttach(alloc, rest);
     if (eql(cmd, "ls") or eql(cmd, "list")) return cmdLs(alloc, rest);
-    if (eql(cmd, "windows")) return cmdWindows(alloc, rest);
     if (eql(cmd, "send")) return cmdSend(alloc, rest);
     if (eql(cmd, "peek")) return cmdPeek(alloc, rest);
     if (eql(cmd, "wait")) return cmdWait(alloc, rest);
@@ -179,12 +178,13 @@ fn pickMostRecent(alloc: std.mem.Allocator, dir: []const u8) !?[]u8 {
 
 const SessionInfo = struct {
     /// Full info payload:
-    /// name \t windows \t Attached|Detached \t idle_ms \t title.
+    /// name \t Attached|Detached \t idle_ms \t out_idle_ms \t title.
     text: []u8,
-    windows: u32,
     attached: bool,
     idle_ms: i64,
-    /// Active window title; slices into `text`.
+    /// Time since the window last produced output; drives wait --idle.
+    out_idle_ms: i64,
+    /// Window title; slices into `text`.
     title: []const u8,
 };
 
@@ -202,17 +202,17 @@ fn sessionInfo(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !?Se
 
     var it = std.mem.splitScalar(u8, result.text, '\t');
     _ = it.next() orelse return error.BadResponse; // name
-    const windows = std.fmt.parseInt(u32, it.next() orelse return error.BadResponse, 10) catch
-        return error.BadResponse;
     const attached = std.mem.eql(u8, it.next() orelse return error.BadResponse, "Attached");
     const idle_ms = std.fmt.parseInt(i64, it.next() orelse return error.BadResponse, 10) catch
+        return error.BadResponse;
+    const out_idle_ms = std.fmt.parseInt(i64, it.next() orelse return error.BadResponse, 10) catch
         return error.BadResponse;
     const title = it.rest();
     return .{
         .text = result.text,
-        .windows = windows,
         .attached = attached,
         .idle_ms = idle_ms,
+        .out_idle_ms = out_idle_ms,
         .title = title,
     };
 }
@@ -286,8 +286,8 @@ fn createSession(
     detached: bool,
     cmd_argv: []const []const u8,
 ) !void {
-    var name_buf: [32]u8 = undefined;
-    const name = name_opt orelse paths.defaultName(&name_buf);
+    var name_buf: [paths.max_name_len]u8 = undefined;
+    const name = name_opt orelse paths.defaultName(&name_buf, dir);
     paths.validateName(name) catch
         usageFail("new", "invalid session name '{s}'", .{name});
 
@@ -411,8 +411,7 @@ fn cmdLs(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
             if (i > 0) try out.append(alloc, ',');
             try out.appendSlice(alloc, "{\"name\":");
             try appendJsonString(alloc, &out, entry.name);
-            const tail = try std.fmt.allocPrint(alloc, ",\"windows\":{d},\"attached\":{},\"idle_ms\":{d},\"title\":", .{
-                entry.info.windows,
+            const tail = try std.fmt.allocPrint(alloc, ",\"attached\":{},\"idle_ms\":{d},\"title\":", .{
                 entry.info.attached,
                 entry.info.idle_ms,
             });
@@ -430,12 +429,11 @@ fn cmdLs(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     }
 
     try appendPadded(alloc, &out, "NAME", name_width);
-    try out.appendSlice(alloc, "  WINDOWS  STATE     IDLE  TITLE\n");
+    try out.appendSlice(alloc, "  STATE     IDLE  TITLE\n");
     for (infos.items) |entry| {
         try appendPadded(alloc, &out, entry.name, name_width);
         var idle_buf: [32]u8 = undefined;
-        const line = try std.fmt.allocPrint(alloc, "  {d: >7}  {s: <8}  {s: <4}  {s}\n", .{
-            entry.info.windows,
+        const line = try std.fmt.allocPrint(alloc, "  {s: <8}  {s: <4}  {s}\n", .{
             if (entry.info.attached) "attached" else "detached",
             fmtIdle(&idle_buf, entry.info.idle_ms),
             entry.info.title,
@@ -444,87 +442,6 @@ fn cmdLs(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
         try out.appendSlice(alloc, line);
     }
     try stdoutWrite(out.items);
-}
-
-fn cmdWindows(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
-    var json = false;
-    var name_arg: ?[]const u8 = null;
-    for (args) |arg| {
-        if (isHelpFlag(arg)) return printHelpPage("windows");
-        if (std.mem.eql(u8, arg, "--json")) {
-            json = true;
-        } else if (arg.len > 0 and arg[0] == '-') {
-            usageFail("windows", "unknown flag '{s}'", .{arg});
-        } else if (name_arg == null) {
-            name_arg = arg;
-        } else {
-            usageFail("windows", "unexpected argument '{s}'", .{arg});
-        }
-    }
-
-    const dir = try paths.socketDir(alloc);
-    defer alloc.free(dir);
-    const name = try resolveSession(alloc, dir, name_arg, .read);
-    defer alloc.free(name);
-
-    const result = try mustControl(alloc, dir, name, &.{"windows"});
-    defer alloc.free(result.text);
-    if (!result.ok) fail(exit_runtime, "{s}", .{result.text});
-
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(alloc);
-
-    if (json) try out.append(alloc, '[');
-    var first = true;
-    var lines = std.mem.splitScalar(u8, result.text, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        const win = parseWindowLine(line) orelse continue;
-        if (json) {
-            if (!first) try out.append(alloc, ',');
-            const head = try std.fmt.allocPrint(alloc, "{{\"id\":{d},\"active\":{},\"idle_ms\":{d},\"command\":", .{
-                win.id, win.active, win.idle_ms,
-            });
-            defer alloc.free(head);
-            try out.appendSlice(alloc, head);
-            try appendJsonString(alloc, &out, win.command);
-            try out.appendSlice(alloc, ",\"title\":");
-            try appendJsonString(alloc, &out, win.title);
-            try out.append(alloc, '}');
-        } else {
-            const marker: u8 = if (win.active) '*' else ' ';
-            const text = try std.fmt.allocPrint(alloc, "{d}{c} {s}\n", .{ win.id, marker, win.title });
-            defer alloc.free(text);
-            try out.appendSlice(alloc, text);
-        }
-        first = false;
-    }
-    if (json) try out.appendSlice(alloc, "]\n");
-    try stdoutWrite(out.items);
-}
-
-const WindowLine = struct {
-    id: u32,
-    active: bool,
-    idle_ms: i64,
-    command: []const u8,
-    title: []const u8,
-};
-
-/// Wire format: id \t active \t idle_ms \t command \t title.
-fn parseWindowLine(line: []const u8) ?WindowLine {
-    var rest = line;
-    const id_str = cutTab(&rest) orelse return null;
-    const active_str = cutTab(&rest) orelse return null;
-    const idle_str = cutTab(&rest) orelse return null;
-    const command = cutTab(&rest) orelse return null;
-    return .{
-        .id = std.fmt.parseInt(u32, id_str, 10) catch return null,
-        .active = std.mem.eql(u8, active_str, "1"),
-        .idle_ms = std.fmt.parseInt(i64, idle_str, 10) catch return null,
-        .command = command,
-        .title = rest,
-    };
 }
 
 fn cutTab(rest: *[]const u8) ?[]const u8 {
@@ -665,13 +582,12 @@ const Peek = struct {
     cols: u32,
     cursor_row: u32,
     cursor_col: u32,
-    window_id: u32,
     title: []const u8,
     screen: []const u8,
 };
 
-/// Wire format: rows \t cols \t cur_row \t cur_col \t window_id \t title
-/// on the first line, then the screen dump.
+/// Wire format: rows \t cols \t cur_row \t cur_col \t title on the
+/// first line, then the screen dump.
 fn parsePeek(payload: []const u8) ?Peek {
     const nl = std.mem.indexOfScalar(u8, payload, '\n') orelse return null;
     var rest = payload[0..nl];
@@ -679,13 +595,11 @@ fn parsePeek(payload: []const u8) ?Peek {
     const cols = cutTab(&rest) orelse return null;
     const cur_row = cutTab(&rest) orelse return null;
     const cur_col = cutTab(&rest) orelse return null;
-    const window_id = cutTab(&rest) orelse return null;
     return .{
         .rows = std.fmt.parseInt(u32, rows, 10) catch return null,
         .cols = std.fmt.parseInt(u32, cols, 10) catch return null,
         .cursor_row = std.fmt.parseInt(u32, cur_row, 10) catch return null,
         .cursor_col = std.fmt.parseInt(u32, cur_col, 10) catch return null,
-        .window_id = std.fmt.parseInt(u32, window_id, 10) catch return null,
         .title = rest,
         .screen = payload[nl + 1 ..],
     };
@@ -736,13 +650,7 @@ fn cmdPeek(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     defer out.deinit(alloc);
     try out.appendSlice(alloc, "{\"session\":");
     try appendJsonString(alloc, &out, name);
-    const mid = try std.fmt.allocPrint(
-        alloc,
-        ",\"window\":{d},\"title\":",
-        .{peek.window_id},
-    );
-    defer alloc.free(mid);
-    try out.appendSlice(alloc, mid);
+    try out.appendSlice(alloc, ",\"title\":");
     try appendJsonString(alloc, &out, peek.title);
     const geo = try std.fmt.allocPrint(
         alloc,
@@ -813,15 +721,10 @@ fn cmdWait(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
                 fail(exit_runtime, "malformed peek response", .{});
             if (std.mem.indexOf(u8, peek.screen, needle) != null) return;
         } else {
-            const result = try mustControl(alloc, dir, name, &.{"windows"});
-            defer alloc.free(result.text);
-            if (!result.ok) fail(exit_runtime, "{s}", .{result.text});
-            var lines = std.mem.splitScalar(u8, result.text, '\n');
-            while (lines.next()) |line| {
-                if (line.len == 0) continue;
-                const win = parseWindowLine(line) orelse continue;
-                if (win.active and win.idle_ms >= idle_ms) return;
-            }
+            const info = try sessionInfo(alloc, dir, name) orelse
+                fail(exit_no_session, "no session named {s}", .{name});
+            defer alloc.free(info.text);
+            if (info.out_idle_ms >= idle_ms) return;
         }
         if (std.time.milliTimestamp() >= deadline) {
             fail(exit_timeout, "wait: timed out after {s}", .{timeout_str});
@@ -1069,23 +972,12 @@ test "appendJsonString escapes" {
     try std.testing.expectEqualStrings("\"a\\\"b\\\\c\\nd\\u0001\"", out.items);
 }
 
-test "parseWindowLine" {
-    const win = parseWindowLine("3\t1\t250\tbash\tmy\ttitle").?;
-    try std.testing.expectEqual(@as(u32, 3), win.id);
-    try std.testing.expect(win.active);
-    try std.testing.expectEqual(@as(i64, 250), win.idle_ms);
-    try std.testing.expectEqualStrings("bash", win.command);
-    try std.testing.expectEqualStrings("my\ttitle", win.title);
-    try std.testing.expectEqual(@as(?WindowLine, null), parseWindowLine("nope"));
-}
-
 test "parsePeek" {
-    const peek = parsePeek("24\t80\t3\t7\t1\tvim\nline1\nline2").?;
+    const peek = parsePeek("24\t80\t3\t7\tvim\nline1\nline2").?;
     try std.testing.expectEqual(@as(u32, 24), peek.rows);
     try std.testing.expectEqual(@as(u32, 80), peek.cols);
     try std.testing.expectEqual(@as(u32, 3), peek.cursor_row);
     try std.testing.expectEqual(@as(u32, 7), peek.cursor_col);
-    try std.testing.expectEqual(@as(u32, 1), peek.window_id);
     try std.testing.expectEqualStrings("vim", peek.title);
     try std.testing.expectEqualStrings("line1\nline2", peek.screen);
 }

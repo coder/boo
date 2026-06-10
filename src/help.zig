@@ -29,9 +29,8 @@ pub const overview =
     \\  new [name] [-d] [-- cmd...]  start a session (attach unless -d)
     \\  attach, at [name]            attach a session (steals politely)
     \\  ls [--json]                  list sessions
-    \\  windows [name] [--json]      list a session's windows
-    \\  send [-s name] [text]        type into a session's active window
-    \\  peek [name]                  print the active window's screen
+    \\  send [-s name] [text]        type into a session
+    \\  peek [name]                  print the session's screen
     \\  wait [name]                  block until output matches or settles
     \\  kill [name | --all]          end a session
     \\  exorcise                     end every session
@@ -73,8 +72,9 @@ pub const commands = [_]Entry{
         \\lose the connection.
         \\
         \\Names may contain letters, digits, '.', '_', and '-'. The
-        \\default name is the starting process id. Everything after
-        \\'--' is the command to run in the first window.
+        \\default name is the name of the current directory, or the
+        \\process id when that name is taken or unusable. Everything
+        \\after '--' is the command to run in the session.
         \\
         \\flags:
         \\  -d, --detached  start without attaching and print the
@@ -117,29 +117,13 @@ pub const commands = [_]Entry{
         .body =
         \\usage: boo ls [--json]
         \\
-        \\List sessions: name, window count, attach state, idle time
-        \\(time since the last window output or client input), and the
-        \\active window's title. Stale sockets left by crashed daemons
-        \\are cleaned up.
+        \\List sessions: name, attach state, idle time (time since the
+        \\last output or client input), and the session's title. Stale
+        \\sockets left by crashed daemons are cleaned up.
         \\
         \\flags:
         \\  --json  emit a JSON array:
-        \\          [{"name","windows","attached","idle_ms","title"}]
-        \\
-        ,
-    },
-    .{
-        .name = "windows",
-        .body =
-        \\usage: boo windows [name] [--json]
-        \\
-        \\List a session's windows. The active window is marked with
-        \\'*'. Titles come from the application (OSC 0/2), falling
-        \\back to the window's launch command.
-        \\
-        \\flags:
-        \\  --json  emit a JSON array:
-        \\          [{"id","active","idle_ms","command","title"}]
+        \\          [{"name","attached","idle_ms","title"}]
         \\
         ,
     },
@@ -148,10 +132,10 @@ pub const commands = [_]Entry{
         .body =
         \\usage: boo send [-s session] [text] [flags]
         \\
-        \\Type into a session's active window, exactly as if the text
-        \\had been typed at the keyboard. Text is sent literally: no
-        \\escape processing and no implicit newline, so there is never
-        \\a quoting layer to fight. With no text and no --key, bytes
+        \\Type into a session, exactly as if the text had been typed
+        \\at the keyboard. Text is sent literally: no escape
+        \\processing and no implicit newline, so there is never a
+        \\quoting layer to fight. With no text and no --key, bytes
         \\are read from stdin (binary safe, NUL excluded).
         \\
         \\flags:
@@ -176,14 +160,14 @@ pub const commands = [_]Entry{
         .body =
         \\usage: boo peek [name] [--scrollback] [--json]
         \\
-        \\Print the active window's rendered screen: what a human
-        \\attached right now would see, reconstructed from terminal
-        \\state (not a raw byte log). Safe to run while attached.
+        \\Print the session's rendered screen: what a human attached
+        \\right now would see, reconstructed from terminal state (not
+        \\a raw byte log). Safe to run while attached.
         \\
         \\flags:
         \\  --scrollback  include the full scrollback history
-        \\  --json        emit {"session","window","title","rows",
-        \\                "cols","cursor":{"row","col"},"screen"}
+        \\  --json        emit {"session","title","rows","cols",
+        \\                "cursor":{"row","col"},"screen"}
         \\
         \\examples:
         \\  boo peek build | tail -20
@@ -202,8 +186,8 @@ pub const commands = [_]Entry{
         \\flags:
         \\  --for <text>     until the rendered screen contains <text>
         \\                   (plain substring match)
-        \\  --idle <dur>     until the active window has produced no
-        \\                   output for <dur>
+        \\  --idle <dur>     until the session has produced no output
+        \\                   for <dur>
         \\  --timeout <dur>  give up and exit 4 (default: 30s)
         \\
         \\Durations are an integer with a unit: 500ms, 2s, 1m.
@@ -219,9 +203,9 @@ pub const commands = [_]Entry{
         .body =
         \\usage: boo kill [name | --all]
         \\
-        \\End a session: every window's process receives SIGHUP and
-        \\the daemon exits. With multiple sessions a name is required
-        \\unless --all is given (also available as 'boo exorcise').
+        \\End a session: its process receives SIGHUP and the daemon
+        \\exits. With multiple sessions a name is required unless
+        \\--all is given (also available as 'boo exorcise').
         \\
         \\examples:
         \\  boo kill build
@@ -269,15 +253,13 @@ pub const topics = [_]Entry{
         .body =
         \\Key bindings inside an attached session (prefix C-a)
         \\
-        \\  C-a c       new window            C-a d   detach
-        \\  C-a n / p   next / prev window    C-a k   kill window
-        \\  C-a 0-9     select window         C-a w   list windows
-        \\  C-a C-a     previous window       C-a l   redraw
-        \\  C-a a       send a literal C-a
+        \\  C-a d   detach
+        \\  C-a l   redraw
+        \\  C-a a   send a literal C-a
         \\
-        \\Control variants match GNU screen: C-a C-d detaches,
-        \\C-a C-c opens a window, and so on. Detaching leaves the
-        \\session running; 'boo attach' brings it back.
+        \\Control variants match GNU screen: C-a C-d detaches and
+        \\C-a C-l redraws. Detaching leaves the session running;
+        \\'boo attach' brings it back.
         \\
         ,
     },
@@ -298,7 +280,7 @@ pub const topics = [_]Entry{
         \\reading state:
         \\  peek prints the rendered screen, not a raw byte stream:
         \\  ordered, fully redrawn, and stable. --scrollback includes
-        \\  history; --json adds size, cursor, window id, and title.
+        \\  history; --json adds size, cursor, and title.
         \\
         \\waiting (instead of sleep):
         \\  boo wait <name> --for <text>   screen contains <text>
@@ -311,19 +293,16 @@ pub const topics = [_]Entry{
         \\  control keys; stdin mode is binary safe.
         \\
         \\machine-readable output:
-        \\  boo ls --json       [{"name","windows","attached","idle_ms",
-        \\                        "title"}]
-        \\  boo windows --json  [{"id","active","idle_ms","command","title"}]
-        \\  boo peek --json     {"session","window","title","rows","cols",
-        \\                       "cursor":{"row","col"},"screen"}
+        \\  boo ls --json    [{"name","attached","idle_ms","title"}]
+        \\  boo peek --json  {"session","title","rows","cols",
+        \\                    "cursor":{"row","col"},"screen"}
         \\
         \\exit codes:
         \\  0 success    1 error    2 usage error
         \\  3 no such session       4 wait timed out
         \\
         \\tips:
-        \\  - Sessions are cheap; prefer one session per task over
-        \\    window juggling.
+        \\  - Sessions are cheap; use one session per task.
         \\  - 'boo new -d' prints the session name on stdout.
         \\  - Pick unique session names so [name] prefixes stay
         \\    unambiguous.

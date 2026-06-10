@@ -52,9 +52,43 @@ pub fn socketPath(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !
     return std.fs.path.join(alloc, &.{ dir, file });
 }
 
-/// Default session name for sessions created without -S: the creating
-/// process id, like GNU screen's pid prefix.
-pub fn defaultName(buf: []u8) []const u8 {
+/// Map an arbitrary string onto the session-name character set: bytes
+/// outside the allowed set become '-' and overlong input is truncated.
+/// Returns null when the result still fails validation, e.g. empty input
+/// or a leading '.' or '-'.
+fn sanitizeName(buf: []u8, base: []const u8) ?[]const u8 {
+    const len = @min(base.len, @min(buf.len, max_name_len));
+    if (len == 0) return null;
+    for (base[0..len], buf[0..len]) |c, *out| {
+        out.* = switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9', '.', '_', '-' => c,
+            else => '-',
+        };
+    }
+    const name = buf[0..len];
+    validateName(name) catch return null;
+    return name;
+}
+
+/// Default session name for sessions created without a name: the basename
+/// of the current directory when it is usable and no session socket with
+/// that name exists in dir, otherwise the creating process id (like GNU
+/// screen's pid prefix).
+pub fn defaultName(buf: []u8, dir: []const u8) []const u8 {
+    cwd: {
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd = std.posix.getcwd(&cwd_buf) catch break :cwd;
+        const name = sanitizeName(buf, std.fs.path.basename(cwd)) orelse break :cwd;
+        var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const sock = std.fmt.bufPrint(
+            &sock_buf,
+            "{s}/{s}.sock",
+            .{ dir, name },
+        ) catch break :cwd;
+        // An existing socket means the name is taken; fall back to the pid.
+        std.fs.cwd().access(sock, .{}) catch return name;
+        break :cwd;
+    }
     return std.fmt.bufPrint(buf, "{d}", .{std.c.getpid()}) catch unreachable;
 }
 
@@ -93,6 +127,20 @@ test "validateName" {
     try std.testing.expectError(error.InvalidSessionName, validateName("-flag"));
     try std.testing.expectError(error.InvalidSessionName, validateName("a" ** 65));
     try std.testing.expectError(error.InvalidSessionName, validateName("sp ace"));
+}
+
+test "sanitizeName" {
+    var buf: [max_name_len]u8 = undefined;
+    try std.testing.expectEqualStrings("my-proj", sanitizeName(&buf, "my proj").?);
+    try std.testing.expectEqualStrings("a.b_c-1", sanitizeName(&buf, "a.b_c-1").?);
+    try std.testing.expectEqualStrings("h--llo", sanitizeName(&buf, "héllo").?);
+    try std.testing.expect(sanitizeName(&buf, "") == null);
+    try std.testing.expect(sanitizeName(&buf, ".hidden") == null);
+    try std.testing.expect(sanitizeName(&buf, "-flag") == null);
+    try std.testing.expectEqualStrings(
+        "x" ** max_name_len,
+        sanitizeName(&buf, "x" ** 100).?,
+    );
 }
 
 test "socketPath" {
