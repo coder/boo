@@ -81,7 +81,11 @@ pub fn main() !void {
             return;
         },
         .show_version => {
-            std.debug.print("ghostscreen {s}\n", .{version});
+            var buf: [64]u8 = undefined;
+            var stdout_writer = std.fs.File.stdout().writer(&buf);
+            const out = &stdout_writer.interface;
+            try out.print("ghostscreen {s}\n", .{version});
+            try out.flush();
             return;
         },
         .list => try cmdList(alloc),

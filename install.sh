@@ -67,7 +67,9 @@ tar -xzf "$tmp/$asset" -C "$tmp"
 mkdir -p "$install_dir"
 install -m 0755 "$tmp/ghostscreen" "$install_dir/ghostscreen"
 
-log "Installed $("$install_dir/ghostscreen" -V) to $install_dir/ghostscreen"
+# The v0.0.1 binary prints its version to stderr; later versions use
+# stdout. Capture both.
+log "Installed $("$install_dir/ghostscreen" -V 2>&1) to $install_dir/ghostscreen"
 case ":$PATH:" in
 *":$install_dir:"*) ;;
 *) log "warning: $install_dir is not in your PATH" ;;
