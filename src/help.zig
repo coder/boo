@@ -27,6 +27,7 @@ pub const overview =
     \\commands:
     \\  new [name] [-d] [-- cmd...]  start a session (attach unless -d)
     \\  attach, at [name]            attach a session (steals politely)
+    \\  ui                           manage sessions in a full-screen UI
     \\  ls [--json]                  list sessions
     \\  send [-s name] [text]        type into a session
     \\  peek [name]                  print the session's screen
@@ -107,6 +108,39 @@ pub const commands = [_]Entry{
         \\examples:
         \\  boo attach           grab the most recent session
         \\  boo at bu            attach "build" by prefix
+        \\
+        ,
+    },
+    .{
+        .name = "ui",
+        .body =
+        \\usage: boo ui
+        \\
+        \\Manage sessions in a full-screen interface: a sidebar lists
+        \\every session and the focused session runs in a viewport on
+        \\the right, rendered live from terminal state.
+        \\
+        \\mouse:
+        \\  click a session     focus it (steals politely, like attach)
+        \\  click its 'x'       kill it (asks for confirmation)
+        \\  click + new session start a session running $SHELL
+        \\  scroll the sidebar  scroll the session list
+        \\  in the viewport     forwarded to the application when it
+        \\                      asked for mouse reporting
+        \\
+        \\keys (prefix C-a, control variants match GNU screen):
+        \\  C-a c   create a session and focus it
+        \\  C-a k   kill the focused session (asks y/n)
+        \\  C-a n   focus the next session
+        \\  C-a p   focus the previous session
+        \\  C-a C-a focus the previously focused session
+        \\  C-a d   quit the UI (sessions keep running)
+        \\  C-a l   redraw
+        \\  C-a a   send a literal C-a to the application
+        \\
+        \\Everything else is typed into the focused session. Unlike a
+        \\plain attach, pasted text may contain C-a bytes safely
+        \\(bracketed paste).
         \\
         ,
     },
@@ -259,6 +293,9 @@ pub const topics = [_]Entry{
         \\Control variants match GNU screen: C-a C-d detaches and
         \\C-a C-l redraws. Detaching leaves the session running;
         \\'boo attach' brings it back.
+        \\
+        \\'boo ui' adds bindings for managing sessions; see
+        \\'boo help ui'.
         \\
         ,
     },

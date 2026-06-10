@@ -153,7 +153,9 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
     }
 }
 
-fn rawMode(t: *posix.termios) void {
+/// Configure a termios for raw byte-at-a-time input. Shared with the
+/// boo ui client, which manages its own terminal lifecycle.
+pub fn rawMode(t: *posix.termios) void {
     t.iflag.IGNBRK = false;
     t.iflag.BRKINT = false;
     t.iflag.PARMRK = false;

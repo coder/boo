@@ -9,6 +9,7 @@ const daemonpkg = @import("daemon.zig");
 const help = @import("help.zig");
 const paths = @import("paths.zig");
 const protocol = @import("protocol.zig");
+const ui = @import("ui.zig");
 
 pub const version = "0.3.0";
 
@@ -64,6 +65,7 @@ pub fn main() !void {
 
     if (eql(cmd, "new")) return cmdNew(alloc, rest);
     if (eql(cmd, "attach") or eql(cmd, "at")) return cmdAttach(alloc, rest);
+    if (eql(cmd, "ui")) return cmdUi(alloc, rest);
     if (eql(cmd, "ls") or eql(cmd, "list")) return cmdLs(alloc, rest);
     if (eql(cmd, "send")) return cmdSend(alloc, rest);
     if (eql(cmd, "peek")) return cmdPeek(alloc, rest);
@@ -176,7 +178,7 @@ fn pickMostRecent(alloc: std.mem.Allocator, dir: []const u8) !?[]u8 {
     return best;
 }
 
-const SessionInfo = struct {
+pub const SessionInfo = struct {
     /// Full info payload:
     /// name \t Attached|Detached \t idle_ms \t out_idle_ms \t title.
     text: []u8,
@@ -189,7 +191,7 @@ const SessionInfo = struct {
 };
 
 /// Query a session daemon, deleting the socket when the daemon is gone.
-fn sessionInfo(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !?SessionInfo {
+pub fn sessionInfo(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !?SessionInfo {
     const sock = try paths.socketPath(alloc, dir, name);
     defer alloc.free(sock);
     const result = client.control(alloc, sock, &.{"info"}) catch {
@@ -356,6 +358,21 @@ fn attachLoop(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !void
             posix.exit(exit_runtime);
         },
     }
+}
+
+fn cmdUi(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
+    for (args) |arg| {
+        if (isHelpFlag(arg)) return printHelpPage("ui");
+        usageFail("ui", "unexpected argument '{s}'", .{arg});
+    }
+
+    const dir = try paths.socketDir(alloc);
+    defer alloc.free(dir);
+    ui.run(alloc, dir) catch |err| switch (err) {
+        error.NotATty => fail(exit_runtime, "ui requires a terminal", .{}),
+        else => return err,
+    };
+    std.debug.print("[boo ui closed]\n", .{});
 }
 
 fn cmdLs(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
@@ -989,4 +1006,5 @@ test {
     _ = @import("daemon.zig");
     _ = @import("client.zig");
     _ = @import("help.zig");
+    _ = @import("ui.zig");
 }
