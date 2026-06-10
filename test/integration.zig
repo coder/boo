@@ -947,8 +947,13 @@ test "kitty keyboard apps: encoded C-a still detaches" {
     // The app enters the alt screen and enables kitty keyboard
     // disambiguation, like a modern TUI. The passthrough mirrors both
     // onto the client's terminal, which then encodes Ctrl+A as
-    // CSI 97;5u instead of 0x01.
-    try client.send("printf '\\033[?1049h\\033[H\\033[2JKITTY-APP\\n\\033[>1u'; read x\r");
+    // CSI 97;5u instead of 0x01. The marker is printed after the
+    // kitty enable and assembled from two printf arguments: by the
+    // time it is visible the daemon has processed the enable, and the
+    // echoed command line never contains the assembled marker (the
+    // tty echo would otherwise satisfy the wait while the keys still
+    // leak into the window).
+    try client.send("printf '\\033[?1049h\\033[H\\033[2J\\033[>1uKITTY-%s\\n' APP; read x\r");
     try client.waitFor("KITTY-APP");
 
     // Press C-a d the way a kitty-mode terminal sends it.
