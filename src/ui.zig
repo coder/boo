@@ -645,8 +645,7 @@ pub fn run(alloc: std.mem.Allocator, dir: []const u8) !void {
     ui.host_name = posix.getenv("BOO");
 
     try ui.refreshSessions();
-    ui.selectInitial();
-    ui.attachSelected();
+    if (ui.selected == null) ui.selectInitial();
 
     try ui.loop(pipe_fds[0]);
 }
@@ -664,6 +663,9 @@ const Ui = struct {
     host_name: ?[]const u8 = null,
     /// Name of the previously focused session for C-a C-a toggling.
     last_name: ?[]u8 = null,
+    /// Session name the current view is attached to; outlives a
+    /// transient disappearance from the listing, unlike `selected`.
+    view_name: ?[]u8 = null,
     /// First visible session row when the list overflows.
     scroll: usize = 0,
     view: ?*View = null,
@@ -711,6 +713,7 @@ const Ui = struct {
         if (self.view) |v| v.destroy();
         freeEntries(self.alloc, &self.sessions);
         if (self.last_name) |n| self.alloc.free(n);
+        if (self.view_name) |n| self.alloc.free(n);
         if (self.rename_input) |*input| input.deinit(self.alloc);
         self.message.deinit(self.alloc);
         for (self.row_cache.items) |*row| row.deinit(self.alloc);
@@ -1234,9 +1237,12 @@ const Ui = struct {
 
     // -- Session management ----------------------------------------------------
 
-    /// Re-query every session socket. Selection is kept by name, the
-    /// focused view is dropped when its session disappeared, and a
-    /// session is auto-focused when the focused one went away.
+    /// Re-query every session socket. Selection is kept by name and
+    /// automatic focus never steals: when nothing is focused the most
+    /// recently active free session is attached, and a focused session
+    /// whose attachment broke is reclaimed once it frees up. A live
+    /// view always outlives a transient listing failure; its own
+    /// socket decides when the attachment is over.
     fn refreshSessions(self: *Ui) !void {
         self.next_refresh_ms = std.time.milliTimestamp() + refresh_interval_ms;
 
@@ -1275,9 +1281,11 @@ const Ui = struct {
         freeEntries(self.alloc, &self.sessions);
         self.sessions = fresh;
 
-        // Restore selection by name.
+        // Restore selection by name; the focused view's session counts
+        // even when the sidebar selection was already empty.
+        const want_name: ?[]const u8 = selected_name orelse self.view_name;
         self.selected = null;
-        if (selected_name) |want| {
+        if (want_name) |want| {
             for (self.sessions.items, 0..) |entry, i| {
                 if (std.mem.eql(u8, entry.name, want)) {
                     self.selected = i;
@@ -1285,17 +1293,24 @@ const Ui = struct {
                 }
             }
         }
-        if (self.selected == null) {
-            // The focused session is gone; fall back to a neighbor.
-            if (self.view) |v| {
-                if (v.state == .live) v.state = .lost;
-            }
-            if (self.firstFocusable()) |i| {
-                self.selected = i;
-                self.attachSelected();
-            } else if (self.view != null) {
-                self.view.?.destroy();
+
+        if (self.selected) |i| {
+            self.maybeReclaim(i);
+        } else if (self.liveView() != null) {
+            // The focused session vanished from the listing while its
+            // socket stays healthy: a transient failure. Keep the view;
+            // selection returns when the listing recovers.
+        } else if (self.autoFocusable()) |i| {
+            self.selected = i;
+            self.attachSelected();
+        } else if (self.view) |v| {
+            // No automatic candidate. A live view keeps running, but a
+            // dead one makes room for the empty state.
+            if (v.state != .live) {
+                v.destroy();
                 self.view = null;
+                if (self.view_name) |n| self.alloc.free(n);
+                self.view_name = null;
             }
         }
         self.clampScroll();
@@ -1307,14 +1322,39 @@ const Ui = struct {
         return std.mem.eql(u8, self.sessions.items[idx].name, host);
     }
 
-    fn firstFocusable(self: *Ui) ?usize {
-        for (self.sessions.items, 0..) |_, i| {
-            if (!self.isHost(i)) return i;
-        }
-        return null;
+    /// Re-attach the focused session after our attachment broke, once
+    /// no other client holds it: stolen views recover when the thief
+    /// lets go, lost sockets when the daemon answers again, and a
+    /// selection that never attached (no-steal startup) binds as soon
+    /// as the session frees up.
+    fn maybeReclaim(self: *Ui, idx: usize) void {
+        if (self.sessions.items[idx].attached) return;
+        const broken = if (self.view) |v|
+            v.state == .stolen or v.state == .lost
+        else
+            true;
+        if (broken) self.attachSelected();
     }
 
-    /// Pick the most recently active session on startup.
+    /// The most recently active session eligible for automatic
+    /// attachment: never this UI's host, and never a session some
+    /// other client holds. Automatic focus must not steal; only a
+    /// deliberate click or keypress may.
+    fn autoFocusable(self: *Ui) ?usize {
+        var best: ?usize = null;
+        for (self.sessions.items, 0..) |entry, i| {
+            if (self.isHost(i)) continue;
+            if (entry.attached) continue;
+            if (best == null or entry.idle_ms < self.sessions.items[best.?].idle_ms) {
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    /// Startup fallback when every session is attached elsewhere:
+    /// select the most recently active one without attaching, so the
+    /// sidebar has a focus target but nothing is stolen.
     fn selectInitial(self: *Ui) void {
         var best: ?usize = null;
         for (self.sessions.items, 0..) |entry, i| {
@@ -1334,6 +1374,8 @@ const Ui = struct {
             v.destroy();
             self.view = null;
         }
+        if (self.view_name) |n| self.alloc.free(n);
+        self.view_name = null;
 
         const sock = paths.socketPath(self.alloc, self.dir, name) catch return;
         defer self.alloc.free(sock);
@@ -1346,6 +1388,7 @@ const Ui = struct {
             self.setMessage("attach {s} failed: {s}", .{ name, @errorName(err) });
             return;
         };
+        self.view_name = self.alloc.dupe(u8, name) catch null;
         self.select_anchor = null;
         self.view_gen += 1;
         self.full_render = true;
@@ -1774,7 +1817,13 @@ const Ui = struct {
         try out.appendSlice(alloc, "\x1b[K");
 
         const v = self.view orelse {
-            try self.composeNoSessions(y, out);
+            if (self.sessions.items.len == 0) {
+                try self.composeNoSessions(y, out);
+            } else if (self.selected != null and self.sessions.items[self.selected.?].attached) {
+                try self.composeEmptyRow(y, "attached elsewhere", "click the session to take it over", out);
+            } else {
+                try self.composeEmptyRow(y, "no session focused", "pick a session on the left", out);
+            }
             return;
         };
 
@@ -2069,6 +2118,33 @@ test "parser: focus reports" {
     try std.testing.expectEqual(@as(usize, 2), h.events.items.len);
     try std.testing.expectEqual(InputEvent{ .focus = true }, h.events.items[0]);
     try std.testing.expectEqual(InputEvent{ .focus = false }, h.events.items[1]);
+}
+
+test "ui: automatic focus skips attached sessions and prefers recent ones" {
+    const alloc = std.testing.allocator;
+    var ui: Ui = .{ .alloc = alloc, .dir = "", .tty = -1 };
+    defer ui.sessions.deinit(alloc);
+
+    var aa = "aa".*;
+    var bb = "bb".*;
+    var cc = "cc".*;
+    var no_title: [0]u8 = .{};
+    try ui.sessions.append(alloc, .{ .name = &aa, .attached = false, .idle_ms = 50, .title = &no_title });
+    try ui.sessions.append(alloc, .{ .name = &bb, .attached = true, .idle_ms = 10, .title = &no_title });
+    try ui.sessions.append(alloc, .{ .name = &cc, .attached = false, .idle_ms = 90, .title = &no_title });
+
+    // bb is the most recent but held elsewhere; aa wins among the free.
+    try std.testing.expectEqual(@as(?usize, 0), ui.autoFocusable());
+
+    // The session hosting this UI is never an automatic candidate.
+    ui.host_name = "aa";
+    try std.testing.expectEqual(@as(?usize, 2), ui.autoFocusable());
+
+    // Every session held elsewhere: nothing to attach automatically.
+    ui.host_name = null;
+    ui.sessions.items[0].attached = true;
+    ui.sessions.items[2].attached = true;
+    try std.testing.expectEqual(@as(?usize, null), ui.autoFocusable());
 }
 
 test "layout: geometry and hit testing" {

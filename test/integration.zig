@@ -1365,6 +1365,58 @@ test "ui: a plain attach steals the focused session" {
     _ = try thief.waitExit();
 }
 
+test "ui: startup leaves a session attached elsewhere alone until it frees up" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("ns", &.{"cat"});
+
+    var holder = try PtyClient.spawn(&h, &.{ "attach", "ns" }, 24, 80);
+    defer holder.deinit();
+    try h.sendLine("ns", "HELD-MARK");
+    try holder.waitFor("HELD-MARK");
+
+    // The UI starts while another client holds the session: it points
+    // at the session without stealing it.
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("attached elsewhere");
+    try ui.waitFor("click the session to take it over");
+    try std.testing.expect(std.mem.indexOf(u8, holder.output.items, "attached elsewhere") == null);
+
+    // Once the holder detaches, the UI binds the session by itself.
+    try holder.send("\x01d");
+    try holder.waitFor("[detached from ns]");
+    _ = try holder.waitExit();
+    try h.sendLine("ns", "FREED-MARK");
+    try ui.waitFor("FREED-MARK");
+}
+
+test "ui: a stolen view reclaims the session once the thief lets go" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("rc", &.{"cat"});
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try h.sendLine("rc", "FIRST-MARK");
+    try ui.waitFor("FIRST-MARK");
+
+    var thief = try PtyClient.spawn(&h, &.{ "attach", "rc" }, 24, 80);
+    defer thief.deinit();
+    try ui.waitFor("attached elsewhere");
+
+    // The thief detaches; the UI re-attaches on its own.
+    try thief.send("\x01d");
+    try thief.waitFor("[detached from rc]");
+    _ = try thief.waitExit();
+    try h.sendLine("rc", "BACK-MARK");
+    try ui.waitFor("BACK-MARK");
+}
+
 test "ui: the status bar reveals keybinds and C-a r renames" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
