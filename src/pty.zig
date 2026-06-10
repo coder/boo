@@ -1,6 +1,7 @@
 //! PTY allocation and child process spawning.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 
 extern "c" fn posix_openpt(flags: c_int) c_int;
@@ -8,6 +9,22 @@ extern "c" fn grantpt(fd: c_int) c_int;
 extern "c" fn unlockpt(fd: c_int) c_int;
 extern "c" fn ptsname_r(fd: c_int, buf: [*]u8, len: usize) c_int;
 extern "c" fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
+
+/// Terminal ioctl request codes. Zig's std does not define the set
+/// variants for darwin, so the (ABI-stable) BSD values are spelled out.
+pub const Tio = switch (builtin.os.tag) {
+    .macos, .ios, .tvos, .watchos, .visionos => struct {
+        pub const IOCGWINSZ: c_ulong = 0x40087468;
+        pub const IOCSWINSZ: c_ulong = 0x80087467;
+        pub const IOCSCTTY: c_ulong = 0x20007461;
+    },
+    .linux => struct {
+        pub const IOCGWINSZ: c_ulong = std.os.linux.T.IOCGWINSZ;
+        pub const IOCSWINSZ: c_ulong = std.os.linux.T.IOCSWINSZ;
+        pub const IOCSCTTY: c_ulong = std.os.linux.T.IOCSCTTY;
+    },
+    else => @compileError("unsupported OS"),
+};
 
 pub const Winsize = std.posix.winsize;
 
@@ -52,7 +69,7 @@ pub const Pty = struct {
     }
 
     pub fn setSize(fd: posix.fd_t, size: Winsize) !void {
-        if (ioctl(fd, reqToUlong(posix.T.IOCSWINSZ), @intFromPtr(&size)) != 0) {
+        if (ioctl(fd, Tio.IOCSWINSZ, @intFromPtr(&size)) != 0) {
             return error.IoctlFailed;
         }
     }
@@ -60,17 +77,10 @@ pub const Pty = struct {
 
 pub fn getSize(fd: posix.fd_t) !Winsize {
     var ws: Winsize = undefined;
-    if (ioctl(fd, reqToUlong(posix.T.IOCGWINSZ), @intFromPtr(&ws)) != 0) {
+    if (ioctl(fd, Tio.IOCGWINSZ, @intFromPtr(&ws)) != 0) {
         return error.IoctlFailed;
     }
     return ws;
-}
-
-fn reqToUlong(req: anytype) c_ulong {
-    return switch (@typeInfo(@TypeOf(req))) {
-        .int, .comptime_int => @intCast(req),
-        else => @intCast(@as(u32, @bitCast(req))),
-    };
 }
 
 pub const SpawnOptions = struct {
@@ -109,7 +119,7 @@ pub fn spawnInPty(alloc: std.mem.Allocator, opts: SpawnOptions) !Spawned {
         // the controlling terminal.
         _ = posix.setsid() catch posix.exit(127);
         const slave = posix.openZ(slave_path, .{ .ACCMODE = .RDWR }, 0) catch posix.exit(127);
-        if (ioctl(slave, reqToUlong(posix.T.IOCSCTTY), @as(c_ulong, 0)) != 0) posix.exit(127);
+        if (ioctl(slave, Tio.IOCSCTTY, @as(c_ulong, 0)) != 0) posix.exit(127);
 
         posix.dup2(slave, 0) catch posix.exit(127);
         posix.dup2(slave, 1) catch posix.exit(127);

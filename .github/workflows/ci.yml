@@ -28,6 +28,14 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
+      - name: Fetch dependencies (with retry)
+        run: |
+          for i in 1 2 3 4 5; do
+            zig build --fetch=all && exit 0
+            echo "fetch attempt $i failed; retrying in 10s" >&2
+            sleep 10
+          done
+          exit 1
       - name: Build
         run: zig build --summary all
       - name: Unit tests
@@ -43,4 +51,12 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
+      - name: Fetch dependencies (with retry)
+        run: |
+          for i in 1 2 3 4 5; do
+            zig build --fetch=all && exit 0
+            echo "fetch attempt $i failed; retrying in 10s" >&2
+            sleep 10
+          done
+          exit 1
       - run: zig build test-all -Doptimize=ReleaseSafe --summary all
