@@ -34,8 +34,7 @@ pub fn makeWinsize(rows: u16, cols: u16) Winsize {
 
 pub const Pty = struct {
     master: posix.fd_t,
-    slave_path: [128]u8,
-    slave_path_len: usize,
+    slave: posix.fd_t,
 
     pub fn open(size: Winsize) !Pty {
         const master = posix_openpt(@bitCast(@as(u32, @bitCast(posix.O{
@@ -48,24 +47,32 @@ pub const Pty = struct {
         if (grantpt(master) != 0) return error.OpenPtyFailed;
         if (unlockpt(master) != 0) return error.OpenPtyFailed;
 
-        var self: Pty = .{
-            .master = master,
-            .slave_path = undefined,
-            .slave_path_len = 0,
-        };
-        if (ptsname_r(master, &self.slave_path, self.slave_path.len) != 0) {
+        var path_buf: [128]u8 = undefined;
+        if (ptsname_r(master, &path_buf, path_buf.len) != 0) {
             return error.OpenPtyFailed;
         }
-        self.slave_path_len = std.mem.indexOfScalar(u8, &self.slave_path, 0) orelse {
+        const path_len = std.mem.indexOfScalar(u8, &path_buf, 0) orelse {
             return error.OpenPtyFailed;
         };
+        const slave_path = path_buf[0..path_len :0];
 
-        try setSize(master, size);
-        return self;
-    }
+        // NOCTTY: the opener may be a session leader without a
+        // controlling terminal; the child acquires the PTY explicitly
+        // via TIOCSCTTY after fork.
+        const slave = posix.openZ(slave_path, .{
+            .ACCMODE = .RDWR,
+            .NOCTTY = true,
+        }, 0) catch return error.OpenPtyFailed;
+        errdefer posix.close(slave);
 
-    pub fn slavePath(self: *const Pty) [:0]const u8 {
-        return self.slave_path[0..self.slave_path_len :0];
+        // Set the initial size on the slave, mirroring openpty(3).
+        // macOS rejects TIOCSWINSZ on the master until the slave has
+        // been opened.
+        if (ioctl(slave, Tio.IOCSWINSZ, @intFromPtr(&size)) != 0) {
+            return error.IoctlFailed;
+        }
+
+        return .{ .master = master, .slave = slave };
     }
 
     pub fn setSize(fd: posix.fd_t, size: Winsize) !void {
@@ -99,6 +106,7 @@ pub const Spawned = struct {
 pub fn spawnInPty(alloc: std.mem.Allocator, opts: SpawnOptions) !Spawned {
     const pty = try Pty.open(opts.size);
     errdefer posix.close(pty.master);
+    errdefer posix.close(pty.slave);
 
     // Prepare exec arguments before forking; only async-signal-safe
     // calls are allowed in the child.
@@ -111,20 +119,17 @@ pub fn spawnInPty(alloc: std.mem.Allocator, opts: SpawnOptions) !Spawned {
     for (opts.argv, 0..) |arg, i| argv[i] = try arena.allocator().dupeZ(u8, arg);
     const envp = try std.process.createEnvironFromMap(arena.allocator(), opts.env, .{});
 
-    const slave_path = pty.slavePath();
-
     const pid = try posix.fork();
     if (pid == 0) {
-        // Child. Become a session leader and acquire the PTY slave as
-        // the controlling terminal.
+        // Child. Become a session leader and acquire the inherited
+        // PTY slave as the controlling terminal (login_tty pattern).
         _ = posix.setsid() catch posix.exit(127);
-        const slave = posix.openZ(slave_path, .{ .ACCMODE = .RDWR }, 0) catch posix.exit(127);
-        if (ioctl(slave, Tio.IOCSCTTY, @as(c_ulong, 0)) != 0) posix.exit(127);
+        if (ioctl(pty.slave, Tio.IOCSCTTY, @as(c_ulong, 0)) != 0) posix.exit(127);
 
-        posix.dup2(slave, 0) catch posix.exit(127);
-        posix.dup2(slave, 1) catch posix.exit(127);
-        posix.dup2(slave, 2) catch posix.exit(127);
-        if (slave > 2) posix.close(slave);
+        posix.dup2(pty.slave, 0) catch posix.exit(127);
+        posix.dup2(pty.slave, 1) catch posix.exit(127);
+        posix.dup2(pty.slave, 2) catch posix.exit(127);
+        if (pty.slave > 2) posix.close(pty.slave);
         posix.close(pty.master);
 
         const err = posix.execvpeZ(argv0, argv, envp);
@@ -132,5 +137,8 @@ pub fn spawnInPty(alloc: std.mem.Allocator, opts: SpawnOptions) !Spawned {
         posix.exit(127);
     }
 
+    // Parent. Drop the slave so the master sees EOF once the child
+    // (the only remaining holder) exits.
+    posix.close(pty.slave);
     return .{ .pid = pid, .master = pty.master };
 }

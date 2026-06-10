@@ -198,8 +198,16 @@ const PtyClient = struct {
         const path_len = std.mem.indexOfScalar(u8, &path_buf, 0) orelse return error.OpenPtyFailed;
         const slave_path = path_buf[0..path_len :0];
 
+        // Open the slave before setting the size: macOS rejects
+        // TIOCSWINSZ on the master until the slave has been opened.
+        const slave = posix.openZ(slave_path, .{
+            .ACCMODE = .RDWR,
+            .NOCTTY = true,
+        }, 0) catch return error.OpenPtyFailed;
+        errdefer posix.close(slave);
+
         const ws: posix.winsize = .{ .row = rows, .col = cols, .xpixel = 0, .ypixel = 0 };
-        if (ioctl(master, Tio.IOCSWINSZ, @intFromPtr(&ws)) != 0) {
+        if (ioctl(slave, Tio.IOCSWINSZ, @intFromPtr(&ws)) != 0) {
             return error.IoctlFailed;
         }
 
@@ -219,9 +227,9 @@ const PtyClient = struct {
 
         const pid = try posix.fork();
         if (pid == 0) {
-            // Child: make the PTY slave the controlling terminal.
+            // Child: make the inherited PTY slave the controlling
+            // terminal (login_tty pattern).
             _ = posix.setsid() catch posix.exit(127);
-            const slave = posix.openZ(slave_path, .{ .ACCMODE = .RDWR }, 0) catch posix.exit(127);
             if (ioctl(slave, Tio.IOCSCTTY, @as(c_ulong, 0)) != 0) {
                 posix.exit(127);
             }
@@ -235,6 +243,7 @@ const PtyClient = struct {
             posix.exit(127);
         }
 
+        posix.close(slave);
         return .{ .alloc = alloc, .master = master, .pid = pid };
     }
 
