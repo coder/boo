@@ -1109,6 +1109,32 @@ test "ui: dragging in the viewport selects text and copies it via osc 52" {
     try ui.waitFor("copied");
 }
 
+test "ui: mouse events forward natively when the application asks for them" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // The session enables button tracking + SGR before the UI
+    // attaches, so the attach replay must carry the modes to the
+    // view terminal. cat -v makes the forwarded bytes visible.
+    try h.startDetached("fwd", &.{
+        "sh",                                                                                "-c",
+        "stty -echo -icanon; printf '\\033[?1002h\\033[?1006h'; echo RAWREADY; exec cat -v",
+    });
+    const seeded = try h.waitPeekContains("fwd", "RAWREADY");
+    alloc.free(seeded);
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("RAWREADY");
+
+    // A click at screen (30, 3) is viewport cell (4, 2); the app gets
+    // SGR press + release with viewport-relative coordinates instead
+    // of a UI selection.
+    try ui.send("\x1b[<0;30;3M\x1b[<0;30;3m");
+    try ui.waitFor("^[[<0;5;3M^[[<0;5;3m");
+}
+
 test "ui: clicking a session in the sidebar focuses it" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
