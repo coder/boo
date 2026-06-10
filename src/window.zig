@@ -201,6 +201,13 @@ pub const Window = struct {
         return self.command_title;
     }
 
+    /// Whether the active screen has any kitty keyboard protocol
+    /// flags enabled. While attached, the user's terminal mirrors
+    /// this state, so the C-a prefix arrives CSI-u encoded.
+    pub fn kittyKeysActive(self: *Window) bool {
+        return self.term.screens.active.kitty_keyboard.current().int() != 0;
+    }
+
     /// Plain-text dump of the screen, for peek.
     pub fn plainScreen(self: *Window, alloc: std.mem.Allocator) ![]const u8 {
         return self.term.plainString(alloc);

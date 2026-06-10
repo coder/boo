@@ -256,7 +256,11 @@ pub const Daemon = struct {
                         try h.daemon.handleKeyCommand(h.conn, cmd);
                     }
                 };
-                try self.key_parser.feed(msg.payload, Handler{ .daemon = self, .conn = conn });
+                // When the active window runs the kitty keyboard
+                // protocol, the client's terminal mirrors it and sends
+                // the prefix key CSI-u encoded.
+                const kitty = if (self.activeWindow()) |w| w.kittyKeysActive() else false;
+                try self.key_parser.feed(msg.payload, kitty, Handler{ .daemon = self, .conn = conn });
             },
 
             .resize => {

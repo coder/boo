@@ -949,6 +949,47 @@ test "exit codes distinguish usage, missing sessions, and ambiguity" {
     try h.runExit(&.{ "kill", "--all", "alpha" }, 2);
 }
 
+test "kitty keyboard apps: encoded C-a still detaches" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    var client = try PtyClient.spawn(&h, &.{ "new", "kt", "--", "bash", "--norc" }, 24, 80);
+    defer client.deinit();
+    try h.waitSessionUp("kt");
+    try client.waitFor("\x1b[H\x1b[2J"); // attach repaint
+
+    // The app enters the alt screen and enables kitty keyboard
+    // disambiguation, like a modern TUI. The passthrough mirrors both
+    // onto the client's terminal, which then encodes Ctrl+A as
+    // CSI 97;5u instead of 0x01.
+    try client.send("printf '\\033[?1049h\\033[H\\033[2JKITTY-APP\\n\\033[>1u'; read x\r");
+    try client.waitFor("KITTY-APP");
+
+    // Press C-a d the way a kitty-mode terminal sends it.
+    client.clearOutput();
+    try client.send("\x1b[97;5u");
+    try client.send("d");
+    try client.waitFor("detached from kt");
+    try std.testing.expectEqual(@as(u32, 0), try client.waitExit());
+
+    // The keys were intercepted, not leaked into the window.
+    const peek = try h.run(&.{ "peek", "kt" });
+    defer alloc.free(peek.stdout);
+    defer alloc.free(peek.stderr);
+    try std.testing.expect(peek.term.Exited == 0);
+    try std.testing.expect(std.mem.indexOf(u8, peek.stdout, "97;5u") == null);
+
+    // The session survives, and the kitty-encoded C-a C-d variant
+    // detaches as well after a reattach.
+    var second = try PtyClient.spawn(&h, &.{ "attach", "kt" }, 24, 80);
+    defer second.deinit();
+    try second.waitFor("KITTY-APP");
+    try second.send("\x1b[97;5u\x1b[100;5u");
+    try second.waitFor("detached from kt");
+    try std.testing.expectEqual(@as(u32, 0), try second.waitExit());
+}
+
 test "agent loop: new, send, wait, peek, kill" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
