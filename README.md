@@ -23,6 +23,19 @@ plain-text hardcopies.
 - Resize propagation end to end (SIGWINCH -> client -> daemon -> window
   PTY -> application).
 
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/coder/ghostscreen/main/install.sh | sh
+```
+
+Pre-built binaries for Linux (x86_64, aarch64; fully static) and macOS
+(x86_64, aarch64) are published on the
+[releases page](https://github.com/coder/ghostscreen/releases). Set
+`GHOSTSCREEN_VERSION` to pin a release and `GHOSTSCREEN_INSTALL_DIR` to
+change the install location (default: `/usr/local/bin` when writable,
+otherwise `~/.local/bin`).
+
 ## Building
 
 Requires [Zig](https://ziglang.org) 0.15.2.

@@ -1,0 +1,52 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: build and publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Check tag matches project version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          grep -Fq ".version = \"$version\"" build.zig.zon
+          grep -Fq "pub const version = \"$version\"" src/main.zig
+      - name: Fetch dependencies (with retry)
+        run: |
+          for i in 1 2 3 4 5; do
+            zig build --fetch=all && exit 0
+            echo "fetch attempt $i failed; retrying in 10s" >&2
+            sleep 10
+          done
+          exit 1
+      - name: Test the Linux release binary
+        run: zig build test-all -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe --summary all
+      - name: Build release binaries
+        run: |
+          mkdir -p dist
+          for target in x86_64-linux-musl aarch64-linux-musl x86_64-macos aarch64-macos; do
+            zig build -Dtarget="$target" -Doptimize=ReleaseSafe -p "zig-out/$target"
+            asset="ghostscreen-${target%-musl}"
+            tar -czf "dist/$asset.tar.gz" -C "zig-out/$target/bin" ghostscreen
+          done
+      - name: Generate checksums
+        run: cd dist && sha256sum *.tar.gz > SHA256SUMS
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --generate-notes \
+            --notes "Install: \`curl -fsSL https://raw.githubusercontent.com/coder/ghostscreen/main/install.sh | sh\`"
