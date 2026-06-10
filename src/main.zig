@@ -11,7 +11,7 @@ const paths = @import("paths.zig");
 const protocol = @import("protocol.zig");
 const ui = @import("ui.zig");
 
-pub const version = "0.4.0";
+pub const version = "0.5.0";
 
 /// Exit codes, documented in `boo help`.
 const exit_runtime: u8 = 1;
