@@ -178,11 +178,14 @@ fn pickMostRecent(alloc: std.mem.Allocator, dir: []const u8) !?[]u8 {
 }
 
 const SessionInfo = struct {
-    /// Full info payload: name \t windows \t Attached|Detached \t idle_ms.
+    /// Full info payload:
+    /// name \t windows \t Attached|Detached \t idle_ms \t title.
     text: []u8,
     windows: u32,
     attached: bool,
     idle_ms: i64,
+    /// Active window title; slices into `text`.
+    title: []const u8,
 };
 
 /// Query a session daemon, deleting the socket when the daemon is gone.
@@ -204,7 +207,14 @@ fn sessionInfo(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !?Se
     const attached = std.mem.eql(u8, it.next() orelse return error.BadResponse, "Attached");
     const idle_ms = std.fmt.parseInt(i64, it.next() orelse return error.BadResponse, 10) catch
         return error.BadResponse;
-    return .{ .text = result.text, .windows = windows, .attached = attached, .idle_ms = idle_ms };
+    const title = it.rest();
+    return .{
+        .text = result.text,
+        .windows = windows,
+        .attached = attached,
+        .idle_ms = idle_ms,
+        .title = title,
+    };
 }
 
 /// Run a control command against a session, mapping a missing daemon
@@ -401,13 +411,15 @@ fn cmdLs(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
             if (i > 0) try out.append(alloc, ',');
             try out.appendSlice(alloc, "{\"name\":");
             try appendJsonString(alloc, &out, entry.name);
-            const tail = try std.fmt.allocPrint(alloc, ",\"windows\":{d},\"attached\":{},\"idle_ms\":{d}}}", .{
+            const tail = try std.fmt.allocPrint(alloc, ",\"windows\":{d},\"attached\":{},\"idle_ms\":{d},\"title\":", .{
                 entry.info.windows,
                 entry.info.attached,
                 entry.info.idle_ms,
             });
             defer alloc.free(tail);
             try out.appendSlice(alloc, tail);
+            try appendJsonString(alloc, &out, entry.info.title);
+            try out.append(alloc, '}');
         }
         try out.appendSlice(alloc, "]\n");
         return stdoutWrite(out.items);
@@ -418,14 +430,15 @@ fn cmdLs(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     }
 
     try appendPadded(alloc, &out, "NAME", name_width);
-    try out.appendSlice(alloc, "  WINDOWS  STATE     IDLE\n");
+    try out.appendSlice(alloc, "  WINDOWS  STATE     IDLE  TITLE\n");
     for (infos.items) |entry| {
         try appendPadded(alloc, &out, entry.name, name_width);
         var idle_buf: [32]u8 = undefined;
-        const line = try std.fmt.allocPrint(alloc, "  {d: >7}  {s: <8}  {s}\n", .{
+        const line = try std.fmt.allocPrint(alloc, "  {d: >7}  {s: <8}  {s: <4}  {s}\n", .{
             entry.info.windows,
             if (entry.info.attached) "attached" else "detached",
             fmtIdle(&idle_buf, entry.info.idle_ms),
+            entry.info.title,
         });
         defer alloc.free(line);
         try out.appendSlice(alloc, line);

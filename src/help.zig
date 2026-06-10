@@ -117,13 +117,14 @@ pub const commands = [_]Entry{
         .body =
         \\usage: boo ls [--json]
         \\
-        \\List sessions: name, window count, attach state, and idle
-        \\time (time since the last window output or client input).
-        \\Stale sockets left by crashed daemons are cleaned up.
+        \\List sessions: name, window count, attach state, idle time
+        \\(time since the last window output or client input), and the
+        \\active window's title. Stale sockets left by crashed daemons
+        \\are cleaned up.
         \\
         \\flags:
         \\  --json  emit a JSON array:
-        \\          [{"name","windows","attached","idle_ms"}]
+        \\          [{"name","windows","attached","idle_ms","title"}]
         \\
         ,
     },
@@ -310,7 +311,8 @@ pub const topics = [_]Entry{
         \\  control keys; stdin mode is binary safe.
         \\
         \\machine-readable output:
-        \\  boo ls --json       [{"name","windows","attached","idle_ms"}]
+        \\  boo ls --json       [{"name","windows","attached","idle_ms",
+        \\                        "title"}]
         \\  boo windows --json  [{"id","active","idle_ms","command","title"}]
         \\  boo peek --json     {"session","window","title","rows","cols",
         \\                       "cursor":{"row","col"},"screen"}

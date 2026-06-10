@@ -510,6 +510,10 @@ test "session listing shows attach state" {
     defer alloc.free(detached.stderr);
     try std.testing.expect(std.mem.indexOf(u8, detached.stdout, "listed") != null);
     try std.testing.expect(std.mem.indexOf(u8, detached.stdout, "detached") != null);
+    // The listing includes the active window's title (the launch
+    // command until the app sets one).
+    try std.testing.expect(std.mem.indexOf(u8, detached.stdout, "TITLE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detached.stdout, "cat") != null);
 
     // `at` is the documented shorthand for attach.
     var client = try PtyClient.spawn(&h, &.{ "at", "listed" }, 24, 80);
@@ -711,6 +715,12 @@ test "reattach restores the window title" {
         try deadline.tick("window title never updated");
     }
 
+    // The session listing shows the same title.
+    const ls = try h.run(&.{"ls"});
+    defer alloc.free(ls.stdout);
+    defer alloc.free(ls.stderr);
+    try std.testing.expect(std.mem.indexOf(u8, ls.stdout, "TTL-MARK") != null);
+
     // Reattach: the repaint must restore the title on the client's
     // terminal, not just the screen contents.
     var client = try PtyClient.spawn(&h, &.{ "attach", "ttl" }, 24, 80);
@@ -780,6 +790,7 @@ test "ls and windows emit machine-readable JSON" {
         try std.testing.expectEqual(false, obj.get("attached").?.bool);
         try std.testing.expectEqual(@as(i64, 1), obj.get("windows").?.integer);
         try std.testing.expect(obj.get("idle_ms").?.integer >= 0);
+        try std.testing.expectEqualStrings("cat", obj.get("title").?.string);
     }
 
     const wins = try h.run(&.{ "windows", "js", "--json" });

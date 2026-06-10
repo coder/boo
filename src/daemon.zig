@@ -391,14 +391,23 @@ pub const Daemon = struct {
                 if (c.attached and !c.closed) attached = true;
             }
             const idle: i64 = @max(0, now - self.last_activity_ms);
-            const info = try std.fmt.allocPrint(self.alloc, "{s}\t{d}\t{s}\t{d}", .{
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(self.alloc);
+            try out.print(self.alloc, "{s}\t{d}\t{s}\t{d}\t", .{
                 self.opts.name,
                 self.windows.items.len,
                 if (attached) "Attached" else "Detached",
                 idle,
             });
-            defer self.alloc.free(info);
-            conn.send(.ok, info);
+            // Active window title last; sanitized, so it cannot
+            // contain the tabs that separate the fields.
+            if (self.activeWindow()) |w| {
+                for (w.title()) |byte| {
+                    if (byte < 0x20 or byte == 0x7f) continue;
+                    try out.append(self.alloc, byte);
+                }
+            }
+            conn.send(.ok, out.items);
         } else if (std.mem.eql(u8, cmd, "quit")) {
             conn.send(.ok, "");
             for (self.windows.items) |w| {
