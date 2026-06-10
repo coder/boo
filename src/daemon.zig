@@ -11,6 +11,7 @@ const posix = std.posix;
 
 const protocol = @import("protocol.zig");
 const keys = @import("keys.zig");
+const altscreen = @import("altscreen.zig");
 const windowpkg = @import("window.zig");
 const Window = windowpkg.Window;
 const main = @import("main.zig");
@@ -420,25 +421,37 @@ pub const Daemon = struct {
             win.dead = true;
             return;
         }
+        const chunk = buf[0..n];
 
-        win.feed(buf[0..n]);
-        if (win.passthrough) {
-            if (self.attachedConn()) |conn| {
-                // Forward raw bytes, minus alternate-screen toggles:
-                // the client canvas cannot switch screens. When the
-                // window switches, drop the rest of the chunk and
-                // repaint the new active screen from terminal state.
-                var out_buf: [32 * 1024 + 32]u8 = undefined;
-                var writer = std.Io.Writer.fixed(&out_buf);
-                const switched = win.alt_filter.feed(buf[0..n], &writer) catch true;
-                const filtered = writer.buffered();
-                if (filtered.len > 0) conn.send(.output, filtered);
-                if (switched) {
-                    self.repaintTo(conn) catch |err| {
-                        log.warn("repaint after screen switch failed: {}", .{err});
-                    };
-                }
-            }
+        const conn = (if (win.passthrough) self.attachedConn() else null) orelse {
+            // Not passed through: the window answers queries itself.
+            win.feed(chunk);
+            return;
+        };
+
+        // Forward raw bytes, minus alternate-screen toggles: the client
+        // canvas cannot switch screens. When the window switches, the
+        // rest of the chunk is dropped and the new active screen is
+        // repainted from terminal state.
+        var out_buf: [32 * 1024 + 32]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&out_buf);
+        const result = win.alt_filter.feed(chunk, &writer) catch
+            altscreen.Filter.Result{ .switched = true, .discard_start = 0 };
+
+        // Bytes up to the discard point reach the client's real
+        // terminal, which answers any queries among them. The repaint
+        // re-renders the discarded tail from terminal state, but it
+        // cannot answer queries, so the window must.
+        const split = result.discard_start orelse chunk.len;
+        win.feed(chunk[0..split]);
+        if (split < chunk.len) win.feedDiscarded(chunk[split..]);
+
+        const filtered = writer.buffered();
+        if (filtered.len > 0) conn.send(.output, filtered);
+        if (result.switched) {
+            self.repaintTo(conn) catch |err| {
+                log.warn("repaint after screen switch failed: {}", .{err});
+            };
         }
     }
 

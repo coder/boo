@@ -38,15 +38,31 @@ pub const Filter = struct {
 
     const State = enum { ground, esc, csi, params };
 
-    /// Scan `input`, writing passthrough bytes to `writer`. Returns
-    /// true if at least one alternate-screen toggle was removed (the
-    /// active screen changed and the client needs a repaint).
+    pub const Result = struct {
+        /// At least one alternate-screen toggle was removed: the
+        /// active screen may have changed and the client needs a
+        /// repaint.
+        switched: bool = false,
+        /// Index into the input of the first byte consumed without
+        /// being emitted, when `discard_after_switch` is active.
+        /// Discarded bytes never reach the client's terminal, so
+        /// side effects they carry (query responses) must be
+        /// produced by the caller instead.
+        discard_start: ?usize = null,
+    };
+
+    /// Scan `input`, writing passthrough bytes to `writer`. Reports
+    /// removed toggles and the start of any discarded tail.
     pub fn feed(
         self: *Filter,
         input: []const u8,
         writer: *std.Io.Writer,
-    ) std.Io.Writer.Error!bool {
-        var switched = false;
+    ) std.Io.Writer.Error!Result {
+        var result: Result = .{
+            // Still discarding from a previous feed: the whole input
+            // is consumed silently.
+            .discard_start = if (self.discarding) 0 else null,
+        };
         var run_start: usize = 0;
         var i: usize = 0;
         while (i < input.len) : (i += 1) {
@@ -112,8 +128,13 @@ pub const Filter = struct {
                             // follow-up repaint re-emits the other
                             // modes from terminal state.
                             self.len = 0;
-                            switched = true;
-                            if (self.discard_after_switch) self.discarding = true;
+                            result.switched = true;
+                            if (self.discard_after_switch) {
+                                self.discarding = true;
+                                if (result.discard_start == null) {
+                                    result.discard_start = i + 1;
+                                }
+                            }
                         } else {
                             try self.flush(writer);
                             try self.emit(writer, &.{byte});
@@ -139,7 +160,7 @@ pub const Filter = struct {
         if (self.state == .ground) {
             try self.emit(writer, input[run_start..]);
         }
-        return switched;
+        return result;
     }
 
     /// Forget held bytes and scanning state, and resume emitting. Used
@@ -176,59 +197,79 @@ pub const Filter = struct {
     }
 };
 
-fn testFeed(filter: *Filter, input: []const u8, expected: []const u8, switched: bool) !void {
+fn testFeed(filter: *Filter, input: []const u8, expected: []const u8, result: Filter.Result) !void {
     var buf: [256]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buf);
     const got = try filter.feed(input, &writer);
     try std.testing.expectEqualStrings(expected, writer.buffered());
-    try std.testing.expectEqual(switched, got);
+    try std.testing.expectEqual(result.switched, got.switched);
+    try std.testing.expectEqual(result.discard_start, got.discard_start);
 }
 
 test "plain text and ordinary sequences pass through" {
     var f: Filter = .{};
-    try testFeed(&f, "hello \x1b[2J\x1b[1;5H\x1b[31mworld", "hello \x1b[2J\x1b[1;5H\x1b[31mworld", false);
+    try testFeed(&f, "hello \x1b[2J\x1b[1;5H\x1b[31mworld", "hello \x1b[2J\x1b[1;5H\x1b[31mworld", .{});
 }
 
 test "non-screen private modes pass through" {
     var f: Filter = .{};
-    try testFeed(&f, "\x1b[?25l\x1b[?2004h\x1b[?1000h", "\x1b[?25l\x1b[?2004h\x1b[?1000h", false);
+    try testFeed(&f, "\x1b[?25l\x1b[?2004h\x1b[?1000h", "\x1b[?25l\x1b[?2004h\x1b[?1000h", .{});
 }
 
 test "alt screen toggles are removed" {
     var f: Filter = .{};
-    try testFeed(&f, "a\x1b[?1049hb", "ab", true);
-    try testFeed(&f, "c\x1b[?1049ld", "cd", true);
-    try testFeed(&f, "\x1b[?47h\x1b[?1047l", "", true);
+    try testFeed(&f, "a\x1b[?1049hb", "ab", .{ .switched = true });
+    try testFeed(&f, "c\x1b[?1049ld", "cd", .{ .switched = true });
+    try testFeed(&f, "\x1b[?47h\x1b[?1047l", "", .{ .switched = true });
 }
 
 test "mixed parameter list containing alt mode is removed" {
     var f: Filter = .{};
-    try testFeed(&f, "\x1b[?25;1049h", "", true);
+    try testFeed(&f, "\x1b[?25;1049h", "", .{ .switched = true });
 }
 
 test "sequence split across feeds" {
     var f: Filter = .{};
-    try testFeed(&f, "x\x1b[?10", "x", false);
-    try testFeed(&f, "49h y", " y", true);
-    try testFeed(&f, "\x1b", "", false);
-    try testFeed(&f, "[?25h", "\x1b[?25h", false);
+    try testFeed(&f, "x\x1b[?10", "x", .{});
+    try testFeed(&f, "49h y", " y", .{ .switched = true });
+    try testFeed(&f, "\x1b", "", .{});
+    try testFeed(&f, "[?25h", "\x1b[?25h", .{});
 }
 
 test "discard after switch suppresses the rest of the feed" {
     var f: Filter = .{ .discard_after_switch = true };
-    try testFeed(&f, "before\x1b[?1049hafter\x1b[2J", "before", true);
-    // The next feed resumes normal emission.
+    // "before" is 6 bytes and the toggle is 8 more; discarding
+    // begins right after the toggle's final byte.
+    try testFeed(&f, "before\x1b[?1049hafter\x1b[2J", "before", .{
+        .switched = true,
+        .discard_start = 14,
+    });
+    // Still discarding: the whole next feed is consumed.
+    try testFeed(&f, "more", "", .{ .discard_start = 0 });
+    // The next feed after a reset resumes normal emission.
     f.reset();
-    try testFeed(&f, "next", "next", false);
+    try testFeed(&f, "next", "next", .{});
+}
+
+test "discard start tracks a toggle split across feeds" {
+    var f: Filter = .{ .discard_after_switch = true };
+    try testFeed(&f, "ab\x1b[?10", "ab", .{});
+    // The toggle completes at the 'h' (index 2); "XY" is discarded.
+    try testFeed(&f, "49hXY", "", .{ .switched = true, .discard_start = 3 });
+}
+
+test "plain mode never reports a discard start" {
+    var f: Filter = .{};
+    try testFeed(&f, "\x1b[?1049hrest", "rest", .{ .switched = true });
 }
 
 test "overlong parameter list is flushed verbatim" {
     var f: Filter = .{};
     const long = "\x1b[?1;2;3;4;5;6;7;8;9;10;11;12h";
-    try testFeed(&f, long, long, false);
+    try testFeed(&f, long, long, .{});
 }
 
 test "DECRQM style sequences pass through" {
     var f: Filter = .{};
-    try testFeed(&f, "\x1b[?1049$p", "\x1b[?1049$p", false);
+    try testFeed(&f, "\x1b[?1049$p", "\x1b[?1049$p", .{});
 }

@@ -650,3 +650,72 @@ test "alt screen apps: toggles are filtered and screens repaint from state" {
     try client.waitFor("detached from altapp");
     _ = try client.waitExit();
 }
+
+test "queries in a discarded passthrough span are answered" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // On a go-signal, emit an alternate-screen toggle immediately
+    // followed by a cursor-position query, then block until the
+    // response arrives. This mirrors shells that probe the terminal
+    // at startup: the toggle flips passthrough into discard mode, so
+    // the query never reaches the test terminal (which would not
+    // answer anyway); only the daemon can unblock the read.
+    const go_path = try std.fmt.allocPrint(alloc, "{s}/go", .{h.dir});
+    defer alloc.free(go_path);
+    const script = try std.fmt.allocPrint(
+        alloc,
+        "while [ ! -e {s} ]; do sleep 0.02; done; " ++
+            "printf '\\033[?1049l\\033[6n'; " ++
+            "IFS= read -rs -d R pos; " ++
+            "printf 'CPR-ANSWERED\\n'; sleep 5",
+        .{go_path},
+    );
+    defer alloc.free(script);
+
+    var client = try PtyClient.spawn(&h, &.{ "-S", "qry", "bash", "-c", script }, 24, 80);
+    defer client.deinit();
+    try h.waitSessionUp("qry");
+    // Wait for the attach repaint so the burst takes the passthrough
+    // path rather than being answered as an unattached window.
+    try client.waitFor("\x1b[H\x1b[2J");
+
+    try std.fs.cwd().writeFile(.{ .sub_path = go_path, .data = "" });
+    try client.waitFor("CPR-ANSWERED");
+}
+
+test "reattach restores the window title" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("ttl", &.{"sh"});
+
+    // Set the title from inside the window. The title is assembled
+    // from two printf arguments so the echoed command line (which
+    // ends up in the repainted screen content) never contains the
+    // assembled marker.
+    try h.mustControl("ttl", &.{ "stuff", "printf '\\\\033]2;TTL-%s\\\\007' MARK\\n" });
+
+    // The window list reflects the OSC title once processed.
+    var deadline = Deadline.init(default_timeout_ms);
+    while (true) {
+        const result = try h.control("ttl", &.{"windows"});
+        const found = std.mem.indexOf(u8, result.stdout, "TTL-MARK") != null;
+        alloc.free(result.stdout);
+        alloc.free(result.stderr);
+        if (found) break;
+        try deadline.tick("window title never updated");
+    }
+
+    // Reattach: the repaint must restore the title on the client's
+    // terminal, not just the screen contents.
+    var client = try PtyClient.spawn(&h, &.{ "-r", "ttl" }, 24, 80);
+    defer client.deinit();
+    try client.waitFor("\x1b]2;TTL-MARK\x07");
+
+    try client.send("\x01d");
+    try client.waitFor("detached from ttl");
+    _ = try client.waitExit();
+}

@@ -29,6 +29,11 @@ pub const Window = struct {
     /// the daemon or left to the client's real terminal.
     passthrough: bool = false,
 
+    /// True while feeding bytes whose passthrough copy was discarded
+    /// (see `feedDiscarded`); forces daemon-side query responses even
+    /// when passing through.
+    feeding_discarded: bool = false,
+
     /// Strips alternate-screen toggles from passthrough output; the
     /// daemon repaints from terminal state on screen switches instead.
     alt_filter: altscreen.Filter = .{ .discard_after_switch = true },
@@ -111,9 +116,11 @@ pub const Window = struct {
     /// queries, ...). When a client is attached and this window is being
     /// passed through raw, the client's real terminal sees the query and
     /// answers it, so the daemon stays quiet to avoid double responses.
+    /// Bytes the passthrough discarded never reach that terminal, so
+    /// queries among them are answered here after all.
     fn effectWritePty(handler: *Stream.Handler, data: [:0]const u8) void {
         const self = fromHandler(handler);
-        if (self.passthrough) return;
+        if (self.passthrough and !self.feeding_discarded) return;
         if (self.pty_fd < 0) return;
         protocol.writeAll(self.pty_fd, data) catch |err| {
             log.warn("window {d}: failed writing query response: {}", .{ self.id, err });
@@ -156,6 +163,17 @@ pub const Window = struct {
 
     /// Feed child output into the terminal emulator.
     pub fn feed(self: *Window, bytes: []const u8) void {
+        self.stream.nextSlice(bytes);
+    }
+
+    /// Feed child output that was dropped from the passthrough stream
+    /// (everything after an alternate-screen switch until the repaint).
+    /// The client's real terminal never sees these bytes, so queries in
+    /// them must be answered by the daemon or the application blocks
+    /// waiting for a response that nobody sends.
+    pub fn feedDiscarded(self: *Window, bytes: []const u8) void {
+        self.feeding_discarded = true;
+        defer self.feeding_discarded = false;
         self.stream.nextSlice(bytes);
     }
 
@@ -209,6 +227,10 @@ pub const Window = struct {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
         try out.writer.writeAll(sanitize_sequence);
+        // The formatter does not emit the title, so without this the
+        // client terminal's title would go stale across reattach and
+        // window switches.
+        try writeTitle(self.title(), &out.writer);
         var filter: altscreen.Filter = .{};
         _ = try filter.feed(raw.writer.buffered(), &out.writer);
 
@@ -231,6 +253,17 @@ pub const Window = struct {
         try writer.print("\x1b[{d};{d}H", .{ row + 1, col + 1 });
     }
 };
+
+/// OSC 2: set the client terminal's window title. Control bytes are
+/// dropped so the title text cannot terminate or corrupt the sequence.
+fn writeTitle(title: []const u8, writer: *std.Io.Writer) !void {
+    try writer.writeAll("\x1b]2;");
+    for (title) |byte| {
+        if (byte < 0x20 or byte == 0x7f) continue;
+        try writer.writeByte(byte);
+    }
+    try writer.writeByte(0x07);
+}
 
 /// Resets every piece of terminal state a window's repaint or
 /// passthrough may have changed, without touching the screen choice or
@@ -290,4 +323,26 @@ test "window state machine without a child" {
     const repainted = out.writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, repainted, "red") != null);
     try std.testing.expect(std.mem.indexOf(u8, repainted, "\x1b[") != null);
+}
+
+test "title set via OSC is tracked and emitted sanitized" {
+    const alloc = std.testing.allocator;
+
+    var term = try vt.Terminal.init(alloc, .{ .cols = 20, .rows = 5 });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    stream.nextSlice("\x1b]2;my title\x07");
+    try std.testing.expectEqualStrings("my title", term.getTitle().?);
+
+    var buf: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try writeTitle(term.getTitle().?, &writer);
+    try std.testing.expectEqualStrings("\x1b]2;my title\x07", writer.buffered());
+
+    // Control bytes in a title cannot break out of the sequence.
+    writer = std.Io.Writer.fixed(&buf);
+    try writeTitle("a\x1b\x07b\x7f!", &writer);
+    try std.testing.expectEqualStrings("\x1b]2;ab!\x07", writer.buffered());
 }
