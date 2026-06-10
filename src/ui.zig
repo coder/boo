@@ -55,6 +55,10 @@ pub const Layout = struct {
     /// Each session occupies two sidebar rows: name and title.
     pub const entry_rows: u16 = 2;
 
+    /// Sidebar rows above the session list: the new-session button
+    /// and a separating blank row.
+    pub const list_top: u16 = 2;
+
     pub fn init(rows: u16, cols: u16) Layout {
         // Narrow terminals get a proportionally smaller sidebar; the
         // viewport keeps at least a sliver so the focused session
@@ -78,9 +82,9 @@ pub const Layout = struct {
     }
 
     /// Sidebar rows available for session entries between the
-    /// new-session row and the status bar.
+    /// new-session button (plus its gap row) and the status bar.
     pub fn listRows(self: Layout) u16 {
-        return self.rows -| 2;
+        return self.rows -| (list_top + 1);
     }
 
     /// Whole session entries that fit in the list area.
@@ -108,8 +112,9 @@ pub const Layout = struct {
         }
         if (x >= self.sidebar_w) return .none; // separator column
         if (y == 0) return .new_button;
+        if (y < list_top) return .none; // gap under the button
         return .{ .session = .{
-            .row = y - 1,
+            .row = y - list_top,
             .kill = self.sidebar_w >= 12 and x == self.sidebar_w - 2,
         } };
     }
@@ -1737,8 +1742,13 @@ const Ui = struct {
             try out.appendSlice(alloc, sgr_reset);
             return;
         }
+        if (y < Layout.list_top) {
+            // Blank gap between the button and the session list.
+            try appendClipped(alloc, out, "", w);
+            return;
+        }
 
-        const row = y - 1;
+        const row = y - Layout.list_top;
         const idx = self.scroll + row / Layout.entry_rows;
         if (idx < self.sessions.items.len) {
             const entry = self.sessions.items[idx];
@@ -1757,9 +1767,14 @@ const Ui = struct {
     fn composeViewportCell(self: *Ui, y: u16, out: *std.ArrayList(u8)) !void {
         const alloc = self.alloc;
 
+        // Erase before drawing. Erasing afterwards would eat the last
+        // cell of a row that touches the terminal's right edge: the
+        // cursor rests on that cell in the pending-wrap state, and EL
+        // erases from the cursor inclusive.
+        try out.appendSlice(alloc, "\x1b[K");
+
         const v = self.view orelse {
-            try self.composeEmptyRow(y, "no sessions", "press C-a c or click + new session", out);
-            try out.appendSlice(alloc, "\x1b[K");
+            try self.composeNoSessions(y, out);
             return;
         };
 
@@ -1767,12 +1782,10 @@ const Ui = struct {
             .live => {},
             .stolen => {
                 try self.composeEmptyRow(y, "attached elsewhere", "click the session to steal it back", out);
-                try out.appendSlice(alloc, "\x1b[K");
                 return;
             },
             .ended, .lost => {
                 try self.composeEmptyRow(y, "session ended", "pick another session on the left", out);
-                try out.appendSlice(alloc, "\x1b[K");
                 return;
             },
         }
@@ -1781,7 +1794,6 @@ const Ui = struct {
             try appendTermRow(alloc, &v.term, y, out);
         }
         try out.appendSlice(alloc, sgr_reset);
-        try out.appendSlice(alloc, "\x1b[K");
 
         // An in-progress mouse selection is highlighted by repainting
         // the selected cells in reverse video over the row content.
@@ -1818,6 +1830,51 @@ const Ui = struct {
         for (0..pad) |_| try out.append(self.alloc, ' ');
         try out.appendSlice(self.alloc, text);
         try out.appendSlice(self.alloc, sgr_reset);
+    }
+
+    /// The boo wordmark and its ghost, shown when no sessions exist.
+    const ghost_art = [_][]const u8{
+        " _                     .-.",
+        "| |__   ___   ___     (o o)",
+        "| '_ \\ / _ \\ / _ \\    | O \\",
+        "| |_) | (_) | (_) |    \\   \\",
+        "|_.__/ \\___/ \\___/      `~~~'",
+    };
+
+    /// Empty state for a boo with no sessions at all: the wordmark
+    /// art centered as a block, then a hint underneath.
+    fn composeNoSessions(self: *Ui, y: u16, out: *std.ArrayList(u8)) !void {
+        const alloc = self.alloc;
+        const l = self.layout;
+        const vw = l.viewportCols();
+
+        const art_h: u16 = ghost_art.len;
+        const total: u16 = art_h + 3; // art, blank, two hint lines
+        const top = (l.viewportRows() -| total) / 2;
+        if (y < top) return;
+        const line = y - top;
+
+        if (line < art_h) {
+            var art_w: usize = 0;
+            for (ghost_art) |a| art_w = @max(art_w, a.len);
+            if (art_w >= vw) return;
+            const pad = (vw - art_w) / 2;
+            for (0..pad) |_| try out.append(alloc, ' ');
+            try out.appendSlice(alloc, ghost_art[line]);
+            return;
+        }
+
+        const text: []const u8 = switch (line) {
+            art_h + 1 => "no sessions",
+            art_h + 2 => "Press Ctrl+A for Keybinds",
+            else => return,
+        };
+        if (text.len >= vw) return;
+        const pad = (vw - text.len) / 2;
+        try out.appendSlice(alloc, style_dim);
+        for (0..pad) |_| try out.append(alloc, ' ');
+        try out.appendSlice(alloc, text);
+        try out.appendSlice(alloc, sgr_reset);
     }
 };
 
@@ -2020,20 +2077,22 @@ test "layout: geometry and hit testing" {
     try std.testing.expectEqual(@as(u16, 75), l.viewportCols());
     try std.testing.expectEqual(@as(u16, 25), l.viewportX());
     try std.testing.expectEqual(@as(u16, 23), l.viewportRows());
-    try std.testing.expectEqual(@as(usize, 11), l.visibleEntries());
+    try std.testing.expectEqual(@as(usize, 10), l.visibleEntries());
 
-    // The new-session button is the top row; the status bar spans
-    // the full width of the last row.
+    // The new-session button is the top row, a blank gap sits under
+    // it, and the status bar spans the full width of the last row.
     try std.testing.expectEqual(Layout.Hit.new_button, l.hit(3, 0));
+    try std.testing.expectEqual(Layout.Hit.none, l.hit(3, 1));
     try std.testing.expectEqual(Layout.Hit.status, l.hit(3, 23));
     try std.testing.expectEqual(Layout.Hit.status, l.hit(80, 23));
     try std.testing.expectEqual(Layout.Hit.none, l.hit(24, 5)); // separator
 
     // Sessions take two display rows: name, then title.
     const s = l.hit(3, 5);
-    try std.testing.expectEqual(@as(u16, 4), s.session.row);
+    try std.testing.expectEqual(@as(u16, 3), s.session.row);
     try std.testing.expect(!s.session.kill);
-    const k = l.hit(22, 5);
+    const k = l.hit(22, 4);
+    try std.testing.expectEqual(@as(u16, 2), k.session.row);
     try std.testing.expect(k.session.kill);
 
     const v = l.hit(30, 7);

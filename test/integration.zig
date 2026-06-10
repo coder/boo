@@ -6,6 +6,7 @@
 const std = @import("std");
 const posix = std.posix;
 const build_options = @import("build_options");
+const vt = @import("ghostty-vt");
 
 const exe_path: []const u8 = build_options.exe_path;
 
@@ -1048,6 +1049,24 @@ fn waitUiSessionCount(h: *Harness, want: usize) !void {
     }
 }
 
+/// Render raw client output through a terminal emulator and return
+/// the resulting screen text, one line per row. Raw byte matching
+/// cannot tell whether content survives on screen (a later erase can
+/// remove it); this can.
+fn renderScreen(
+    alloc: std.mem.Allocator,
+    bytes: []const u8,
+    rows: u16,
+    cols: u16,
+) ![]const u8 {
+    var term = try vt.Terminal.init(alloc, .{ .cols = cols, .rows = rows });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice(bytes);
+    return term.screens.active.dumpStringAlloc(alloc, .{ .screen = .{} });
+}
+
 test "ui: sidebar lists sessions and the focused session renders in the viewport" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
@@ -1135,6 +1154,59 @@ test "ui: mouse events forward natively when the application asks for them" {
     try ui.waitFor("^[[<0;5;3M^[[<0;5;3m");
 }
 
+test "ui: a row touching the viewport's right edge keeps its last cell" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("edge", &.{"sh"});
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("+ new session");
+
+    // Paint a marker whose final cell sits in the session's last
+    // column (75 wide inside a 100-column UI), which lands in the
+    // last column of the whole terminal. The marker is assembled
+    // from a variable so the echoed command line cannot match.
+    try h.sendLine("edge", "T=EDGE; printf \"\\\\033[3;71H${T}Z\"");
+    try ui.waitFor("EDGEZ");
+    // The status bar repaints after arming the prefix, so once the
+    // keybind bar shows, the marker row's frame is fully captured.
+    try ui.send("\x01");
+    try ui.waitFor("r rename");
+    try ui.send("\x1b");
+
+    // Erase-to-EOL emitted after a full-width row would eat the last
+    // cell (the cursor rests on it in the pending-wrap state), so the
+    // marker must survive on the rendered screen, not just in the
+    // byte stream.
+    const screen = try renderScreen(alloc, ui.output.items, 24, 100);
+    defer alloc.free(screen);
+    try std.testing.expect(std.mem.indexOf(u8, screen, "EDGEZ") != null);
+
+    // The sidebar separates the new-session button from the first
+    // session row with a blank gap row.
+    var lines = std.mem.splitScalar(u8, screen, '\n');
+    _ = lines.next(); // button row
+    const gap = lines.next().?;
+    try std.testing.expect(std.mem.startsWith(u8, gap, " " ** 24 ++ "\u{2502}"));
+    const first = lines.next().?;
+    try std.testing.expect(std.mem.indexOf(u8, first, "edge") != null);
+}
+
+test "ui: the empty state shows the ghost and the keybind hint" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("(o o)");
+    try ui.waitFor("no sessions");
+    try ui.waitFor("Press Ctrl+A for Keybinds");
+}
+
 test "ui: clicking a session in the sidebar focuses it" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
@@ -1151,10 +1223,11 @@ test "ui: clicking a session in the sidebar focuses it" {
     defer ui.deinit();
     try ui.waitFor("TWO-MARK"); // most recent session focused
 
-    // Sessions are sorted by name: "one" on sidebar row 2 (1-based).
-    // An SGR press + release on that row switches the viewport.
+    // Sessions are sorted by name: "one" on sidebar row 3 (1-based,
+    // under the button and its gap row). An SGR press + release on
+    // that row switches the viewport.
     ui.clearOutput();
-    try ui.send("\x1b[<0;5;2M\x1b[<0;5;2m");
+    try ui.send("\x1b[<0;5;3M\x1b[<0;5;3m");
     try ui.waitFor("ONE-MARK");
 }
 
@@ -1203,8 +1276,8 @@ test "ui: clicking the kill target asks for confirmation" {
     try ui.waitFor("victim");
 
     // The kill target is the 'x' in the second-to-last sidebar
-    // column (sidebar width 24 -> 1-based column 23), row 2.
-    try ui.send("\x1b[<0;23;2M\x1b[<0;23;2m");
+    // column (sidebar width 24 -> 1-based column 23), row 3.
+    try ui.send("\x1b[<0;23;3M\x1b[<0;23;3m");
     try ui.waitFor("kill victim? y/n");
     try ui.send("y");
     try waitUiSessionCount(&h, 0);
@@ -1287,7 +1360,7 @@ test "ui: a plain attach steals the focused session" {
     try ui.waitFor("attached elsewhere");
 
     // Clicking the session in the sidebar steals it back.
-    try ui.send("\x1b[<0;5;2M\x1b[<0;5;2m");
+    try ui.send("\x1b[<0;5;3M\x1b[<0;5;3m");
     try thief.waitFor("attached elsewhere");
     _ = try thief.waitExit();
 }

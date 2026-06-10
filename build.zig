@@ -53,6 +53,14 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     integration_mod.addOptions("build_options", test_opts);
+    // The tests render captured client output through a terminal
+    // emulator to assert what a user would actually see.
+    if (b.lazyDependency("ghostty", .{
+        .target = target,
+        .optimize = optimize,
+    })) |dep| {
+        integration_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
+    }
 
     const integration_tests = b.addTest(.{ .root_module = integration_mod });
     const run_integration_tests = b.addRunArtifact(integration_tests);
