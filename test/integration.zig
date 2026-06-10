@@ -869,38 +869,23 @@ test "wait --for and --idle observe session output" {
     try h.runExit(&.{ "wait", "w1", "--for", "NEVER-APPEARS", "--timeout", "300ms" }, 4);
 }
 
-test "zero-arg boo creates a session, then reattaches it" {
+test "zero-arg boo prints the help overview" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
     defer h.deinit();
 
-    // No sessions: boo starts one running the default shell. Wait
-    // for the attach repaint before typing; input sent before the
-    // client enters raw mode is flushed by tcsetattr.
-    var first = try PtyClient.spawn(&h, &.{}, 24, 80);
-    defer first.deinit();
-    try first.waitFor("\x1b[H\x1b[2J");
-    try first.send("echo Z-MARK-$((70+7))\r");
-    try first.waitFor("Z-MARK-77");
-    try first.send("\x01d");
-    try first.waitFor("detached from");
-    try std.testing.expectEqual(@as(u32, 0), try first.waitExit());
+    const result = try h.run(&.{});
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+    try std.testing.expect(result.term == .Exited and result.term.Exited == 0);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "usage:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "commands:") != null);
 
-    const ls = try h.run(&.{ "ls", "--json" });
+    // Unlike earlier versions, no session is created or attached.
+    const ls = try h.run(&.{"ls"});
     defer alloc.free(ls.stdout);
     defer alloc.free(ls.stderr);
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, ls.stdout, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);
-
-    // One live session: zero-arg boo attaches it instead of creating
-    // another; the repaint proves it is the same session.
-    var second = try PtyClient.spawn(&h, &.{}, 24, 80);
-    defer second.deinit();
-    try second.waitFor("Z-MARK-77");
-    try second.send("\x01d");
-    try second.waitFor("detached from");
-    try std.testing.expectEqual(@as(u32, 0), try second.waitExit());
+    try std.testing.expect(std.mem.indexOf(u8, ls.stdout, "No sessions") != null);
 }
 
 test "exorcise banishes every session" {

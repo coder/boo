@@ -60,7 +60,6 @@ automatically (pinned in `build.zig.zon`).
 ## Usage
 
 ```sh
-boo                        # attach the most recent session, or start one
 boo new                    # new session running $SHELL, attached
 boo new work               # named session
 boo new work -d -- make    # create detached, running a command

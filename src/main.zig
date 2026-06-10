@@ -10,7 +10,7 @@ const help = @import("help.zig");
 const paths = @import("paths.zig");
 const protocol = @import("protocol.zig");
 
-pub const version = "0.2.0";
+pub const version = "0.3.0";
 
 /// Exit codes, documented in `boo help`.
 const exit_runtime: u8 = 1;
@@ -52,7 +52,7 @@ pub fn main() !void {
     defer std.process.argsFree(alloc, argv);
     const args: []const [:0]const u8 = @ptrCast(argv[1..]);
 
-    if (args.len == 0) return cmdAuto(alloc);
+    if (args.len == 0) return stdoutWrite(help.overview);
 
     const cmd = args[0];
     const rest = args[1..];
@@ -238,17 +238,6 @@ fn mustControl(
 }
 
 // -- Commands -------------------------------------------------------------
-
-/// Zero-argument boo: attach the most recent session, else create one.
-fn cmdAuto(alloc: std.mem.Allocator) !void {
-    const dir = try paths.socketDir(alloc);
-    defer alloc.free(dir);
-    if (try pickMostRecent(alloc, dir)) |name| {
-        defer alloc.free(name);
-        return attachLoop(alloc, dir, name);
-    }
-    return createSession(alloc, dir, null, false, &.{});
-}
 
 fn cmdNew(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     var name: ?[]const u8 = null;

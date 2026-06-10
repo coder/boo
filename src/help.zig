@@ -20,10 +20,9 @@ pub const overview =
     \\human would see them.
     \\
     \\usage:
-    \\  boo [command] [arguments]
+    \\  boo <command> [arguments]
     \\
-    \\  With no arguments, boo attaches the most recently active
-    \\  session, or starts a new one if none exist.
+    \\  With no arguments, boo prints this overview.
     \\
     \\commands:
     \\  new [name] [-d] [-- cmd...]  start a session (attach unless -d)
