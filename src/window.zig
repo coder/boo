@@ -24,6 +24,10 @@ pub const Window = struct {
     /// Fallback title: the command that was launched.
     command_title: []const u8,
 
+    /// Wall-clock time (milliseconds) of the most recent child output,
+    /// maintained by the daemon. Drives `wait --idle`.
+    last_output_ms: i64,
+
     /// True while this window is the active window of an attached client.
     /// Controls whether query responses (DSR, DA, ...) are answered by
     /// the daemon or left to the client's real terminal.
@@ -70,6 +74,7 @@ pub const Window = struct {
             .pty_fd = spawned.master,
             .child_pid = spawned.pid,
             .command_title = try alloc.dupe(u8, argv[0]),
+            .last_output_ms = std.time.milliTimestamp(),
             .term = undefined,
             .stream = undefined,
         };
@@ -158,7 +163,7 @@ pub const Window = struct {
 
     fn effectXtversion(handler: *Stream.Handler) []const u8 {
         _ = handler;
-        return "ghostscreen " ++ @import("main.zig").version;
+        return "boo " ++ @import("main.zig").version;
     }
 
     /// Feed child output into the terminal emulator.
@@ -196,9 +201,14 @@ pub const Window = struct {
         return self.command_title;
     }
 
-    /// Plain-text dump of the screen, for hardcopy.
+    /// Plain-text dump of the screen, for peek.
     pub fn plainScreen(self: *Window, alloc: std.mem.Allocator) ![]const u8 {
         return self.term.plainString(alloc);
+    }
+
+    /// Plain-text dump including the full scrollback history.
+    pub fn plainScrollback(self: *Window, alloc: std.mem.Allocator) ![]const u8 {
+        return self.term.screens.active.dumpStringAlloc(alloc, .{ .screen = .{} });
     }
 
     /// VT bytes that reproduce this window's full terminal state on a

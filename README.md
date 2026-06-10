@@ -1,52 +1,53 @@
-# ghostscreen
+# boo
 
-A GNU `screen` style terminal multiplexer built on
-[libghostty](https://github.com/ghostty-org/ghostty) (`libghostty-vt`),
-written in Zig.
+Sessions that haunt your terminal. A GNU `screen` style terminal
+multiplexer built on [libghostty](https://github.com/ghostty-org/ghostty)
+(`libghostty-vt`), written in Zig.
 
 Every window's output is parsed through Ghostty's terminal emulation
-core, so ghostscreen always knows the exact screen state of every
-window: contents, styles, cursor, scrollback, and terminal modes. That
-state is used to rehydrate your terminal on attach and window switches,
-to answer terminal queries for background windows, and to produce
-plain-text hardcopies.
+core, so boo always knows the exact screen state of every window:
+contents, styles, cursor, scrollback, and terminal modes. That state is
+used to rehydrate your terminal on attach and window switches, to
+answer terminal queries for background windows, and to let scripts and
+AI agents read the screen exactly as a human would see it.
 
 ## Features
 
 - Sessions that survive disconnects: detach with `C-a d`, reattach with
-  `ghostscreen -r`.
+  `boo attach`.
 - Multiple windows per session with screen-style `C-a` key bindings.
 - Faithful redraws from libghostty terminal state, including SGR styles,
-  cursor position, scrolling regions, and terminal modes (alt screen,
-  bracketed paste, mouse reporting, kitty keyboard, ...).
+  cursor position, scrolling regions, window title, and terminal modes
+  (alt screen, bracketed paste, mouse reporting, kitty keyboard, ...).
 - Screen-style terminal etiquette: the attached client renders inside
   your terminal's alternate screen, so attaching never disturbs your
   shell scrollback and detaching restores your pre-attach view.
   Alternate-screen switches by apps inside a window are tracked in
   terminal state and repainted, never passed through raw.
-- Scriptable control commands (`-X`), including `stuff` and `hardcopy`.
+- Agent-friendly automation primitives: `send`, `peek`, `wait`, and
+  `--json` output, all usable without a terminal.
 - Resize propagation end to end (SIGWINCH -> client -> daemon -> window
   PTY -> application).
 
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/coder/ghostscreen/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/coder/boo/main/install.sh | sh
 ```
 
 Pre-built binaries for Linux (x86_64, aarch64; fully static) and macOS
 (x86_64, aarch64) are published on the
-[releases page](https://github.com/coder/ghostscreen/releases). Set
-`GHOSTSCREEN_VERSION` to pin a release and `GHOSTSCREEN_INSTALL_DIR` to
-change the install location (default: `/usr/local/bin` when writable,
-otherwise `~/.local/bin`).
+[releases page](https://github.com/coder/boo/releases). Set
+`BOO_VERSION` to pin a release and `BOO_INSTALL_DIR` to change the
+install location (default: `/usr/local/bin` when writable, otherwise
+`~/.local/bin`).
 
 ## Building
 
 Requires [Zig](https://ziglang.org) 0.15.2.
 
 ```sh
-zig build                       # binary in zig-out/bin/ghostscreen
+zig build                       # binary in zig-out/bin/boo
 zig build test                  # unit tests
 zig build test-integration     # end-to-end tests on a real PTY
 zig build test-all             # everything
@@ -58,15 +59,19 @@ automatically (pinned in `build.zig.zon`).
 ## Usage
 
 ```sh
-ghostscreen                   # new session running $SHELL, attached
-ghostscreen htop              # new session running a command
-ghostscreen -S work           # named session
-ghostscreen -d -m -S work     # create detached
-ghostscreen -ls               # list sessions
-ghostscreen -r work           # reattach (steals if attached elsewhere)
-ghostscreen -S work -X stuff 'echo hi\n'        # type into the session
-ghostscreen -S work -X hardcopy /tmp/screen.txt # dump screen as text
+boo                        # attach the most recent session, or start one
+boo new                    # new session running $SHELL, attached
+boo new work               # named session
+boo new work -d -- make    # create detached, running a command
+boo ls                     # list sessions
+boo attach work            # reattach (steals if attached elsewhere)
+boo at w                   # same: alias + unique-prefix matching
+boo kill work              # end a session
+boo exorcise               # end every session
 ```
+
+Run `boo help` for the full overview, `boo help <command>` for flags
+and examples, and `boo help --all` to print every help page at once.
 
 ### Key bindings (prefix `C-a`)
 
@@ -85,26 +90,51 @@ Bindings follow GNU screen's defaults, including the `C-x` variants
 | `C-a l`, `C-a C-l` | redraw                     |
 | `C-a a`   | send a literal `C-a`                |
 
-### Control commands (`-X`)
+## Automation
 
-`stuff <text>` (with `\n \r \t \e \xHH` escapes), `hardcopy <path>`,
-`new-window [cmd ...]`, `select <n>`, `next`, `prev`, `windows`,
-`kill-window`, `info`, `quit`.
+Everything except `attach` works without a terminal, which makes boo a
+natural sandbox for scripts and AI agents driving interactive programs.
+The canonical loop:
+
+```sh
+boo new build -d -- bash           # 1. headless session
+boo send -s build 'make' --enter   # 2. type into it
+boo wait build --idle 2s           # 3. let output settle
+boo peek build --scrollback        # 4. read the screen
+boo kill build                     # 5. clean up
+```
+
+- **Reading state**: `peek` prints the rendered screen reconstructed
+  from terminal state, not a raw byte log: ordered, fully redrawn, and
+  stable. `--scrollback` includes history; `--json` adds size, cursor,
+  window id, and title.
+- **Waiting**: `wait --for <text>` blocks until the screen contains the
+  text; `wait --idle <dur>` until output settles; `--timeout <dur>`
+  exits 4 instead of hanging forever. No more sleep-and-poll loops.
+- **Sending input**: `send` is literal: no escape processing, no
+  implicit newline, no quoting layer to fight. `--enter` submits,
+  `--key Enter,C-c,Up` names control keys, and stdin mode is binary
+  safe.
+- **Machine-readable output**: `ls --json`, `windows --json`, and
+  `peek --json`.
+- **Exit codes**: `0` success, `1` error, `2` usage error, `3` no such
+  session, `4` wait timed out.
+
+See `boo help automation` for the full page.
 
 ### Environment
 
-- `GHOSTSCREEN_DIR`: socket directory (default
-  `$XDG_RUNTIME_DIR/ghostscreen`, else `/tmp/ghostscreen-<uid>`).
-- `GHOSTSCREEN_LOG`: daemon log file (daemon logging is otherwise
-  discarded).
+- `BOO_DIR`: socket directory (default `$XDG_RUNTIME_DIR/boo`, else
+  `/tmp/boo-<uid>`).
+- `BOO_LOG`: daemon log file (daemon logging is otherwise discarded).
 
 ## Architecture
 
 ```
-your terminal <-(raw tty)-> ghostscreen client <-(unix socket)-> session daemon
-                                                                  |- window 0: PTY + ghostty-vt Terminal
-                                                                  |- window 1: PTY + ghostty-vt Terminal
-                                                                  `- ...
+your terminal <-(raw tty)-> boo client <-(unix socket)-> session daemon
+                                                         |- window 0: PTY + ghostty-vt Terminal
+                                                         |- window 1: PTY + ghostty-vt Terminal
+                                                         `- ...
 ```
 
 - The **client** puts your TTY in raw mode and shuttles bytes over a

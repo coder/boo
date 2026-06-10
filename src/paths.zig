@@ -18,19 +18,19 @@ pub fn validateName(name: []const u8) NameError!void {
 }
 
 /// Resolve the runtime directory that holds session sockets:
-/// $GHOSTSCREEN_DIR, else $XDG_RUNTIME_DIR/ghostscreen, else
-/// /tmp/ghostscreen-<uid>. The directory is created with mode 0700.
+/// $BOO_DIR, else $XDG_RUNTIME_DIR/boo, else /tmp/boo-<uid>.
+/// The directory is created with mode 0700.
 pub fn socketDir(alloc: std.mem.Allocator) ![]u8 {
     const dir = dir: {
-        if (std.posix.getenv("GHOSTSCREEN_DIR")) |d| {
+        if (std.posix.getenv("BOO_DIR")) |d| {
             if (d.len > 0) break :dir try alloc.dupe(u8, d);
         }
         if (std.posix.getenv("XDG_RUNTIME_DIR")) |d| {
-            if (d.len > 0) break :dir try std.fs.path.join(alloc, &.{ d, "ghostscreen" });
+            if (d.len > 0) break :dir try std.fs.path.join(alloc, &.{ d, "boo" });
         }
         break :dir try std.fmt.allocPrint(
             alloc,
-            "/tmp/ghostscreen-{d}",
+            "/tmp/boo-{d}",
             .{std.c.getuid()},
         );
     };

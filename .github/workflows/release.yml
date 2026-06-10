@@ -36,8 +36,8 @@ jobs:
           mkdir -p dist
           for target in x86_64-linux-musl aarch64-linux-musl x86_64-macos aarch64-macos; do
             zig build -Dtarget="$target" -Doptimize=ReleaseSafe -p "zig-out/$target"
-            asset="ghostscreen-${target%-musl}"
-            tar -czf "dist/$asset.tar.gz" -C "zig-out/$target/bin" ghostscreen
+            asset="boo-${target%-musl}"
+            tar -czf "dist/$asset.tar.gz" -C "zig-out/$target/bin" boo
           done
       - name: Generate checksums
         run: cd dist && sha256sum *.tar.gz > SHA256SUMS
@@ -49,4 +49,4 @@ jobs:
             --title "$GITHUB_REF_NAME" \
             --verify-tag \
             --generate-notes \
-            --notes "Install: \`curl -fsSL https://raw.githubusercontent.com/coder/ghostscreen/main/install.sh | sh\`"
+            --notes "Install: \`curl -fsSL https://raw.githubusercontent.com/coder/boo/main/install.sh | sh\`"

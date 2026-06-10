@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const run_step = b.step("run", "Run ghostscreen");
+    const run_step = b.step("run", "Run boo");
     const test_step = b.step("test", "Run unit tests");
     const integration_step = b.step("test-integration", "Run PTY integration tests");
     const test_all_step = b.step("test-all", "Run all tests");
@@ -26,7 +26,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const exe = b.addExecutable(.{
-        .name = "ghostscreen",
+        .name = "boo",
         .root_module = exe_mod,
     });
     b.installArtifact(exe);

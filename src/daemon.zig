@@ -64,6 +64,10 @@ pub const Daemon = struct {
     rows: u16,
     cols: u16,
 
+    /// Wall-clock time (milliseconds) of the most recent window output
+    /// or client input; reported as session idle time.
+    last_activity_ms: i64 = 0,
+
     sig_read: posix.fd_t = -1,
     quitting: bool = false,
 
@@ -73,6 +77,7 @@ pub const Daemon = struct {
             .opts = opts,
             .rows = opts.rows,
             .cols = opts.cols,
+            .last_activity_ms = std.time.milliTimestamp(),
         };
         defer self.deinit();
 
@@ -243,6 +248,7 @@ pub const Daemon = struct {
 
             .input => {
                 if (!conn.attached) return;
+                self.last_activity_ms = std.time.milliTimestamp();
                 const Handler = struct {
                     daemon: *Daemon,
                     conn: *Conn,
@@ -318,82 +324,78 @@ pub const Daemon = struct {
             return;
         }
 
+        const now = std.time.milliTimestamp();
         const cmd = argv[0];
-        if (std.mem.eql(u8, cmd, "stuff")) {
+        if (std.mem.eql(u8, cmd, "send")) {
             if (argv.len != 2) {
-                conn.send(.err, "usage: stuff <text>");
+                conn.send(.err, "usage: send <bytes>");
                 return;
             }
-            const text = try unescape(self.alloc, argv[1]);
-            defer self.alloc.free(text);
             if (self.activeWindow()) |w| {
-                w.writeInput(text) catch {
+                w.writeInput(argv[1]) catch {
                     conn.send(.err, "window write failed");
                     return;
                 };
+                self.last_activity_ms = now;
                 conn.send(.ok, "");
             } else conn.send(.err, "no active window");
-        } else if (std.mem.eql(u8, cmd, "hardcopy")) {
-            if (argv.len != 2) {
-                conn.send(.err, "usage: hardcopy <path>");
-                return;
-            }
+        } else if (std.mem.eql(u8, cmd, "peek")) {
+            const scrollback = argv.len > 1 and std.mem.eql(u8, argv[1], "scrollback");
             if (self.activeWindow()) |w| {
-                const text = try w.plainScreen(self.alloc);
+                const text = if (scrollback)
+                    try w.plainScrollback(self.alloc)
+                else
+                    try w.plainScreen(self.alloc);
                 defer self.alloc.free(text);
-                var file = std.fs.cwd().createFile(argv[1], .{}) catch {
-                    conn.send(.err, "cannot create file");
-                    return;
-                };
-                defer file.close();
-                file.writeAll(text) catch {
-                    conn.send(.err, "write failed");
-                    return;
-                };
-                file.writeAll("\n") catch {};
-                conn.send(.ok, "");
+                // Header line with window metadata, then the dump. The
+                // title is sanitized so it cannot contain the newline
+                // that terminates the header.
+                var out: std.ArrayList(u8) = .empty;
+                defer out.deinit(self.alloc);
+                const cursor = &w.term.screens.active.cursor;
+                try out.print(self.alloc, "{d}\t{d}\t{d}\t{d}\t{d}\t", .{
+                    self.rows,
+                    self.cols,
+                    cursor.y + 1,
+                    cursor.x + 1,
+                    w.id,
+                });
+                for (w.title()) |byte| {
+                    if (byte < 0x20 or byte == 0x7f) continue;
+                    try out.append(self.alloc, byte);
+                }
+                try out.append(self.alloc, '\n');
+                try out.appendSlice(self.alloc, text);
+                if (out.items.len > protocol.max_payload) {
+                    out.shrinkRetainingCapacity(protocol.max_payload);
+                }
+                conn.send(.ok, out.items);
             } else conn.send(.err, "no active window");
-        } else if (std.mem.eql(u8, cmd, "new-window")) {
-            const idx = try self.createWindow(argv[1..]);
-            self.switchTo(idx);
-            conn.send(.ok, "");
-        } else if (std.mem.eql(u8, cmd, "select")) {
-            if (argv.len != 2) {
-                conn.send(.err, "usage: select <n>");
-                return;
-            }
-            const n = std.fmt.parseInt(u16, argv[1], 10) catch {
-                conn.send(.err, "bad window number");
-                return;
-            };
-            if (self.windowIndexById(n)) |idx| {
-                self.switchTo(idx);
-                conn.send(.ok, "");
-            } else conn.send(.err, "no such window");
-        } else if (std.mem.eql(u8, cmd, "next")) {
-            self.switchRelative(1);
-            conn.send(.ok, "");
-        } else if (std.mem.eql(u8, cmd, "prev")) {
-            self.switchRelative(-1);
-            conn.send(.ok, "");
         } else if (std.mem.eql(u8, cmd, "windows")) {
-            const list = try self.windowList();
-            defer self.alloc.free(list);
-            conn.send(.ok, list);
-        } else if (std.mem.eql(u8, cmd, "kill-window")) {
-            if (self.activeWindow()) |w| {
-                posix.kill(w.child_pid, posix.SIG.HUP) catch {};
-                conn.send(.ok, "");
-            } else conn.send(.err, "no active window");
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(self.alloc);
+            for (self.windows.items, 0..) |w, i| {
+                if (out.items.len > 0) try out.append(self.alloc, '\n');
+                const active: u8 = if (self.active != null and self.active.? == i) '1' else '0';
+                const idle: i64 = @max(0, now - w.last_output_ms);
+                try out.print(self.alloc, "{d}\t{c}\t{d}\t{s}\t", .{ w.id, active, idle, w.command_title });
+                for (w.title()) |byte| {
+                    if (byte < 0x20 or byte == 0x7f) continue;
+                    try out.append(self.alloc, byte);
+                }
+            }
+            conn.send(.ok, out.items);
         } else if (std.mem.eql(u8, cmd, "info")) {
             var attached = false;
             for (self.conns.items) |c| {
                 if (c.attached and !c.closed) attached = true;
             }
-            const info = try std.fmt.allocPrint(self.alloc, "{s}\t{d} windows\t{s}", .{
+            const idle: i64 = @max(0, now - self.last_activity_ms);
+            const info = try std.fmt.allocPrint(self.alloc, "{s}\t{d}\t{s}\t{d}", .{
                 self.opts.name,
                 self.windows.items.len,
                 if (attached) "Attached" else "Detached",
+                idle,
             });
             defer self.alloc.free(info);
             conn.send(.ok, info);
@@ -422,6 +424,9 @@ pub const Daemon = struct {
             return;
         }
         const chunk = buf[0..n];
+        const now = std.time.milliTimestamp();
+        win.last_output_ms = now;
+        self.last_activity_ms = now;
 
         const conn = (if (win.passthrough) self.attachedConn() else null) orelse {
             // Not passed through: the window answers queries itself.
@@ -506,7 +511,7 @@ pub const Daemon = struct {
         var env = try std.process.getEnvMap(self.alloc);
         defer env.deinit();
         try env.put("TERM", "xterm-256color");
-        try env.put("GHOSTSCREEN", self.opts.name);
+        try env.put("BOO", self.opts.name);
 
         var default_argv: [1][]const u8 = .{env.get("SHELL") orelse "/bin/sh"};
         const child_argv: []const []const u8 = if (argv.len > 0) argv else &default_argv;
@@ -642,56 +647,3 @@ pub const Daemon = struct {
         conn.send(.output, seq);
     }
 };
-
-/// Unescape backslash sequences in `stuff` arguments: \n \r \t \e \\ \xHH.
-pub fn unescape(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(alloc);
-    var i: usize = 0;
-    while (i < input.len) : (i += 1) {
-        if (input[i] != '\\' or i + 1 >= input.len) {
-            try out.append(alloc, input[i]);
-            continue;
-        }
-        i += 1;
-        switch (input[i]) {
-            'n' => try out.append(alloc, '\n'),
-            'r' => try out.append(alloc, '\r'),
-            't' => try out.append(alloc, '\t'),
-            'e' => try out.append(alloc, 0x1b),
-            '\\' => try out.append(alloc, '\\'),
-            'x' => {
-                if (i + 2 < input.len) {
-                    const val = std.fmt.parseInt(u8, input[i + 1 .. i + 3], 16) catch {
-                        try out.append(alloc, input[i]);
-                        continue;
-                    };
-                    try out.append(alloc, val);
-                    i += 2;
-                } else try out.append(alloc, input[i]);
-            },
-            else => {
-                try out.append(alloc, '\\');
-                try out.append(alloc, input[i]);
-            },
-        }
-    }
-    return out.toOwnedSlice(alloc);
-}
-
-test "unescape" {
-    const alloc = std.testing.allocator;
-    const cases = [_]struct { in: []const u8, out: []const u8 }{
-        .{ .in = "plain", .out = "plain" },
-        .{ .in = "a\\nb", .out = "a\nb" },
-        .{ .in = "\\e[1m", .out = "\x1b[1m" },
-        .{ .in = "\\x01d", .out = "\x01d" },
-        .{ .in = "tail\\", .out = "tail\\" },
-        .{ .in = "\\q", .out = "\\q" },
-    };
-    for (cases) |case| {
-        const got = try unescape(alloc, case.in);
-        defer alloc.free(got);
-        try std.testing.expectEqualStrings(case.out, got);
-    }
-}

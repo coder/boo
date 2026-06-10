@@ -1,6 +1,7 @@
-//! End-to-end tests that drive the real ghostscreen binary through a
-//! real PTY: a test "terminal" (PTY master) hosts the attach client as
+//! End-to-end tests that drive the real boo binary through a real
+//! PTY: a test "terminal" (PTY master) hosts the attach client as
 //! its controlling terminal, exactly like a user's terminal would.
+//! Detached control flows go through the public subcommand CLI.
 
 const std = @import("std");
 const posix = std.posix;
@@ -41,7 +42,7 @@ const Harness = struct {
         std.crypto.random.bytes(&random_bytes);
         var suffix: [12]u8 = undefined;
         const hex = std.fmt.bufPrint(&suffix, "{x}", .{&random_bytes}) catch unreachable;
-        const dir = try std.fmt.allocPrint(alloc, "/tmp/gstest-{s}", .{hex});
+        const dir = try std.fmt.allocPrint(alloc, "/tmp/bootest-{s}", .{hex});
         errdefer alloc.free(dir);
         try std.fs.cwd().makePath(dir);
         return .{ .alloc = alloc, .dir = dir };
@@ -49,17 +50,9 @@ const Harness = struct {
 
     fn deinit(self: *Harness) void {
         // Best effort: terminate any session daemons still running.
-        if (std.fs.cwd().openDir(self.dir, .{ .iterate = true })) |d| {
-            var iter_dir = d;
-            defer iter_dir.close();
-            var it = iter_dir.iterate();
-            while (it.next() catch null) |entry| {
-                if (!std.mem.endsWith(u8, entry.name, ".sock")) continue;
-                const name = entry.name[0 .. entry.name.len - ".sock".len];
-                const result = self.control(name, &.{"quit"}) catch continue;
-                self.alloc.free(result.stdout);
-                self.alloc.free(result.stderr);
-            }
+        if (self.run(&.{ "kill", "--all" })) |result| {
+            self.alloc.free(result.stdout);
+            self.alloc.free(result.stderr);
         } else |_| {}
         std.Thread.sleep(50 * std.time.ns_per_ms);
         std.fs.cwd().deleteTree(self.dir) catch {};
@@ -74,7 +67,7 @@ const Harness = struct {
 
         var env = try std.process.getEnvMap(self.alloc);
         defer env.deinit();
-        try env.put("GHOSTSCREEN_DIR", self.dir);
+        try env.put("BOO_DIR", self.dir);
 
         return std.process.Child.run(.{
             .allocator = self.alloc,
@@ -83,44 +76,52 @@ const Harness = struct {
         });
     }
 
-    fn control(self: *Harness, session: []const u8, cmd: []const []const u8) !std.process.Child.RunResult {
-        var argv: std.ArrayList([]const u8) = .empty;
-        defer argv.deinit(self.alloc);
-        try argv.appendSlice(self.alloc, &.{ "-S", session, "-X" });
-        try argv.appendSlice(self.alloc, cmd);
-        return self.run(argv.items);
-    }
-
-    /// Run a control command and require success.
-    fn mustControl(self: *Harness, session: []const u8, cmd: []const []const u8) !void {
-        const result = try self.control(session, cmd);
+    /// Run a CLI command and require exit code 0.
+    fn runOk(self: *Harness, argv: []const []const u8) !void {
+        const result = try self.run(argv);
         defer self.alloc.free(result.stdout);
         defer self.alloc.free(result.stderr);
         if (result.term != .Exited or result.term.Exited != 0) {
-            std.debug.print("control {s} failed: {s}\n", .{ cmd[0], result.stderr });
-            return error.ControlFailed;
+            std.debug.print("boo {s} failed: {s}\n", .{ argv[0], result.stderr });
+            return error.CommandFailed;
+        }
+    }
+
+    /// Run a CLI command and require a specific exit code.
+    fn runExit(self: *Harness, argv: []const []const u8, want: u32) !void {
+        const result = try self.run(argv);
+        defer self.alloc.free(result.stdout);
+        defer self.alloc.free(result.stderr);
+        if (result.term != .Exited or result.term.Exited != want) {
+            std.debug.print(
+                "boo {s}: wanted exit {d}, got {any}: {s}\n",
+                .{ argv[0], want, result.term, result.stderr },
+            );
+            return error.WrongExit;
         }
     }
 
     fn startDetached(self: *Harness, session: []const u8, cmd: []const []const u8) !void {
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(self.alloc);
-        try argv.appendSlice(self.alloc, &.{ "-d", "-m", "-S", session });
+        try argv.appendSlice(self.alloc, &.{ "new", session, "-d", "--" });
         try argv.appendSlice(self.alloc, cmd);
         const result = try self.run(argv.items);
         defer self.alloc.free(result.stdout);
         defer self.alloc.free(result.stderr);
         if (result.term != .Exited or result.term.Exited != 0) {
-            std.debug.print("startDetached failed: {s}\n", .{result.stderr});
+            std.debug.print("new -d failed: {s}\n", .{result.stderr});
             return error.StartFailed;
         }
+        // The session name lands on stdout for scripts to capture.
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, session) != null);
         try self.waitSessionUp(session);
     }
 
     fn waitSessionUp(self: *Harness, session: []const u8) !void {
         var deadline = Deadline.init(default_timeout_ms);
         while (true) {
-            const result = try self.control(session, &.{"info"});
+            const result = try self.run(&.{ "windows", session });
             defer self.alloc.free(result.stdout);
             defer self.alloc.free(result.stderr);
             if (result.term == .Exited and result.term.Exited == 0) return;
@@ -128,24 +129,30 @@ const Harness = struct {
         }
     }
 
-    /// Poll the active window's screen contents until `needle` shows up.
-    fn waitHardcopyContains(self: *Harness, session: []const u8, needle: []const u8) ![]u8 {
-        const path = try std.fmt.allocPrint(self.alloc, "{s}/hardcopy.txt", .{self.dir});
-        defer self.alloc.free(path);
+    /// Type text into the session's active window, followed by Enter.
+    fn sendLine(self: *Harness, session: []const u8, text: []const u8) !void {
+        try self.runOk(&.{ "send", "-s", session, text, "--enter" });
+    }
 
+    /// Poll the active window's screen contents until `needle` shows up.
+    /// Returns the matching peek output; caller frees.
+    fn waitPeekContains(self: *Harness, session: []const u8, needle: []const u8) ![]u8 {
         var deadline = Deadline.init(default_timeout_ms);
         var last: ?[]u8 = null;
         errdefer if (last) |l| self.alloc.free(l);
         while (true) {
-            try self.mustControl(session, &.{ "hardcopy", path });
+            const result = try self.run(&.{ "peek", session });
+            self.alloc.free(result.stderr);
             if (last) |l| self.alloc.free(l);
             last = null;
-            last = std.fs.cwd().readFileAlloc(self.alloc, path, 1 << 20) catch null;
-            if (last) |content| {
-                if (std.mem.indexOf(u8, content, needle) != null) return content;
+            if (result.term == .Exited and result.term.Exited == 0) {
+                last = result.stdout;
+                if (std.mem.indexOf(u8, result.stdout, needle) != null) return result.stdout;
+            } else {
+                self.alloc.free(result.stdout);
             }
-            deadline.tick("hardcopy never contained needle") catch |err| {
-                std.debug.print("--- last hardcopy ---\n{s}\n---\n", .{last orelse "<none>"});
+            deadline.tick("peek never contained needle") catch |err| {
+                std.debug.print("--- last peek ---\n{s}\n---\n", .{last orelse "<none>"});
                 return err;
             };
         }
@@ -168,7 +175,7 @@ const Deadline = struct {
     }
 };
 
-/// A ghostscreen client process running on a real PTY owned by the test.
+/// A boo client process running on a real PTY owned by the test.
 const PtyClient = struct {
     alloc: std.mem.Allocator,
     master: posix.fd_t,
@@ -222,7 +229,7 @@ const PtyClient = struct {
         for (argv, 1..) |arg, i| argv_z[i] = try arena.dupeZ(u8, arg);
 
         var env = try std.process.getEnvMap(arena);
-        try env.put("GHOSTSCREEN_DIR", harness.dir);
+        try env.put("BOO_DIR", harness.dir);
         const envp = try std.process.createEnvironFromMap(arena, &env, .{});
 
         const pid = try posix.fork();
@@ -337,15 +344,28 @@ const PtyClient = struct {
     }
 };
 
-test "detached session: stuff and hardcopy through libghostty" {
+fn waitFileEquals(alloc: std.mem.Allocator, path: []const u8, expected: []const u8) !void {
+    var deadline = Deadline.init(default_timeout_ms);
+    while (true) {
+        const content = std.fs.cwd().readFileAlloc(alloc, path, 4096) catch "";
+        defer if (content.len > 0) alloc.free(content);
+        if (std.mem.eql(u8, content, expected)) return;
+        deadline.tick("file never matched") catch |err| {
+            std.debug.print("--- file {s} content: {s} (wanted {s})\n", .{ path, content, expected });
+            return err;
+        };
+    }
+}
+
+test "detached session: send and peek round-trip through libghostty" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
     defer h.deinit();
 
     try h.startDetached("t1", &.{"cat"});
-    try h.mustControl("t1", &.{ "stuff", "round-trip-42\\n" });
+    try h.sendLine("t1", "round-trip-42");
 
-    const content = try h.waitHardcopyContains("t1", "round-trip-42");
+    const content = try h.waitPeekContains("t1", "round-trip-42");
     defer alloc.free(content);
 }
 
@@ -355,20 +375,18 @@ test "vt sequences: cursor movement, SGR, and clear are emulated" {
     defer h.deinit();
 
     try h.startDetached("t2", &.{"cat"});
-    // Paint NOISE, clear the screen, write at row 3 col 5, color a word.
-    try h.mustControl("t2", &.{
-        "stuff",
-        "NOISE\\e[2J\\e[3;5HPOS\\e[1;31mRED\\e[0m-END\\n",
-    });
+    // Paint NOISE, clear the screen, write at row 3 col 5, color a
+    // word. send carries the raw ESC bytes; no escaping layer.
+    try h.sendLine("t2", "NOISE\x1b[2J\x1b[3;5HPOS\x1b[1;31mRED\x1b[0m-END");
 
-    const content = try h.waitHardcopyContains("t2", "POSRED-END");
+    const content = try h.waitPeekContains("t2", "POSRED-END");
     defer alloc.free(content);
 
     // The clear must have removed earlier output.
     try std.testing.expect(std.mem.indexOf(u8, content, "NOISE") == null);
 
     // Row 3 starts with 4 blank columns (cursor positioning worked and
-    // the hardcopy reflects screen geometry, not the byte stream).
+    // the peek reflects screen geometry, not the byte stream).
     var lines = std.mem.splitScalar(u8, content, '\n');
     _ = lines.next(); // row 1
     _ = lines.next(); // row 2
@@ -381,7 +399,7 @@ test "attach over a real tty: echo, then detach with C-a d" {
     var h = try Harness.init(alloc);
     defer h.deinit();
 
-    var client = try PtyClient.spawn(&h, &.{ "-S", "t3", "cat" }, 24, 80);
+    var client = try PtyClient.spawn(&h, &.{ "new", "t3", "--", "cat" }, 24, 80);
     defer client.deinit();
     try h.waitSessionUp("t3");
 
@@ -393,10 +411,11 @@ test "attach over a real tty: echo, then detach with C-a d" {
     try std.testing.expectEqual(@as(u32, 0), try client.waitExit());
 
     // Session survives the detach.
-    const result = try h.control("t3", &.{"info"});
+    const result = try h.run(&.{"ls"});
     defer alloc.free(result.stdout);
     defer alloc.free(result.stderr);
-    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Detached") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "t3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "detached") != null);
 }
 
 test "reattach rehydrates the screen from terminal state" {
@@ -405,12 +424,12 @@ test "reattach rehydrates the screen from terminal state" {
     defer h.deinit();
 
     try h.startDetached("t4", &.{"cat"});
-    try h.mustControl("t4", &.{ "stuff", "persisted-99\\n" });
-    const content = try h.waitHardcopyContains("t4", "persisted-99");
+    try h.sendLine("t4", "persisted-99");
+    const content = try h.waitPeekContains("t4", "persisted-99");
     alloc.free(content);
 
     // Reattach: the repaint must reproduce content written while detached.
-    var client = try PtyClient.spawn(&h, &.{ "-r", "t4" }, 24, 80);
+    var client = try PtyClient.spawn(&h, &.{ "attach", "t4" }, 24, 80);
     defer client.deinit();
     try client.waitFor("persisted-99");
 
@@ -424,16 +443,16 @@ test "window size: initial attach size and SIGWINCH resize reach the app" {
     var h = try Harness.init(alloc);
     defer h.deinit();
 
-    var client = try PtyClient.spawn(&h, &.{ "-S", "t5", "/bin/sh" }, 12, 57);
+    var client = try PtyClient.spawn(&h, &.{ "new", "t5", "--", "/bin/sh" }, 12, 57);
     defer client.deinit();
     try h.waitSessionUp("t5");
 
     const size_file = try std.fmt.allocPrint(alloc, "{s}/size.txt", .{h.dir});
     defer alloc.free(size_file);
 
-    const cmd1 = try std.fmt.allocPrint(alloc, "stty size > {s}\\n", .{size_file});
+    const cmd1 = try std.fmt.allocPrint(alloc, "stty size > {s}", .{size_file});
     defer alloc.free(cmd1);
-    try h.mustControl("t5", &.{ "stuff", cmd1 });
+    try h.sendLine("t5", cmd1);
     try waitFileEquals(alloc, size_file, "12 57\n");
 
     // Dynamic resize: change the outer terminal size; SIGWINCH propagates
@@ -441,7 +460,7 @@ test "window size: initial attach size and SIGWINCH resize reach the app" {
     try client.setSize(30, 90);
     var deadline = Deadline.init(default_timeout_ms);
     while (true) {
-        try h.mustControl("t5", &.{ "stuff", cmd1 });
+        try h.sendLine("t5", cmd1);
         std.Thread.sleep(50 * std.time.ns_per_ms);
         const content = std.fs.cwd().readFileAlloc(alloc, size_file, 4096) catch "";
         defer if (content.len > 0) alloc.free(content);
@@ -455,7 +474,7 @@ test "multiple windows: create, switch, and list" {
     var h = try Harness.init(alloc);
     defer h.deinit();
 
-    var client = try PtyClient.spawn(&h, &.{ "-S", "t6", "cat" }, 24, 80);
+    var client = try PtyClient.spawn(&h, &.{ "new", "t6", "--", "cat" }, 24, 80);
     defer client.deinit();
     try h.waitSessionUp("t6");
 
@@ -472,7 +491,7 @@ test "multiple windows: create, switch, and list" {
     try client.send("\x01p");
     try client.waitFor("first-window-data");
 
-    const result = try h.control("t6", &.{"windows"});
+    const result = try h.run(&.{ "windows", "t6" });
     defer alloc.free(result.stdout);
     defer alloc.free(result.stderr);
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "0*") != null);
@@ -486,43 +505,41 @@ test "session listing shows attach state" {
 
     try h.startDetached("listed", &.{"cat"});
 
-    const detached = try h.run(&.{"-ls"});
+    const detached = try h.run(&.{"ls"});
     defer alloc.free(detached.stdout);
     defer alloc.free(detached.stderr);
     try std.testing.expect(std.mem.indexOf(u8, detached.stdout, "listed") != null);
-    try std.testing.expect(std.mem.indexOf(u8, detached.stdout, "Detached") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detached.stdout, "detached") != null);
 
-    var client = try PtyClient.spawn(&h, &.{ "-r", "listed" }, 24, 80);
+    // `at` is the documented shorthand for attach.
+    var client = try PtyClient.spawn(&h, &.{ "at", "listed" }, 24, 80);
     defer client.deinit();
 
     var deadline = Deadline.init(default_timeout_ms);
     while (true) {
-        const attached = try h.run(&.{"-ls"});
+        const attached = try h.run(&.{"ls"});
         defer alloc.free(attached.stdout);
         defer alloc.free(attached.stderr);
-        if (std.mem.indexOf(u8, attached.stdout, "Attached") != null) break;
+        if (std.mem.indexOf(u8, attached.stdout, "attached") != null) break;
         try deadline.tick("session never showed as attached");
     }
 }
 
-test "quit ends the session and notifies the attached client" {
+test "kill ends the session and notifies the attached client" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
     defer h.deinit();
 
-    var client = try PtyClient.spawn(&h, &.{ "-S", "t8", "cat" }, 24, 80);
+    var client = try PtyClient.spawn(&h, &.{ "new", "t8", "--", "cat" }, 24, 80);
     defer client.deinit();
     try h.waitSessionUp("t8");
 
-    try h.mustControl("t8", &.{"quit"});
+    try h.runOk(&.{ "kill", "t8" });
     try client.waitFor("session t8 ended");
     try std.testing.expectEqual(@as(u32, 0), try client.waitExit());
 
-    // The socket is gone: control commands now fail.
-    const result = try h.control("t8", &.{"info"});
-    defer alloc.free(result.stdout);
-    defer alloc.free(result.stderr);
-    try std.testing.expect(result.term != .Exited or result.term.Exited != 0);
+    // The socket is gone: session commands now fail with exit 3.
+    try h.runExit(&.{ "windows", "t8" }, 3);
 }
 
 test "attach without a tty fails cleanly" {
@@ -531,24 +548,11 @@ test "attach without a tty fails cleanly" {
     defer h.deinit();
 
     try h.startDetached("t9", &.{"cat"});
-    const result = try h.run(&.{ "-r", "t9" });
+    const result = try h.run(&.{ "attach", "t9" });
     defer alloc.free(result.stdout);
     defer alloc.free(result.stderr);
     try std.testing.expect(result.term == .Exited and result.term.Exited == 1);
     try std.testing.expect(std.mem.indexOf(u8, result.stderr, "requires a terminal") != null);
-}
-
-fn waitFileEquals(alloc: std.mem.Allocator, path: []const u8, expected: []const u8) !void {
-    var deadline = Deadline.init(default_timeout_ms);
-    while (true) {
-        const content = std.fs.cwd().readFileAlloc(alloc, path, 4096) catch "";
-        defer if (content.len > 0) alloc.free(content);
-        if (std.mem.eql(u8, content, expected)) return;
-        deadline.tick("file never matched") catch |err| {
-            std.debug.print("--- file {s} content: {s} (wanted {s})\n", .{ path, content, expected });
-            return err;
-        };
-    }
 }
 
 test "attached client renders inside the terminal's alternate screen" {
@@ -556,7 +560,7 @@ test "attached client renders inside the terminal's alternate screen" {
     var h = try Harness.init(alloc);
     defer h.deinit();
 
-    var client = try PtyClient.spawn(&h, &.{ "-S", "wrap", "cat" }, 24, 80);
+    var client = try PtyClient.spawn(&h, &.{ "new", "wrap", "--", "cat" }, 24, 80);
     defer client.deinit();
     try h.waitSessionUp("wrap");
 
@@ -585,7 +589,7 @@ test "C-a C-d detaches like GNU screen" {
     var h = try Harness.init(alloc);
     defer h.deinit();
 
-    var client = try PtyClient.spawn(&h, &.{ "-S", "ctrld", "cat" }, 24, 80);
+    var client = try PtyClient.spawn(&h, &.{ "new", "ctrld", "--", "cat" }, 24, 80);
     defer client.deinit();
     try h.waitSessionUp("ctrld");
 
@@ -593,10 +597,10 @@ test "C-a C-d detaches like GNU screen" {
     try client.waitFor("detached from ctrld");
     try std.testing.expectEqual(@as(u32, 0), try client.waitExit());
 
-    const result = try h.control("ctrld", &.{"info"});
+    const result = try h.run(&.{"ls"});
     defer alloc.free(result.stdout);
     defer alloc.free(result.stderr);
-    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Detached") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "detached") != null);
 }
 
 test "alt screen apps: toggles are filtered and screens repaint from state" {
@@ -607,11 +611,11 @@ test "alt screen apps: toggles are filtered and screens repaint from state" {
     try h.startDetached("altapp", &.{"sh"});
 
     // Put a marker on the primary screen.
-    try h.mustControl("altapp", &.{ "stuff", "echo PRIMARY-MARK\\n" });
-    const hc = try h.waitHardcopyContains("altapp", "PRIMARY-MARK");
-    alloc.free(hc);
+    try h.sendLine("altapp", "echo PRIMARY-MARK");
+    const peeked = try h.waitPeekContains("altapp", "PRIMARY-MARK");
+    alloc.free(peeked);
 
-    var client = try PtyClient.spawn(&h, &.{ "-r", "altapp" }, 24, 80);
+    var client = try PtyClient.spawn(&h, &.{ "attach", "altapp" }, 24, 80);
     defer client.deinit();
     try client.waitFor("PRIMARY-MARK");
     client.clearOutput();
@@ -621,9 +625,7 @@ test "alt screen apps: toggles are filtered and screens repaint from state" {
     // content arrives via a repaint instead. The echoed command line
     // also contains "ALT-MARK", so wait for the marker to show up
     // after a repaint's canvas clear specifically.
-    try h.mustControl("altapp", &.{
-        "stuff", "printf '\\\\033[?1049h\\\\033[H\\\\033[2JALT-MARK\\\\n'\\n",
-    });
+    try h.sendLine("altapp", "printf '\\033[?1049h\\033[H\\033[2JALT-MARK\\n'");
     var deadline = Deadline.init(default_timeout_ms);
     while (true) {
         if (std.mem.lastIndexOf(u8, client.output.items, "\x1b[H\x1b[2J")) |clear_pos| {
@@ -640,7 +642,7 @@ test "alt screen apps: toggles are filtered and screens repaint from state" {
     // The app leaves the alternate screen: still no raw toggle, and
     // the primary screen content is repainted from terminal state
     // rather than left blank.
-    try h.mustControl("altapp", &.{ "stuff", "printf '\\\\033[?1049l'\\n" });
+    try h.sendLine("altapp", "printf '\\033[?1049l'");
     try client.waitFor("PRIMARY-MARK");
     try std.testing.expect(
         std.mem.indexOf(u8, client.output.items, "\x1b[?1049l") == null,
@@ -674,7 +676,7 @@ test "queries in a discarded passthrough span are answered" {
     );
     defer alloc.free(script);
 
-    var client = try PtyClient.spawn(&h, &.{ "-S", "qry", "bash", "-c", script }, 24, 80);
+    var client = try PtyClient.spawn(&h, &.{ "new", "qry", "--", "bash", "-c", script }, 24, 80);
     defer client.deinit();
     try h.waitSessionUp("qry");
     // Wait for the attach repaint so the burst takes the passthrough
@@ -696,12 +698,12 @@ test "reattach restores the window title" {
     // from two printf arguments so the echoed command line (which
     // ends up in the repainted screen content) never contains the
     // assembled marker.
-    try h.mustControl("ttl", &.{ "stuff", "printf '\\\\033]2;TTL-%s\\\\007' MARK\\n" });
+    try h.sendLine("ttl", "printf '\\033]2;TTL-%s\\007' MARK");
 
     // The window list reflects the OSC title once processed.
     var deadline = Deadline.init(default_timeout_ms);
     while (true) {
-        const result = try h.control("ttl", &.{"windows"});
+        const result = try h.run(&.{ "windows", "ttl" });
         const found = std.mem.indexOf(u8, result.stdout, "TTL-MARK") != null;
         alloc.free(result.stdout);
         alloc.free(result.stderr);
@@ -711,11 +713,245 @@ test "reattach restores the window title" {
 
     // Reattach: the repaint must restore the title on the client's
     // terminal, not just the screen contents.
-    var client = try PtyClient.spawn(&h, &.{ "-r", "ttl" }, 24, 80);
+    var client = try PtyClient.spawn(&h, &.{ "attach", "ttl" }, 24, 80);
     defer client.deinit();
     try client.waitFor("\x1b]2;TTL-MARK\x07");
 
     try client.send("\x01d");
     try client.waitFor("detached from ttl");
     _ = try client.waitExit();
+}
+
+test "help: overview, command pages, topics, and version" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    const overview = try h.run(&.{"help"});
+    defer alloc.free(overview.stdout);
+    defer alloc.free(overview.stderr);
+    try std.testing.expect(overview.term.Exited == 0);
+    try std.testing.expect(std.mem.indexOf(u8, overview.stdout, "commands:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, overview.stdout, "exorcise") != null);
+
+    const send_page = try h.run(&.{ "help", "send" });
+    defer alloc.free(send_page.stdout);
+    defer alloc.free(send_page.stderr);
+    try std.testing.expect(send_page.term.Exited == 0);
+    try std.testing.expect(std.mem.indexOf(u8, send_page.stdout, "--enter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, send_page.stdout, "--key") != null);
+
+    const automation = try h.run(&.{ "help", "automation" });
+    defer alloc.free(automation.stdout);
+    defer alloc.free(automation.stderr);
+    try std.testing.expect(automation.term.Exited == 0);
+    try std.testing.expect(std.mem.indexOf(u8, automation.stdout, "wait") != null);
+
+    const all = try h.run(&.{ "help", "--all" });
+    defer alloc.free(all.stdout);
+    defer alloc.free(all.stderr);
+    try std.testing.expect(all.term.Exited == 0);
+    try std.testing.expect(all.stdout.len > overview.stdout.len);
+
+    const ver = try h.run(&.{"version"});
+    defer alloc.free(ver.stdout);
+    defer alloc.free(ver.stderr);
+    try std.testing.expect(std.mem.startsWith(u8, ver.stdout, "boo "));
+}
+
+test "ls and windows emit machine-readable JSON" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("js", &.{"cat"});
+
+    const ls = try h.run(&.{ "ls", "--json" });
+    defer alloc.free(ls.stdout);
+    defer alloc.free(ls.stderr);
+    try std.testing.expect(ls.term.Exited == 0);
+    {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, ls.stdout, .{});
+        defer parsed.deinit();
+        const sessions = parsed.value.array.items;
+        try std.testing.expectEqual(@as(usize, 1), sessions.len);
+        const obj = sessions[0].object;
+        try std.testing.expectEqualStrings("js", obj.get("name").?.string);
+        try std.testing.expectEqual(false, obj.get("attached").?.bool);
+        try std.testing.expectEqual(@as(i64, 1), obj.get("windows").?.integer);
+        try std.testing.expect(obj.get("idle_ms").?.integer >= 0);
+    }
+
+    const wins = try h.run(&.{ "windows", "js", "--json" });
+    defer alloc.free(wins.stdout);
+    defer alloc.free(wins.stderr);
+    try std.testing.expect(wins.term.Exited == 0);
+    {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, wins.stdout, .{});
+        defer parsed.deinit();
+        const windows = parsed.value.array.items;
+        try std.testing.expectEqual(@as(usize, 1), windows.len);
+        const obj = windows[0].object;
+        try std.testing.expectEqual(@as(i64, 0), obj.get("id").?.integer);
+        try std.testing.expectEqual(true, obj.get("active").?.bool);
+        try std.testing.expectEqualStrings("cat", obj.get("command").?.string);
+    }
+}
+
+test "peek --json includes geometry, cursor, and screen content" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("pj", &.{"cat"});
+    try h.sendLine("pj", "json-peek-mark");
+    const content = try h.waitPeekContains("pj", "json-peek-mark");
+    alloc.free(content);
+
+    const peek = try h.run(&.{ "peek", "pj", "--json" });
+    defer alloc.free(peek.stdout);
+    defer alloc.free(peek.stderr);
+    try std.testing.expect(peek.term.Exited == 0);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, peek.stdout, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("pj", obj.get("session").?.string);
+    try std.testing.expectEqual(@as(i64, 0), obj.get("window").?.integer);
+    try std.testing.expect(obj.get("rows").?.integer > 0);
+    try std.testing.expect(obj.get("cols").?.integer > 0);
+    try std.testing.expect(obj.get("cursor").?.object.get("row").?.integer >= 1);
+    try std.testing.expect(
+        std.mem.indexOf(u8, obj.get("screen").?.string, "json-peek-mark") != null,
+    );
+}
+
+test "send --key presses named keys" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("keys", &.{"cat"});
+    // Type a line without Enter, then press Enter by name; cat only
+    // echoes the line back once the key arrives.
+    try h.runOk(&.{ "send", "-s", "keys", "key-mark" });
+    try h.runOk(&.{ "send", "-s", "keys", "--key", "Enter" });
+    const content = try h.waitPeekContains("keys", "key-mark");
+    defer alloc.free(content);
+}
+
+test "wait --for and --idle observe session output" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("w1", &.{"cat"});
+    try h.sendLine("w1", "wait-mark");
+
+    // --for: returns once the text is on screen.
+    try h.runOk(&.{ "wait", "w1", "--for", "wait-mark", "--timeout", "10s" });
+
+    // --idle: cat produces no further output, so this settles quickly.
+    try h.runOk(&.{ "wait", "w1", "--idle", "200ms", "--timeout", "10s" });
+
+    // Timeout: text that never appears exits with the documented code.
+    try h.runExit(&.{ "wait", "w1", "--for", "NEVER-APPEARS", "--timeout", "300ms" }, 4);
+}
+
+test "zero-arg boo creates a session, then reattaches it" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // No sessions: boo starts one running the default shell. Wait
+    // for the attach repaint before typing; input sent before the
+    // client enters raw mode is flushed by tcsetattr.
+    var first = try PtyClient.spawn(&h, &.{}, 24, 80);
+    defer first.deinit();
+    try first.waitFor("\x1b[H\x1b[2J");
+    try first.send("echo Z-MARK-$((70+7))\r");
+    try first.waitFor("Z-MARK-77");
+    try first.send("\x01d");
+    try first.waitFor("detached from");
+    try std.testing.expectEqual(@as(u32, 0), try first.waitExit());
+
+    const ls = try h.run(&.{ "ls", "--json" });
+    defer alloc.free(ls.stdout);
+    defer alloc.free(ls.stderr);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, ls.stdout, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);
+
+    // One live session: zero-arg boo attaches it instead of creating
+    // another; the repaint proves it is the same session.
+    var second = try PtyClient.spawn(&h, &.{}, 24, 80);
+    defer second.deinit();
+    try second.waitFor("Z-MARK-77");
+    try second.send("\x01d");
+    try second.waitFor("detached from");
+    try std.testing.expectEqual(@as(u32, 0), try second.waitExit());
+}
+
+test "exorcise banishes every session" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("ghost1", &.{"cat"});
+    try h.startDetached("ghost2", &.{"cat"});
+    try h.runOk(&.{"exorcise"});
+
+    var deadline = Deadline.init(default_timeout_ms);
+    while (true) {
+        const result = try h.run(&.{"ls"});
+        const empty = std.mem.indexOf(u8, result.stdout, "No sessions") != null;
+        alloc.free(result.stdout);
+        alloc.free(result.stderr);
+        if (empty) break;
+        try deadline.tick("sessions survived the exorcism");
+    }
+    try h.runExit(&.{ "windows", "ghost1" }, 3);
+}
+
+test "exit codes distinguish usage, missing sessions, and ambiguity" {
+    var h = try Harness.init(std.testing.allocator);
+    defer h.deinit();
+
+    try h.startDetached("alpha", &.{"cat"});
+    try h.startDetached("alike", &.{"cat"});
+
+    // Unique prefix resolves; ambiguous prefix and unknown names exit 3.
+    try h.runOk(&.{ "windows", "alp" });
+    try h.runExit(&.{ "windows", "al" }, 3);
+    try h.runExit(&.{ "attach", "nosuchzz" }, 3);
+    try h.runExit(&.{ "kill", "nosuchzz" }, 3);
+
+    // Destructive commands never guess between sessions.
+    try h.runExit(&.{"kill"}, 3);
+
+    // Usage errors exit 2.
+    try h.runExit(&.{"frobnicate"}, 2);
+    try h.runExit(&.{ "wait", "alpha" }, 2);
+    try h.runExit(&.{ "send", "-s", "alpha", "--key", "NoSuchKey" }, 2);
+    try h.runExit(&.{ "send", "-s", "alpha", "text", "--key", "Enter" }, 2);
+    try h.runExit(&.{ "help", "nosuchtopic" }, 2);
+    try h.runExit(&.{ "kill", "--all", "alpha" }, 2);
+}
+
+test "agent loop: new, send, wait, peek, kill" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // The documented automation loop, end to end, with no terminal.
+    try h.startDetached("agent", &.{"sh"});
+    try h.sendLine("agent", "echo result-$((40+2))");
+    try h.runOk(&.{ "wait", "agent", "--for", "result-42", "--timeout", "10s" });
+    try h.runOk(&.{ "wait", "agent", "--idle", "200ms", "--timeout", "10s" });
+
+    const content = try h.waitPeekContains("agent", "result-42");
+    defer alloc.free(content);
+
+    try h.runOk(&.{ "kill", "agent" });
+    try h.runExit(&.{ "windows", "agent" }, 3);
 }

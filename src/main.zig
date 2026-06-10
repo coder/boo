@@ -1,65 +1,43 @@
-//! ghostscreen: a GNU screen style terminal multiplexer built on
-//! libghostty (ghostty-vt) for terminal emulation.
+//! boo: sessions that haunt your terminal. A GNU screen style
+//! terminal multiplexer built on libghostty (ghostty-vt).
 
 const std = @import("std");
 const posix = std.posix;
 
 const client = @import("client.zig");
 const daemonpkg = @import("daemon.zig");
+const help = @import("help.zig");
 const paths = @import("paths.zig");
 const protocol = @import("protocol.zig");
 
-pub const version = "0.0.4";
+pub const version = "0.1.0";
 
-const usage =
-    \\usage: ghostscreen [options] [command ...]
-    \\
-    \\Start a new session running `command` (default: $SHELL) and attach.
-    \\
-    \\options:
-    \\  -S <name>     session name (default: pid of the creating process)
-    \\  -d -m         start the session detached (do not attach)
-    \\  -r [name]     reattach to a session (steals an attached session)
-    \\  -ls, --list   list sessions
-    \\  -X <cmd ...>  send a control command to a session (see below)
-    \\  -h, --help    show this help
-    \\  -V, --version show version
-    \\
-    \\key bindings (prefix C-a):
-    \\  c new window     n/p next/prev      0-9 select window
-    \\  d detach         k kill window      w list windows
-    \\  a send literal C-a   C-a a second C-a switches to previous window
-    \\  l redraw
-    \\
-    \\control commands (-X):
-    \\  stuff <text>       send text to the active window (\n \r \t \e \xHH)
-    \\  hardcopy <path>    write a plain-text dump of the active window
-    \\  new-window [cmd]   create a window
-    \\  select <n> | next | prev | windows | kill-window | info | quit
-    \\
-    \\environment:
-    \\  GHOSTSCREEN_DIR    socket directory (default: $XDG_RUNTIME_DIR/ghostscreen)
-    \\
-;
+/// Exit codes, documented in `boo help`.
+const exit_runtime: u8 = 1;
+const exit_usage: u8 = 2;
+const exit_no_session: u8 = 3;
+const exit_timeout: u8 = 4;
 
-const Action = union(enum) {
-    create: struct { detached: bool },
-    reattach,
-    list,
-    command,
-    help,
-    show_version,
-};
+fn fail(code: u8, comptime fmt: []const u8, args: anytype) noreturn {
+    std.debug.print("boo: " ++ fmt ++ "\n", args);
+    posix.exit(code);
+}
 
-const Args = struct {
-    action: Action = .{ .create = .{ .detached = false } },
-    session: ?[]const u8 = null,
-    rest: []const []const u8 = &.{},
-};
+/// Usage errors point at the relevant help page.
+fn usageFail(comptime cmd: []const u8, comptime fmt: []const u8, args: anytype) noreturn {
+    const hint = if (cmd.len == 0) "boo help" else "boo help " ++ cmd;
+    std.debug.print("boo: " ++ fmt ++ " (run '" ++ hint ++ "')\n", args);
+    posix.exit(exit_usage);
+}
 
-fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
-    std.debug.print("ghostscreen: " ++ fmt ++ "\n", args);
-    posix.exit(1);
+fn stdoutWrite(bytes: []const u8) !void {
+    try protocol.writeAll(posix.STDOUT_FILENO, bytes);
+}
+
+fn stdoutPrint(alloc: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
+    const text = try std.fmt.allocPrint(alloc, fmt, args);
+    defer alloc.free(text);
+    try stdoutWrite(text);
 }
 
 pub fn main() !void {
@@ -72,216 +50,914 @@ pub fn main() !void {
 
     const argv = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, argv);
+    const args: []const [:0]const u8 = @ptrCast(argv[1..]);
 
-    const args = parseArgs(argv[1..]);
+    if (args.len == 0) return cmdAuto(alloc);
 
-    switch (args.action) {
-        .help => {
-            std.debug.print("{s}", .{usage});
-            return;
-        },
-        .show_version => {
-            var buf: [64]u8 = undefined;
-            var stdout_writer = std.fs.File.stdout().writer(&buf);
-            const out = &stdout_writer.interface;
-            try out.print("ghostscreen {s}\n", .{version});
-            try out.flush();
-            return;
-        },
-        .list => try cmdList(alloc),
-        .command => try cmdControl(alloc, args),
-        .reattach => try cmdReattach(alloc, args),
-        .create => |c| try cmdCreate(alloc, args, c.detached),
-    }
+    const cmd = args[0];
+    const rest = args[1..];
+    const eql = struct {
+        fn f(a: []const u8, b: []const u8) bool {
+            return std.mem.eql(u8, a, b);
+        }
+    }.f;
+
+    if (eql(cmd, "new")) return cmdNew(alloc, rest);
+    if (eql(cmd, "attach") or eql(cmd, "at")) return cmdAttach(alloc, rest);
+    if (eql(cmd, "ls") or eql(cmd, "list")) return cmdLs(alloc, rest);
+    if (eql(cmd, "windows")) return cmdWindows(alloc, rest);
+    if (eql(cmd, "send")) return cmdSend(alloc, rest);
+    if (eql(cmd, "peek")) return cmdPeek(alloc, rest);
+    if (eql(cmd, "wait")) return cmdWait(alloc, rest);
+    if (eql(cmd, "kill")) return cmdKill(alloc, rest, "kill");
+    if (eql(cmd, "exorcise")) return cmdKill(alloc, rest, "exorcise");
+    if (eql(cmd, "version") or eql(cmd, "-V") or eql(cmd, "--version")) return cmdVersion(alloc);
+    if (eql(cmd, "help") or eql(cmd, "-h") or eql(cmd, "--help")) return cmdHelp(alloc, rest);
+    fail(exit_usage, "unknown command '{s}' (run 'boo help')", .{cmd});
 }
 
-fn parseArgs(argv: []const [:0]const u8) Args {
-    var args: Args = .{};
-    var detached = false;
-    var create_only = false;
-    var i: usize = 0;
-    var rest_start: ?usize = null;
-
-    while (i < argv.len) : (i += 1) {
-        const arg = argv[i];
-        if (std.mem.eql(u8, arg, "--")) {
-            rest_start = i + 1;
-            break;
-        } else if (std.mem.eql(u8, arg, "-S")) {
-            i += 1;
-            if (i >= argv.len) fatal("-S requires a session name", .{});
-            args.session = argv[i];
-        } else if (std.mem.eql(u8, arg, "-d")) {
-            detached = true;
-        } else if (std.mem.eql(u8, arg, "-m")) {
-            create_only = true;
-        } else if (std.mem.eql(u8, arg, "-r")) {
-            args.action = .reattach;
-            if (i + 1 < argv.len and argv[i + 1].len > 0 and argv[i + 1][0] != '-') {
-                i += 1;
-                args.session = argv[i];
-            }
-        } else if (std.mem.eql(u8, arg, "-ls") or std.mem.eql(u8, arg, "--list")) {
-            args.action = .list;
-        } else if (std.mem.eql(u8, arg, "-X")) {
-            args.action = .command;
-            rest_start = i + 1;
-            break;
-        } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            args.action = .help;
-            return args;
-        } else if (std.mem.eql(u8, arg, "-V") or std.mem.eql(u8, arg, "--version")) {
-            args.action = .show_version;
-            return args;
-        } else if (arg.len > 0 and arg[0] == '-') {
-            fatal("unknown option: {s} (see --help)", .{arg});
-        } else {
-            rest_start = i;
-            break;
-        }
-    }
-
-    if (rest_start) |start| {
-        if (start < argv.len) {
-            args.rest = @ptrCast(argv[start..]);
-        }
-    }
-
-    if (detached or create_only) {
-        if (!(detached and create_only)) fatal("-d and -m must be used together", .{});
-        args.action = .{ .create = .{ .detached = true } };
-    }
-    return args;
+fn isHelpFlag(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help");
 }
 
-fn cmdList(alloc: std.mem.Allocator) !void {
-    const dir = try paths.socketDir(alloc);
-    defer alloc.free(dir);
+fn printHelpPage(name: []const u8) !void {
+    const entry = help.find(name) orelse unreachable;
+    try stdoutWrite(entry.body);
+}
+
+// -- Session resolution ---------------------------------------------------
+
+/// How to pick a session when no name was given and several exist.
+const Pick = enum {
+    /// Read-only commands fall back to the most recently active session.
+    read,
+    /// Destructive commands never guess.
+    destructive,
+};
+
+fn joinNames(alloc: std.mem.Allocator, names: []const []u8) []const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (names, 0..) |name, i| {
+        if (i > 0) out.appendSlice(alloc, ", ") catch break;
+        out.appendSlice(alloc, name) catch break;
+    }
+    return out.items;
+}
+
+/// Resolve an optional session name to an owned, existing session name.
+/// Accepts unique prefixes. Exits with code 3 when nothing matches.
+fn resolveSession(
+    alloc: std.mem.Allocator,
+    dir: []const u8,
+    explicit: ?[]const u8,
+    pick: Pick,
+) ![]u8 {
     const sessions = try paths.listSessions(alloc, dir);
     defer {
         for (sessions) |s| alloc.free(s);
         alloc.free(sessions);
+    }
+
+    if (explicit) |want| {
+        for (sessions) |s| {
+            if (std.mem.eql(u8, s, want)) return alloc.dupe(u8, s);
+        }
+        var match: ?[]const u8 = null;
+        var count: usize = 0;
+        for (sessions) |s| {
+            if (std.mem.startsWith(u8, s, want)) {
+                match = s;
+                count += 1;
+            }
+        }
+        if (count == 1) return alloc.dupe(u8, match.?);
+        if (count > 1) fail(exit_no_session, "ambiguous session '{s}': matches {s}", .{
+            want, joinNames(alloc, sessions),
+        });
+        fail(exit_no_session, "no session matching '{s}' (run 'boo ls')", .{want});
     }
 
     if (sessions.len == 0) {
-        std.debug.print("No sessions in {s}.\n", .{dir});
-        return;
+        fail(exit_no_session, "no sessions (run 'boo' or 'boo new' to start one)", .{});
     }
+    if (sessions.len == 1) return alloc.dupe(u8, sessions[0]);
 
-    var stdout_buf: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
-    const out = &stdout_writer.interface;
-
-    for (sessions) |name| {
-        const sock = try paths.socketPath(alloc, dir, name);
-        defer alloc.free(sock);
-        const result = client.control(alloc, sock, &.{"info"}) catch {
-            // Stale socket: the daemon is gone.
-            std.fs.cwd().deleteFile(sock) catch {};
-            continue;
-        };
-        defer alloc.free(result.text);
-        // info is "name\t<n> windows\tAttached|Detached"
-        try out.print("\t{s}\n", .{result.text});
+    switch (pick) {
+        .destructive => fail(exit_no_session, "multiple sessions; name one of: {s}", .{
+            joinNames(alloc, sessions),
+        }),
+        .read => {
+            if (try pickMostRecent(alloc, dir)) |name| return name;
+            fail(exit_no_session, "no sessions (run 'boo' or 'boo new' to start one)", .{});
+        },
     }
-    try out.flush();
 }
 
-fn resolveSession(alloc: std.mem.Allocator, args: Args, dir: []const u8) ![]u8 {
-    if (args.session) |name| {
-        paths.validateName(name) catch fatal("invalid session name: {s}", .{name});
-        return alloc.dupe(u8, name);
-    }
+/// The live session with the smallest idle time. Cleans up stale
+/// sockets along the way. Returns null when no session is alive.
+fn pickMostRecent(alloc: std.mem.Allocator, dir: []const u8) !?[]u8 {
     const sessions = try paths.listSessions(alloc, dir);
     defer {
         for (sessions) |s| alloc.free(s);
         alloc.free(sessions);
     }
-    if (sessions.len == 0) fatal("no sessions (use ghostscreen to create one)", .{});
-    if (sessions.len > 1) fatal("multiple sessions; pick one with -S (see -ls)", .{});
-    return alloc.dupe(u8, sessions[0]);
+
+    var best: ?[]u8 = null;
+    errdefer if (best) |b| alloc.free(b);
+    var best_idle: i64 = std.math.maxInt(i64);
+    for (sessions) |name| {
+        const info = sessionInfo(alloc, dir, name) catch continue orelse continue;
+        defer alloc.free(info.text);
+        if (best == null or info.idle_ms < best_idle) {
+            if (best) |b| alloc.free(b);
+            best = try alloc.dupe(u8, name);
+            best_idle = info.idle_ms;
+        }
+    }
+    return best;
 }
 
-fn cmdControl(alloc: std.mem.Allocator, args: Args) !void {
-    if (args.rest.len == 0) fatal("-X requires a command", .{});
-    const dir = try paths.socketDir(alloc);
-    defer alloc.free(dir);
-    const name = try resolveSession(alloc, args, dir);
-    defer alloc.free(name);
+const SessionInfo = struct {
+    /// Full info payload: name \t windows \t Attached|Detached \t idle_ms.
+    text: []u8,
+    windows: u32,
+    attached: bool,
+    idle_ms: i64,
+};
+
+/// Query a session daemon, deleting the socket when the daemon is gone.
+fn sessionInfo(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !?SessionInfo {
     const sock = try paths.socketPath(alloc, dir, name);
     defer alloc.free(sock);
+    const result = client.control(alloc, sock, &.{"info"}) catch {
+        // Stale socket: the daemon is gone.
+        std.fs.cwd().deleteFile(sock) catch {};
+        return null;
+    };
+    errdefer alloc.free(result.text);
+    if (!result.ok) return error.BadResponse;
 
-    const result = client.control(alloc, sock, args.rest) catch |err| switch (err) {
-        error.FileNotFound, error.ConnectionRefused => fatal("no session named {s}", .{name}),
+    var it = std.mem.splitScalar(u8, result.text, '\t');
+    _ = it.next() orelse return error.BadResponse; // name
+    const windows = std.fmt.parseInt(u32, it.next() orelse return error.BadResponse, 10) catch
+        return error.BadResponse;
+    const attached = std.mem.eql(u8, it.next() orelse return error.BadResponse, "Attached");
+    const idle_ms = std.fmt.parseInt(i64, it.next() orelse return error.BadResponse, 10) catch
+        return error.BadResponse;
+    return .{ .text = result.text, .windows = windows, .attached = attached, .idle_ms = idle_ms };
+}
+
+/// Run a control command against a session, mapping a missing daemon
+/// to the documented exit code.
+fn mustControl(
+    alloc: std.mem.Allocator,
+    dir: []const u8,
+    name: []const u8,
+    argv: []const []const u8,
+) !client.ControlResult {
+    const sock = try paths.socketPath(alloc, dir, name);
+    defer alloc.free(sock);
+    return client.control(alloc, sock, argv) catch |err| switch (err) {
+        error.FileNotFound, error.ConnectionRefused => fail(
+            exit_no_session,
+            "no session named {s}",
+            .{name},
+        ),
         else => return err,
     };
-    defer alloc.free(result.text);
+}
 
-    if (result.ok) {
-        if (result.text.len > 0) {
-            var buf: [4096]u8 = undefined;
-            var stdout_writer = std.fs.File.stdout().writer(&buf);
-            const out = &stdout_writer.interface;
-            try out.print("{s}\n", .{result.text});
-            try out.flush();
-        }
-    } else {
-        std.debug.print("ghostscreen: {s}\n", .{result.text});
-        posix.exit(1);
+// -- Commands -------------------------------------------------------------
+
+/// Zero-argument boo: attach the most recent session, else create one.
+fn cmdAuto(alloc: std.mem.Allocator) !void {
+    const dir = try paths.socketDir(alloc);
+    defer alloc.free(dir);
+    if (try pickMostRecent(alloc, dir)) |name| {
+        defer alloc.free(name);
+        return attachLoop(alloc, dir, name);
     }
+    return createSession(alloc, dir, null, false, &.{});
 }
 
-fn cmdReattach(alloc: std.mem.Allocator, args: Args) !void {
+fn cmdNew(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
+    var name: ?[]const u8 = null;
+    var detached = false;
+    var cmd_argv: []const [:0]const u8 = &.{};
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--")) {
+            cmd_argv = args[i + 1 ..];
+            break;
+        } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--detached")) {
+            detached = true;
+        } else if (isHelpFlag(arg)) {
+            return printHelpPage("new");
+        } else if (arg.len > 0 and arg[0] == '-') {
+            usageFail("new", "unknown flag '{s}'", .{arg});
+        } else if (name == null) {
+            name = arg;
+        } else {
+            usageFail("new", "unexpected argument '{s}'; put -- before the command", .{arg});
+        }
+    }
+
     const dir = try paths.socketDir(alloc);
     defer alloc.free(dir);
-    const name = try resolveSession(alloc, args, dir);
-    defer alloc.free(name);
-    const sock = try paths.socketPath(alloc, dir, name);
-    defer alloc.free(sock);
-    try attachLoop(alloc, sock, name);
+    return createSession(alloc, dir, name, detached, @ptrCast(cmd_argv));
 }
 
-fn cmdCreate(alloc: std.mem.Allocator, args: Args, detached: bool) !void {
-    const dir = try paths.socketDir(alloc);
-    defer alloc.free(dir);
-
+fn createSession(
+    alloc: std.mem.Allocator,
+    dir: []const u8,
+    name_opt: ?[]const u8,
+    detached: bool,
+    cmd_argv: []const []const u8,
+) !void {
     var name_buf: [32]u8 = undefined;
-    const name = args.session orelse paths.defaultName(&name_buf);
-    paths.validateName(name) catch fatal("invalid session name: {s}", .{name});
+    const name = name_opt orelse paths.defaultName(&name_buf);
+    paths.validateName(name) catch
+        usageFail("new", "invalid session name '{s}'", .{name});
 
     const sock = try paths.socketPath(alloc, dir, name);
     defer alloc.free(sock);
 
     const listen_fd = bindListen(alloc, sock) catch |err| switch (err) {
-        error.SessionExists => fatal("session {s} already exists (use -r to attach)", .{name}),
+        error.SessionExists => fail(
+            exit_runtime,
+            "session {s} already exists (run 'boo attach {s}')",
+            .{ name, name },
+        ),
         else => return err,
     };
 
     // Fork the session daemon. The listening socket already exists, so
     // there is no race between daemon startup and the first attach.
-    // GHOSTSCREEN_FOREGROUND=1 keeps the daemon in the foreground, which
-    // is useful for debugging.
-    if (posix.getenv("GHOSTSCREEN_FOREGROUND") != null) {
+    // BOO_FOREGROUND=1 keeps the daemon in the foreground, which is
+    // useful for debugging.
+    if (posix.getenv("BOO_FOREGROUND") != null) {
         try daemonpkg.Daemon.run(alloc, .{
             .name = name,
             .socket_path = sock,
             .listen_fd = listen_fd,
-            .argv = args.rest,
+            .argv = cmd_argv,
         });
         return;
     }
     const pid = try posix.fork();
     if (pid == 0) {
-        runDaemon(alloc, name, sock, listen_fd, args.rest);
+        runDaemon(alloc, name, sock, listen_fd, cmd_argv);
     }
     posix.close(listen_fd);
 
     if (detached) {
-        std.debug.print("ghostscreen: started detached session {s}\n", .{name});
+        // The name on stdout so scripts can capture it.
+        try stdoutPrint(alloc, "{s}\n", .{name});
         return;
     }
-    try attachLoop(alloc, sock, name);
+    try attachLoop(alloc, dir, name);
 }
+
+fn cmdAttach(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
+    var name_arg: ?[]const u8 = null;
+    for (args) |arg| {
+        if (isHelpFlag(arg)) return printHelpPage("attach");
+        if (arg.len > 0 and arg[0] == '-') usageFail("attach", "unknown flag '{s}'", .{arg});
+        if (name_arg != null) usageFail("attach", "unexpected argument '{s}'", .{arg});
+        name_arg = arg;
+    }
+
+    const dir = try paths.socketDir(alloc);
+    defer alloc.free(dir);
+    const name = try resolveSession(alloc, dir, name_arg, .read);
+    defer alloc.free(name);
+    try attachLoop(alloc, dir, name);
+}
+
+fn attachLoop(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !void {
+    const sock = try paths.socketPath(alloc, dir, name);
+    defer alloc.free(sock);
+    const outcome = client.attach(alloc, sock) catch |err| switch (err) {
+        error.FileNotFound, error.ConnectionRefused => fail(
+            exit_no_session,
+            "no session named {s}",
+            .{name},
+        ),
+        error.NotATty => fail(exit_runtime, "attach requires a terminal", .{}),
+        else => return err,
+    };
+    switch (outcome) {
+        .detached => std.debug.print("[detached from {s}]\n", .{name}),
+        .stolen => std.debug.print("[session {s} attached elsewhere]\n", .{name}),
+        .ended => std.debug.print("[session {s} ended]\n", .{name}),
+        .lost => {
+            std.debug.print("[lost connection to {s}]\n", .{name});
+            posix.exit(exit_runtime);
+        },
+    }
+}
+
+fn cmdLs(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
+    var json = false;
+    for (args) |arg| {
+        if (isHelpFlag(arg)) return printHelpPage("ls");
+        if (std.mem.eql(u8, arg, "--json")) {
+            json = true;
+        } else {
+            usageFail("ls", "unexpected argument '{s}'", .{arg});
+        }
+    }
+
+    const dir = try paths.socketDir(alloc);
+    defer alloc.free(dir);
+    const sessions = try paths.listSessions(alloc, dir);
+    defer {
+        for (sessions) |s| alloc.free(s);
+        alloc.free(sessions);
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    var live: usize = 0;
+    var name_width: usize = 4;
+    var infos: std.ArrayList(struct { name: []const u8, info: SessionInfo }) = .empty;
+    defer {
+        for (infos.items) |entry| alloc.free(entry.info.text);
+        infos.deinit(alloc);
+    }
+    for (sessions) |name| {
+        const info = sessionInfo(alloc, dir, name) catch continue orelse continue;
+        try infos.append(alloc, .{ .name = name, .info = info });
+        name_width = @max(name_width, name.len);
+        live += 1;
+    }
+
+    if (json) {
+        try out.append(alloc, '[');
+        for (infos.items, 0..) |entry, i| {
+            if (i > 0) try out.append(alloc, ',');
+            try out.appendSlice(alloc, "{\"name\":");
+            try appendJsonString(alloc, &out, entry.name);
+            const tail = try std.fmt.allocPrint(alloc, ",\"windows\":{d},\"attached\":{},\"idle_ms\":{d}}}", .{
+                entry.info.windows,
+                entry.info.attached,
+                entry.info.idle_ms,
+            });
+            defer alloc.free(tail);
+            try out.appendSlice(alloc, tail);
+        }
+        try out.appendSlice(alloc, "]\n");
+        return stdoutWrite(out.items);
+    }
+
+    if (live == 0) {
+        return stdoutPrint(alloc, "No sessions in {s}.\n", .{dir});
+    }
+
+    try appendPadded(alloc, &out, "NAME", name_width);
+    try out.appendSlice(alloc, "  WINDOWS  STATE     IDLE\n");
+    for (infos.items) |entry| {
+        try appendPadded(alloc, &out, entry.name, name_width);
+        var idle_buf: [32]u8 = undefined;
+        const line = try std.fmt.allocPrint(alloc, "  {d: >7}  {s: <8}  {s}\n", .{
+            entry.info.windows,
+            if (entry.info.attached) "attached" else "detached",
+            fmtIdle(&idle_buf, entry.info.idle_ms),
+        });
+        defer alloc.free(line);
+        try out.appendSlice(alloc, line);
+    }
+    try stdoutWrite(out.items);
+}
+
+fn cmdWindows(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
+    var json = false;
+    var name_arg: ?[]const u8 = null;
+    for (args) |arg| {
+        if (isHelpFlag(arg)) return printHelpPage("windows");
+        if (std.mem.eql(u8, arg, "--json")) {
+            json = true;
+        } else if (arg.len > 0 and arg[0] == '-') {
+            usageFail("windows", "unknown flag '{s}'", .{arg});
+        } else if (name_arg == null) {
+            name_arg = arg;
+        } else {
+            usageFail("windows", "unexpected argument '{s}'", .{arg});
+        }
+    }
+
+    const dir = try paths.socketDir(alloc);
+    defer alloc.free(dir);
+    const name = try resolveSession(alloc, dir, name_arg, .read);
+    defer alloc.free(name);
+
+    const result = try mustControl(alloc, dir, name, &.{"windows"});
+    defer alloc.free(result.text);
+    if (!result.ok) fail(exit_runtime, "{s}", .{result.text});
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    if (json) try out.append(alloc, '[');
+    var first = true;
+    var lines = std.mem.splitScalar(u8, result.text, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const win = parseWindowLine(line) orelse continue;
+        if (json) {
+            if (!first) try out.append(alloc, ',');
+            const head = try std.fmt.allocPrint(alloc, "{{\"id\":{d},\"active\":{},\"idle_ms\":{d},\"command\":", .{
+                win.id, win.active, win.idle_ms,
+            });
+            defer alloc.free(head);
+            try out.appendSlice(alloc, head);
+            try appendJsonString(alloc, &out, win.command);
+            try out.appendSlice(alloc, ",\"title\":");
+            try appendJsonString(alloc, &out, win.title);
+            try out.append(alloc, '}');
+        } else {
+            const marker: u8 = if (win.active) '*' else ' ';
+            const text = try std.fmt.allocPrint(alloc, "{d}{c} {s}\n", .{ win.id, marker, win.title });
+            defer alloc.free(text);
+            try out.appendSlice(alloc, text);
+        }
+        first = false;
+    }
+    if (json) try out.appendSlice(alloc, "]\n");
+    try stdoutWrite(out.items);
+}
+
+const WindowLine = struct {
+    id: u32,
+    active: bool,
+    idle_ms: i64,
+    command: []const u8,
+    title: []const u8,
+};
+
+/// Wire format: id \t active \t idle_ms \t command \t title.
+fn parseWindowLine(line: []const u8) ?WindowLine {
+    var rest = line;
+    const id_str = cutTab(&rest) orelse return null;
+    const active_str = cutTab(&rest) orelse return null;
+    const idle_str = cutTab(&rest) orelse return null;
+    const command = cutTab(&rest) orelse return null;
+    return .{
+        .id = std.fmt.parseInt(u32, id_str, 10) catch return null,
+        .active = std.mem.eql(u8, active_str, "1"),
+        .idle_ms = std.fmt.parseInt(i64, idle_str, 10) catch return null,
+        .command = command,
+        .title = rest,
+    };
+}
+
+fn cutTab(rest: *[]const u8) ?[]const u8 {
+    const idx = std.mem.indexOfScalar(u8, rest.*, '\t') orelse return null;
+    const field = rest.*[0..idx];
+    rest.* = rest.*[idx + 1 ..];
+    return field;
+}
+
+fn cmdSend(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
+    var session: ?[]const u8 = null;
+    var text: ?[]const u8 = null;
+    var keys_arg: ?[]const u8 = null;
+    var enter = false;
+    var stdin = false;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (isHelpFlag(arg)) return printHelpPage("send");
+        if (std.mem.eql(u8, arg, "-s")) {
+            i += 1;
+            if (i >= args.len) usageFail("send", "-s requires a session name", .{});
+            session = args[i];
+        } else if (std.mem.eql(u8, arg, "--enter")) {
+            enter = true;
+        } else if (std.mem.eql(u8, arg, "--stdin")) {
+            stdin = true;
+        } else if (std.mem.eql(u8, arg, "--key")) {
+            i += 1;
+            if (i >= args.len) usageFail("send", "--key requires a key list", .{});
+            keys_arg = args[i];
+        } else if (arg.len > 0 and arg[0] == '-') {
+            usageFail("send", "unknown flag '{s}'", .{arg});
+        } else if (text == null) {
+            text = arg;
+        } else {
+            usageFail("send", "multiple text arguments; quote the text", .{});
+        }
+    }
+
+    if (text != null and keys_arg != null) {
+        usageFail("send", "text and --key cannot be combined; use two calls", .{});
+    }
+    if (stdin and (text != null or keys_arg != null)) {
+        usageFail("send", "--stdin cannot be combined with text or --key", .{});
+    }
+
+    // Resolve the session before potentially blocking on stdin.
+    const dir = try paths.socketDir(alloc);
+    defer alloc.free(dir);
+    const name = try resolveSession(alloc, dir, session, .read);
+    defer alloc.free(name);
+
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+    if (text) |t| {
+        try payload.appendSlice(alloc, t);
+    } else if (keys_arg) |list| {
+        var it = std.mem.splitScalar(u8, list, ',');
+        while (it.next()) |key_name| {
+            if (key_name.len == 0) continue;
+            if (!appendKey(alloc, &payload, key_name)) {
+                usageFail("send", "unknown key '{s}'", .{key_name});
+            }
+        }
+    } else {
+        const data = try readAllStdin(alloc);
+        defer alloc.free(data);
+        try payload.appendSlice(alloc, data);
+    }
+    if (enter) try payload.append(alloc, '\r');
+
+    if (payload.items.len == 0) usageFail("send", "nothing to send", .{});
+    if (std.mem.indexOfScalar(u8, payload.items, 0) != null) {
+        usageFail("send", "cannot send NUL bytes", .{});
+    }
+
+    const result = try mustControl(alloc, dir, name, &.{ "send", payload.items });
+    defer alloc.free(result.text);
+    if (!result.ok) fail(exit_runtime, "{s}", .{result.text});
+}
+
+/// Append the byte sequence for a named key. Returns false when the
+/// name is not recognized.
+fn appendKey(alloc: std.mem.Allocator, out: *std.ArrayList(u8), name: []const u8) bool {
+    const eqli = std.ascii.eqlIgnoreCase;
+    const bytes: []const u8 = if (eqli(name, "enter"))
+        "\r"
+    else if (eqli(name, "tab"))
+        "\t"
+    else if (eqli(name, "escape") or eqli(name, "esc"))
+        "\x1b"
+    else if (eqli(name, "space"))
+        " "
+    else if (eqli(name, "backspace") or eqli(name, "bs"))
+        "\x7f"
+    else if (eqli(name, "up"))
+        "\x1b[A"
+    else if (eqli(name, "down"))
+        "\x1b[B"
+    else if (eqli(name, "right"))
+        "\x1b[C"
+    else if (eqli(name, "left"))
+        "\x1b[D"
+    else if (eqli(name, "home"))
+        "\x1b[H"
+    else if (eqli(name, "end"))
+        "\x1b[F"
+    else if (name.len == 3 and (name[0] == 'C' or name[0] == 'c') and name[1] == '-' and
+        std.ascii.isAlphabetic(name[2]))
+    blk: {
+        const byte = std.ascii.toLower(name[2]) - 'a' + 1;
+        break :blk &[1]u8{byte};
+    } else return false;
+
+    out.appendSlice(alloc, bytes) catch return false;
+    return true;
+}
+
+fn readAllStdin(alloc: std.mem.Allocator) ![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(alloc);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = try posix.read(posix.STDIN_FILENO, &buf);
+        if (n == 0) break;
+        try list.appendSlice(alloc, buf[0..n]);
+        if (list.items.len > protocol.max_payload - 64) {
+            fail(exit_runtime, "stdin too large to send (max ~1MB)", .{});
+        }
+    }
+    return list.toOwnedSlice(alloc);
+}
+
+const Peek = struct {
+    rows: u32,
+    cols: u32,
+    cursor_row: u32,
+    cursor_col: u32,
+    window_id: u32,
+    title: []const u8,
+    screen: []const u8,
+};
+
+/// Wire format: rows \t cols \t cur_row \t cur_col \t window_id \t title
+/// on the first line, then the screen dump.
+fn parsePeek(payload: []const u8) ?Peek {
+    const nl = std.mem.indexOfScalar(u8, payload, '\n') orelse return null;
+    var rest = payload[0..nl];
+    const rows = cutTab(&rest) orelse return null;
+    const cols = cutTab(&rest) orelse return null;
+    const cur_row = cutTab(&rest) orelse return null;
+    const cur_col = cutTab(&rest) orelse return null;
+    const window_id = cutTab(&rest) orelse return null;
+    return .{
+        .rows = std.fmt.parseInt(u32, rows, 10) catch return null,
+        .cols = std.fmt.parseInt(u32, cols, 10) catch return null,
+        .cursor_row = std.fmt.parseInt(u32, cur_row, 10) catch return null,
+        .cursor_col = std.fmt.parseInt(u32, cur_col, 10) catch return null,
+        .window_id = std.fmt.parseInt(u32, window_id, 10) catch return null,
+        .title = rest,
+        .screen = payload[nl + 1 ..],
+    };
+}
+
+fn cmdPeek(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
+    var scrollback = false;
+    var json = false;
+    var name_arg: ?[]const u8 = null;
+    for (args) |arg| {
+        if (isHelpFlag(arg)) return printHelpPage("peek");
+        if (std.mem.eql(u8, arg, "--scrollback")) {
+            scrollback = true;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            json = true;
+        } else if (arg.len > 0 and arg[0] == '-') {
+            usageFail("peek", "unknown flag '{s}'", .{arg});
+        } else if (name_arg == null) {
+            name_arg = arg;
+        } else {
+            usageFail("peek", "unexpected argument '{s}'", .{arg});
+        }
+    }
+
+    const dir = try paths.socketDir(alloc);
+    defer alloc.free(dir);
+    const name = try resolveSession(alloc, dir, name_arg, .read);
+    defer alloc.free(name);
+
+    const result = try mustControl(alloc, dir, name, &.{
+        "peek", if (scrollback) "scrollback" else "screen",
+    });
+    defer alloc.free(result.text);
+    if (!result.ok) fail(exit_runtime, "{s}", .{result.text});
+
+    const peek = parsePeek(result.text) orelse
+        fail(exit_runtime, "malformed peek response", .{});
+
+    if (!json) {
+        try stdoutWrite(peek.screen);
+        if (peek.screen.len > 0 and peek.screen[peek.screen.len - 1] != '\n') {
+            try stdoutWrite("\n");
+        }
+        return;
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"session\":");
+    try appendJsonString(alloc, &out, name);
+    const mid = try std.fmt.allocPrint(
+        alloc,
+        ",\"window\":{d},\"title\":",
+        .{peek.window_id},
+    );
+    defer alloc.free(mid);
+    try out.appendSlice(alloc, mid);
+    try appendJsonString(alloc, &out, peek.title);
+    const geo = try std.fmt.allocPrint(
+        alloc,
+        ",\"rows\":{d},\"cols\":{d},\"cursor\":{{\"row\":{d},\"col\":{d}}},\"screen\":",
+        .{ peek.rows, peek.cols, peek.cursor_row, peek.cursor_col },
+    );
+    defer alloc.free(geo);
+    try out.appendSlice(alloc, geo);
+    try appendJsonString(alloc, &out, peek.screen);
+    try out.appendSlice(alloc, "}\n");
+    try stdoutWrite(out.items);
+}
+
+fn cmdWait(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
+    var name_arg: ?[]const u8 = null;
+    var for_text: ?[]const u8 = null;
+    var idle_str: ?[]const u8 = null;
+    var timeout_str: []const u8 = "30s";
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (isHelpFlag(arg)) return printHelpPage("wait");
+        if (std.mem.eql(u8, arg, "--for")) {
+            i += 1;
+            if (i >= args.len) usageFail("wait", "--for requires text", .{});
+            for_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--idle")) {
+            i += 1;
+            if (i >= args.len) usageFail("wait", "--idle requires a duration", .{});
+            idle_str = args[i];
+        } else if (std.mem.eql(u8, arg, "--timeout")) {
+            i += 1;
+            if (i >= args.len) usageFail("wait", "--timeout requires a duration", .{});
+            timeout_str = args[i];
+        } else if (arg.len > 0 and arg[0] == '-') {
+            usageFail("wait", "unknown flag '{s}'", .{arg});
+        } else if (name_arg == null) {
+            name_arg = arg;
+        } else {
+            usageFail("wait", "unexpected argument '{s}'", .{arg});
+        }
+    }
+
+    if ((for_text == null) == (idle_str == null)) {
+        usageFail("wait", "exactly one of --for or --idle is required", .{});
+    }
+    const timeout_ms = parseDurationMs(timeout_str) orelse
+        usageFail("wait", "bad duration '{s}' (use 500ms, 2s, 1m)", .{timeout_str});
+    const idle_ms: i64 = if (idle_str) |s|
+        @intCast(parseDurationMs(s) orelse
+            usageFail("wait", "bad duration '{s}' (use 500ms, 2s, 1m)", .{s}))
+    else
+        0;
+
+    const dir = try paths.socketDir(alloc);
+    defer alloc.free(dir);
+    const name = try resolveSession(alloc, dir, name_arg, .read);
+    defer alloc.free(name);
+
+    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (true) {
+        if (for_text) |needle| {
+            const result = try mustControl(alloc, dir, name, &.{ "peek", "screen" });
+            defer alloc.free(result.text);
+            if (!result.ok) fail(exit_runtime, "{s}", .{result.text});
+            const peek = parsePeek(result.text) orelse
+                fail(exit_runtime, "malformed peek response", .{});
+            if (std.mem.indexOf(u8, peek.screen, needle) != null) return;
+        } else {
+            const result = try mustControl(alloc, dir, name, &.{"windows"});
+            defer alloc.free(result.text);
+            if (!result.ok) fail(exit_runtime, "{s}", .{result.text});
+            var lines = std.mem.splitScalar(u8, result.text, '\n');
+            while (lines.next()) |line| {
+                if (line.len == 0) continue;
+                const win = parseWindowLine(line) orelse continue;
+                if (win.active and win.idle_ms >= idle_ms) return;
+            }
+        }
+        if (std.time.milliTimestamp() >= deadline) {
+            fail(exit_timeout, "wait: timed out after {s}", .{timeout_str});
+        }
+        std.Thread.sleep(50 * std.time.ns_per_ms);
+    }
+}
+
+fn cmdKill(alloc: std.mem.Allocator, args: []const [:0]const u8, comptime cmd: []const u8) !void {
+    const is_exorcise = comptime std.mem.eql(u8, cmd, "exorcise");
+    var all = is_exorcise;
+    var name_arg: ?[]const u8 = null;
+    for (args) |arg| {
+        if (isHelpFlag(arg)) return printHelpPage(cmd);
+        if (std.mem.eql(u8, arg, "--all")) {
+            if (is_exorcise) usageFail(cmd, "unexpected flag '--all'", .{});
+            all = true;
+        } else if (arg.len > 0 and arg[0] == '-') {
+            usageFail(cmd, "unknown flag '{s}'", .{arg});
+        } else if (is_exorcise or all) {
+            usageFail(cmd, "unexpected argument '{s}'", .{arg});
+        } else if (name_arg == null) {
+            name_arg = arg;
+        } else {
+            usageFail(cmd, "unexpected argument '{s}'", .{arg});
+        }
+    }
+    if (all and name_arg != null) {
+        usageFail(cmd, "--all cannot be combined with a session name", .{});
+    }
+
+    const dir = try paths.socketDir(alloc);
+    defer alloc.free(dir);
+
+    if (all) {
+        const sessions = try paths.listSessions(alloc, dir);
+        defer {
+            for (sessions) |s| alloc.free(s);
+            alloc.free(sessions);
+        }
+        for (sessions) |name| {
+            const sock = try paths.socketPath(alloc, dir, name);
+            defer alloc.free(sock);
+            const result = client.control(alloc, sock, &.{"quit"}) catch {
+                std.fs.cwd().deleteFile(sock) catch {};
+                continue;
+            };
+            alloc.free(result.text);
+            try stdoutPrint(alloc, "{s}\n", .{name});
+        }
+        return;
+    }
+
+    const name = try resolveSession(alloc, dir, name_arg, .destructive);
+    defer alloc.free(name);
+    const result = try mustControl(alloc, dir, name, &.{"quit"});
+    defer alloc.free(result.text);
+    if (!result.ok) fail(exit_runtime, "{s}", .{result.text});
+}
+
+fn cmdVersion(alloc: std.mem.Allocator) !void {
+    try stdoutPrint(alloc, "boo {s}\n", .{version});
+}
+
+fn cmdHelp(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
+    _ = alloc;
+    if (args.len == 0) return stdoutWrite(help.overview);
+    if (args.len > 1) usageFail("help", "expected one command or topic", .{});
+
+    const topic = args[0];
+    if (std.mem.eql(u8, topic, "--all")) {
+        try stdoutWrite(help.overview);
+        for (&help.commands) |*entry| {
+            try stdoutWrite("\n");
+            try stdoutWrite(entry.body);
+        }
+        for (&help.topics) |*entry| {
+            try stdoutWrite("\n");
+            try stdoutWrite(entry.body);
+        }
+        return;
+    }
+    if (help.find(topic)) |entry| return stdoutWrite(entry.body);
+    usageFail("help", "no help for '{s}'", .{topic});
+}
+
+// -- Output helpers -------------------------------------------------------
+
+fn appendPadded(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    text: []const u8,
+    width: usize,
+) !void {
+    try out.appendSlice(alloc, text);
+    var i = text.len;
+    while (i < width) : (i += 1) try out.append(alloc, ' ');
+}
+
+/// Append a JSON string literal, escaping per RFC 8259.
+fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
+    try out.append(alloc, '"');
+    for (s) |byte| {
+        switch (byte) {
+            '"' => try out.appendSlice(alloc, "\\\""),
+            '\\' => try out.appendSlice(alloc, "\\\\"),
+            '\n' => try out.appendSlice(alloc, "\\n"),
+            '\r' => try out.appendSlice(alloc, "\\r"),
+            '\t' => try out.appendSlice(alloc, "\\t"),
+            else => {
+                if (byte < 0x20) {
+                    var buf: [8]u8 = undefined;
+                    const esc = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{byte}) catch unreachable;
+                    try out.appendSlice(alloc, esc);
+                } else {
+                    try out.append(alloc, byte);
+                }
+            },
+        }
+    }
+    try out.append(alloc, '"');
+}
+
+/// Parse durations like 500ms, 2s, 1m. Returns milliseconds.
+fn parseDurationMs(s: []const u8) ?u64 {
+    if (std.mem.endsWith(u8, s, "ms")) {
+        const n = std.fmt.parseInt(u64, s[0 .. s.len - 2], 10) catch return null;
+        return n;
+    }
+    if (std.mem.endsWith(u8, s, "s")) {
+        const n = std.fmt.parseInt(u64, s[0 .. s.len - 1], 10) catch return null;
+        return n * std.time.ms_per_s;
+    }
+    if (std.mem.endsWith(u8, s, "m")) {
+        const n = std.fmt.parseInt(u64, s[0 .. s.len - 1], 10) catch return null;
+        return n * std.time.ms_per_min;
+    }
+    return null;
+}
+
+/// Human idle durations for `ls`: 12s, 5m, 3h.
+fn fmtIdle(buf: []u8, ms: i64) []const u8 {
+    const s = @divTrunc(@max(0, ms), std.time.ms_per_s);
+    if (s < 60) return std.fmt.bufPrint(buf, "{d}s", .{s}) catch "?";
+    if (s < 3600) return std.fmt.bufPrint(buf, "{d}m", .{@divTrunc(s, 60)}) catch "?";
+    return std.fmt.bufPrint(buf, "{d}h", .{@divTrunc(s, 3600)}) catch "?";
+}
+
+// -- Daemon plumbing ------------------------------------------------------
 
 fn runDaemon(
     alloc: std.mem.Allocator,
@@ -292,12 +968,12 @@ fn runDaemon(
 ) noreturn {
     _ = posix.setsid() catch {};
 
-    // Detach stdio. Keep stderr pointed at GHOSTSCREEN_LOG if set so
-    // std.log output is preserved for debugging.
+    // Detach stdio. Keep stderr pointed at BOO_LOG if set so std.log
+    // output is preserved for debugging.
     const devnull = posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch posix.exit(1);
     posix.dup2(devnull, 0) catch {};
     posix.dup2(devnull, 1) catch {};
-    if (posix.getenv("GHOSTSCREEN_LOG")) |log_path| blk: {
+    if (posix.getenv("BOO_LOG")) |log_path| blk: {
         const fd = posix.open(log_path, .{
             .ACCMODE = .WRONLY,
             .CREAT = true,
@@ -349,21 +1025,64 @@ fn bindListen(alloc: std.mem.Allocator, sock_path: []const u8) !posix.fd_t {
     return fd;
 }
 
-fn attachLoop(alloc: std.mem.Allocator, sock: []const u8, name: []const u8) !void {
-    const outcome = client.attach(alloc, sock) catch |err| switch (err) {
-        error.FileNotFound, error.ConnectionRefused => fatal("no session named {s}", .{name}),
-        error.NotATty => fatal("attach requires a terminal", .{}),
-        else => return err,
-    };
-    switch (outcome) {
-        .detached => std.debug.print("[detached from {s}]\n", .{name}),
-        .stolen => std.debug.print("[session {s} attached elsewhere]\n", .{name}),
-        .ended => std.debug.print("[session {s} ended]\n", .{name}),
-        .lost => {
-            std.debug.print("[lost connection to {s}]\n", .{name});
-            posix.exit(1);
-        },
-    }
+// -- Tests ----------------------------------------------------------------
+
+test "parseDurationMs" {
+    try std.testing.expectEqual(@as(?u64, 500), parseDurationMs("500ms"));
+    try std.testing.expectEqual(@as(?u64, 2000), parseDurationMs("2s"));
+    try std.testing.expectEqual(@as(?u64, 60_000), parseDurationMs("1m"));
+    try std.testing.expectEqual(@as(?u64, null), parseDurationMs("2"));
+    try std.testing.expectEqual(@as(?u64, null), parseDurationMs("s"));
+    try std.testing.expectEqual(@as(?u64, null), parseDurationMs("2h"));
+}
+
+test "appendKey named keys" {
+    const alloc = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try std.testing.expect(appendKey(alloc, &out, "Enter"));
+    try std.testing.expect(appendKey(alloc, &out, "C-c"));
+    try std.testing.expect(appendKey(alloc, &out, "up"));
+    try std.testing.expectEqualStrings("\r\x03\x1b[A", out.items);
+    try std.testing.expect(!appendKey(alloc, &out, "C-1"));
+    try std.testing.expect(!appendKey(alloc, &out, "banana"));
+}
+
+test "appendJsonString escapes" {
+    const alloc = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try appendJsonString(alloc, &out, "a\"b\\c\nd\x01");
+    try std.testing.expectEqualStrings("\"a\\\"b\\\\c\\nd\\u0001\"", out.items);
+}
+
+test "parseWindowLine" {
+    const win = parseWindowLine("3\t1\t250\tbash\tmy\ttitle").?;
+    try std.testing.expectEqual(@as(u32, 3), win.id);
+    try std.testing.expect(win.active);
+    try std.testing.expectEqual(@as(i64, 250), win.idle_ms);
+    try std.testing.expectEqualStrings("bash", win.command);
+    try std.testing.expectEqualStrings("my\ttitle", win.title);
+    try std.testing.expectEqual(@as(?WindowLine, null), parseWindowLine("nope"));
+}
+
+test "parsePeek" {
+    const peek = parsePeek("24\t80\t3\t7\t1\tvim\nline1\nline2").?;
+    try std.testing.expectEqual(@as(u32, 24), peek.rows);
+    try std.testing.expectEqual(@as(u32, 80), peek.cols);
+    try std.testing.expectEqual(@as(u32, 3), peek.cursor_row);
+    try std.testing.expectEqual(@as(u32, 7), peek.cursor_col);
+    try std.testing.expectEqual(@as(u32, 1), peek.window_id);
+    try std.testing.expectEqualStrings("vim", peek.title);
+    try std.testing.expectEqualStrings("line1\nline2", peek.screen);
+}
+
+test "fmtIdle" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("0s", fmtIdle(&buf, 400));
+    try std.testing.expectEqualStrings("12s", fmtIdle(&buf, 12_500));
+    try std.testing.expectEqualStrings("5m", fmtIdle(&buf, 5 * 60_000));
+    try std.testing.expectEqualStrings("2h", fmtIdle(&buf, 2 * 3_600_000));
 }
 
 test {
@@ -375,4 +1094,5 @@ test {
     _ = @import("window.zig");
     _ = @import("daemon.zig");
     _ = @import("client.zig");
+    _ = @import("help.zig");
 }
