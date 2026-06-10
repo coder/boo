@@ -1171,8 +1171,9 @@ test "ui: a row touching the viewport's right edge keeps its last cell" {
     // from a variable so the echoed command line cannot match.
     try h.sendLine("edge", "T=EDGE; printf \"\\\\033[3;71H${T}Z\"");
     try ui.waitFor("EDGEZ");
-    // The status bar repaints after arming the prefix, so once the
-    // keybind bar shows, the marker row's frame is fully captured.
+    // The bottom row repaints with the keybind bar after arming the
+    // prefix, so once it shows, the marker row's frame is fully
+    // captured.
     try ui.send("\x01");
     try ui.waitFor("r rename");
     try ui.send("\x1b");
@@ -1318,7 +1319,8 @@ test "ui: viewport size tracks the terminal minus the sidebar" {
     try h.startDetached("rz", &.{"/bin/sh"});
 
     // 100 columns - 24 sidebar - 1 separator = 75 viewport columns;
-    // 24 rows - 1 status bar = 23 viewport rows.
+    // the viewport spans all 24 rows, since status content only
+    // overlays the bottom row while it has something to show.
     var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
     defer ui.deinit();
     try ui.waitFor("rz");
@@ -1329,7 +1331,7 @@ test "ui: viewport size tracks the terminal minus the sidebar" {
     defer alloc.free(cmd);
 
     try h.sendLine("rz", cmd);
-    try waitFileEquals(alloc, size_file, "23 75\n");
+    try waitFileEquals(alloc, size_file, "24 75\n");
 
     // Resizing the outer terminal resizes the viewport with it.
     try ui.setSize(30, 120);
@@ -1339,7 +1341,7 @@ test "ui: viewport size tracks the terminal minus the sidebar" {
         std.Thread.sleep(50 * std.time.ns_per_ms);
         const content = std.fs.cwd().readFileAlloc(alloc, size_file, 4096) catch "";
         defer if (content.len > 0) alloc.free(content);
-        if (std.mem.eql(u8, content, "29 95\n")) break;
+        if (std.mem.eql(u8, content, "30 95\n")) break;
         try deadline.tick("viewport resize never reached the session");
     }
 }
@@ -1417,7 +1419,42 @@ test "ui: a stolen view reclaims the session once the thief lets go" {
     try ui.waitFor("BACK-MARK");
 }
 
-test "ui: the status bar reveals keybinds and C-a r renames" {
+/// Pump the client until the rendered screen's last row contains
+/// every needle (or, for `absent`, none of them).
+fn waitLastRow(
+    alloc: std.mem.Allocator,
+    ui: *PtyClient,
+    rows: u16,
+    cols: u16,
+    present: []const []const u8,
+    absent: []const []const u8,
+) !void {
+    var deadline = Deadline.init(default_timeout_ms);
+    while (true) {
+        const screen = try renderScreen(alloc, ui.output.items, rows, cols);
+        defer alloc.free(screen);
+        var lines = std.mem.splitScalar(u8, screen, '\n');
+        var last: []const u8 = "";
+        while (lines.next()) |line| last = line;
+
+        var ok = true;
+        for (present) |needle| {
+            if (std.mem.indexOf(u8, last, needle) == null) ok = false;
+        }
+        for (absent) |needle| {
+            if (std.mem.indexOf(u8, last, needle) != null) ok = false;
+        }
+        if (ok) return;
+
+        _ = try ui.pump(100);
+        deadline.tick("waiting for the bottom row") catch |err| {
+            std.debug.print("--- bottom row --- {s}\n", .{last});
+            return err;
+        };
+    }
+}
+
+test "ui: the keybind bar overlays the bottom row and C-a r renames" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
     defer h.deinit();
@@ -1427,16 +1464,22 @@ test "ui: the status bar reveals keybinds and C-a r renames" {
     var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
     defer ui.deinit();
     try ui.waitFor("oldname");
-    try ui.waitFor("Keybinds: Ctrl+A");
 
-    // Arming the prefix swaps the hint for the keybind list; Esc
-    // backs out and the hint returns.
+    // The keybind hint sits in the sidebar's bottom row and the
+    // separator runs through the last row: no reserved status bar.
+    try waitLastRow(alloc, &ui, 24, 100, &.{ "Keybinds: Ctrl+A", "\u{2502}" }, &.{});
+
+    // Arming the prefix overlays the keybind list across the whole
+    // bottom row, covering the sidebar hint and the separator.
     try ui.send("\x01");
     try ui.waitFor("r rename");
     try ui.waitFor("esc cancel");
-    ui.clearOutput();
+    try waitLastRow(alloc, &ui, 24, 100, &.{"r rename"}, &.{"\u{2502}"});
+
+    // Esc backs out: the overlay reverts to the hint, the separator,
+    // and whatever the viewport had underneath.
     try ui.send("\x1b");
-    try ui.waitFor("Keybinds: Ctrl+A");
+    try waitLastRow(alloc, &ui, 24, 100, &.{ "Keybinds: Ctrl+A", "\u{2502}" }, &.{"r rename"});
 
     // C-a r opens the prompt pre-filled with the old name; erase it
     // and type a new one.
