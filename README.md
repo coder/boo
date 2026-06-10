@@ -16,8 +16,9 @@ exactly as a human would see it.
 - Sessions that survive disconnects: detach with `C-a d`, reattach with
   `boo attach`.
 - A full-screen session manager: `boo ui` lists sessions in a sidebar
-  and renders the focused one live next to it. Click to switch, create,
-  or kill sessions; everything also works from the keyboard.
+  with their titles and renders the focused one live next to it. Click
+  to switch, create, kill, or rename sessions; everything also works
+  from the keyboard.
 - One command per session, named after your current directory by
   default. Sessions are cheap; run one per task.
 - Faithful redraws from libghostty terminal state, including SGR styles,
@@ -70,6 +71,7 @@ boo ui                     # manage sessions in a full-screen UI
 boo ls                     # list sessions
 boo attach work            # reattach (steals if attached elsewhere)
 boo at w                   # same: alias + unique-prefix matching
+boo rename work api        # rename a session
 boo kill work              # end a session
 boo kill --all             # end every session
 ```
@@ -92,7 +94,8 @@ Bindings follow GNU screen's defaults, including the `C-x` variants
 | `C-a a`   | send a literal `C-a`                |
 
 `boo ui` adds bindings for switching (`C-a n`/`C-a p`/`C-a C-a`),
-creating (`C-a c`), and killing (`C-a k`) sessions; see
+creating (`C-a c`), killing (`C-a k`), and renaming (`C-a r`)
+sessions; pressing `C-a` alone lists them in the bottom bar. See
 `boo help ui`.
 
 ## Automation

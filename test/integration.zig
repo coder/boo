@@ -1002,6 +1002,32 @@ test "agent loop: new, send, wait, peek, kill" {
     try h.runExit(&.{ "peek", "agent" }, 3);
 }
 
+test "rename: moves a session to a new name" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("before", &.{"cat"});
+    try h.sendLine("before", "RN-MARK");
+    const seeded = try h.waitPeekContains("before", "RN-MARK");
+    alloc.free(seeded);
+
+    // The screen and the running process survive the rename.
+    try h.runOk(&.{ "rename", "before", "after" });
+    const content = try h.waitPeekContains("after", "RN-MARK");
+    alloc.free(content);
+    try h.runExit(&.{ "peek", "before" }, 3);
+
+    // Name collisions, invalid names, and missing sessions are
+    // rejected with the documented exit codes.
+    try h.startDetached("other", &.{"cat"});
+    try h.runExit(&.{ "rename", "after", "other" }, 1);
+    try h.runExit(&.{ "rename", "after", "sp ace" }, 2);
+    try h.runExit(&.{ "rename", "nosuchzz", "x" }, 3);
+    try h.runExit(&.{"rename"}, 2);
+    try h.runExit(&.{ "rename", "after" }, 2);
+}
+
 // -- boo ui -------------------------------------------------------------------
 
 fn uiSessionCount(h: *Harness) !usize {
@@ -1164,7 +1190,8 @@ test "ui: viewport size tracks the terminal minus the sidebar" {
 
     try h.startDetached("rz", &.{"/bin/sh"});
 
-    // 100 columns - 24 sidebar - 1 separator = 75 viewport columns.
+    // 100 columns - 24 sidebar - 1 separator = 75 viewport columns;
+    // 24 rows - 1 status bar = 23 viewport rows.
     var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
     defer ui.deinit();
     try ui.waitFor("rz");
@@ -1175,7 +1202,7 @@ test "ui: viewport size tracks the terminal minus the sidebar" {
     defer alloc.free(cmd);
 
     try h.sendLine("rz", cmd);
-    try waitFileEquals(alloc, size_file, "24 75\n");
+    try waitFileEquals(alloc, size_file, "23 75\n");
 
     // Resizing the outer terminal resizes the viewport with it.
     try ui.setSize(30, 120);
@@ -1185,7 +1212,7 @@ test "ui: viewport size tracks the terminal minus the sidebar" {
         std.Thread.sleep(50 * std.time.ns_per_ms);
         const content = std.fs.cwd().readFileAlloc(alloc, size_file, 4096) catch "";
         defer if (content.len > 0) alloc.free(content);
-        if (std.mem.eql(u8, content, "30 95\n")) break;
+        if (std.mem.eql(u8, content, "29 95\n")) break;
         try deadline.tick("viewport resize never reached the session");
     }
 }
@@ -1209,6 +1236,56 @@ test "ui: a plain attach steals the focused session" {
     try ui.send("\x1b[<0;5;2M\x1b[<0;5;2m");
     try thief.waitFor("attached elsewhere");
     _ = try thief.waitExit();
+}
+
+test "ui: the status bar reveals keybinds and C-a r renames" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("oldname", &.{"cat"});
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("oldname");
+    try ui.waitFor("Press Ctrl+A for keybinds");
+
+    // Arming the prefix swaps the hint for the keybind list.
+    try ui.send("\x01");
+    try ui.waitFor("r rename");
+
+    // C-a r opens the prompt pre-filled with the old name; erase it
+    // and type a new one.
+    try ui.send("r");
+    try ui.waitFor("rename oldname:");
+    try ui.send("\x7f\x7f\x7f\x7f\x7f\x7f\x7f");
+    try ui.send("fresh\r");
+    try ui.waitFor("renamed oldname to fresh");
+
+    // The daemon moved with the name: the old one is gone and the
+    // sidebar lists the new one.
+    const ls = try h.run(&.{"ls"});
+    defer alloc.free(ls.stdout);
+    defer alloc.free(ls.stderr);
+    try std.testing.expect(std.mem.indexOf(u8, ls.stdout, "fresh") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ls.stdout, "oldname") == null);
+}
+
+test "ui: session titles render in the sidebar" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("titled", &.{"/bin/sh"});
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("titled");
+
+    // Set the window title via OSC 2. The marker is assembled from a
+    // variable so the echoed command line cannot match the wait.
+    try h.sendLine("titled", "T=TITLE; printf \"\\033]2;${T}-MARK\\007\"");
+    try ui.waitFor("TITLE-MARK");
 }
 
 test "ui without a tty fails cleanly" {

@@ -12,6 +12,7 @@ const posix = std.posix;
 const protocol = @import("protocol.zig");
 const keys = @import("keys.zig");
 const altscreen = @import("altscreen.zig");
+const paths = @import("paths.zig");
 const windowpkg = @import("window.zig");
 const Window = windowpkg.Window;
 const main = @import("main.zig");
@@ -57,6 +58,11 @@ pub const Daemon = struct {
 
     conns: std.ArrayList(*Conn) = .empty,
     key_parser: keys.Parser = .{},
+
+    /// Owned replacements for opts.name and opts.socket_path after a
+    /// rename; the startup values are borrowed from the caller.
+    owned_name: ?[]u8 = null,
+    owned_socket_path: ?[]u8 = null,
 
     rows: u16,
     cols: u16,
@@ -115,6 +121,8 @@ pub const Daemon = struct {
         self.conns.deinit(self.alloc);
         posix.close(self.opts.listen_fd);
         std.fs.cwd().deleteFile(self.opts.socket_path) catch {};
+        if (self.owned_name) |n| self.alloc.free(n);
+        if (self.owned_socket_path) |p| self.alloc.free(p);
         if (self.sig_read >= 0) posix.close(self.sig_read);
         if (sigchld_pipe >= 0) posix.close(sigchld_pipe);
     }
@@ -371,6 +379,12 @@ pub const Daemon = struct {
                 }
             }
             conn.send(.ok, out.items);
+        } else if (std.mem.eql(u8, cmd, "rename")) {
+            if (argv.len != 2) {
+                conn.send(.err, "usage: rename <new-name>");
+                return;
+            }
+            self.rename(conn, argv[1]);
         } else if (std.mem.eql(u8, cmd, "quit")) {
             conn.send(.ok, "");
             if (self.win) |w| {
@@ -381,6 +395,57 @@ pub const Daemon = struct {
         } else {
             conn.send(.err, "unknown command");
         }
+    }
+
+    /// Move the session to a new name by renaming the listening
+    /// socket; established connections survive, and new clients find
+    /// the session under the new name.
+    fn rename(self: *Daemon, conn: *Conn, new_name: []const u8) void {
+        paths.validateName(new_name) catch {
+            conn.send(.err, "invalid session name");
+            return;
+        };
+        if (std.mem.eql(u8, new_name, self.opts.name)) {
+            conn.send(.ok, "");
+            return;
+        }
+
+        const dir = std.fs.path.dirname(self.opts.socket_path) orelse ".";
+        const new_path = paths.socketPath(self.alloc, dir, new_name) catch {
+            conn.send(.err, "rename failed");
+            return;
+        };
+        const new_owned_name = self.alloc.dupe(u8, new_name) catch {
+            self.alloc.free(new_path);
+            conn.send(.err, "rename failed");
+            return;
+        };
+
+        // Refuse to clobber another session's socket. Checking first
+        // is racy, but the window is tiny and losing the race only
+        // replaces a socket the same way 'kill' would free it.
+        if (std.fs.cwd().access(new_path, .{})) |_| {
+            self.alloc.free(new_path);
+            self.alloc.free(new_owned_name);
+            conn.send(.err, "a session with that name already exists");
+            return;
+        } else |_| {}
+
+        std.fs.cwd().rename(self.opts.socket_path, new_path) catch {
+            self.alloc.free(new_path);
+            self.alloc.free(new_owned_name);
+            conn.send(.err, "rename failed");
+            return;
+        };
+
+        if (self.owned_name) |n| self.alloc.free(n);
+        if (self.owned_socket_path) |p| self.alloc.free(p);
+        self.owned_name = new_owned_name;
+        self.owned_socket_path = new_path;
+        self.opts.name = new_owned_name;
+        self.opts.socket_path = new_path;
+        log.info("renamed to {s}", .{new_name});
+        conn.send(.ok, "");
     }
 
     fn serviceWindow(self: *Daemon, win: *Window, buf: []u8) void {

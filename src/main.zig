@@ -71,6 +71,7 @@ pub fn main() !void {
     if (eql(cmd, "peek")) return cmdPeek(alloc, rest);
     if (eql(cmd, "wait")) return cmdWait(alloc, rest);
     if (eql(cmd, "kill")) return cmdKill(alloc, rest);
+    if (eql(cmd, "rename")) return cmdRename(alloc, rest);
     if (eql(cmd, "version") or eql(cmd, "-V") or eql(cmd, "--version")) return cmdVersion(alloc);
     if (eql(cmd, "help") or eql(cmd, "-h") or eql(cmd, "--help")) return cmdHelp(alloc, rest);
     fail(exit_usage, "unknown command '{s}' (run 'boo help')", .{cmd});
@@ -746,6 +747,36 @@ fn cmdKill(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     const name = try resolveSession(alloc, dir, want);
     defer alloc.free(name);
     const result = try mustControl(alloc, dir, name, &.{"quit"});
+    defer alloc.free(result.text);
+    if (!result.ok) fail(exit_runtime, "{s}", .{result.text});
+}
+
+fn cmdRename(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
+    var old_arg: ?[]const u8 = null;
+    var new_arg: ?[]const u8 = null;
+    for (args) |arg| {
+        if (isHelpFlag(arg)) return printHelpPage("rename");
+        if (arg.len > 0 and arg[0] == '-') {
+            usageFail("rename", "unknown flag '{s}'", .{arg});
+        } else if (old_arg == null) {
+            old_arg = arg;
+        } else if (new_arg == null) {
+            new_arg = arg;
+        } else {
+            usageFail("rename", "unexpected argument '{s}'", .{arg});
+        }
+    }
+    const want = old_arg orelse usageFail("rename", "a session name is required", .{});
+    const new_name = new_arg orelse usageFail("rename", "a new session name is required", .{});
+    paths.validateName(new_name) catch
+        usageFail("rename", "invalid session name '{s}'", .{new_name});
+
+    const dir = try paths.socketDir(alloc);
+    defer alloc.free(dir);
+    const name = try resolveSession(alloc, dir, want);
+    defer alloc.free(name);
+
+    const result = try mustControl(alloc, dir, name, &.{ "rename", new_name });
     defer alloc.free(result.text);
     if (!result.ok) fail(exit_runtime, "{s}", .{result.text});
 }

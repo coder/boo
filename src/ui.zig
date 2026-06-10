@@ -43,13 +43,17 @@ const render_interval_ms: i64 = 15;
 // -- Layout -----------------------------------------------------------------
 
 /// Screen geometry: a sidebar on the left, a one-column separator,
-/// and the session viewport filling the rest. The viewport always
-/// reaches the right edge, so erase-to-end-of-line stays inside it.
+/// the session viewport filling the rest, and a full-width status
+/// bar on the last row. The viewport always reaches the right edge,
+/// so erase-to-end-of-line stays inside it.
 pub const Layout = struct {
     rows: u16,
     cols: u16,
     /// Sidebar text columns, excluding the separator column.
     sidebar_w: u16,
+
+    /// Each session occupies two sidebar rows: name and title.
+    pub const entry_rows: u16 = 2;
 
     pub fn init(rows: u16, cols: u16) Layout {
         // Narrow terminals get a proportionally smaller sidebar; the
@@ -63,21 +67,31 @@ pub const Layout = struct {
         return self.cols -| (self.sidebar_w + 1);
     }
 
+    /// Viewport rows: everything above the status bar.
+    pub fn viewportRows(self: Layout) u16 {
+        return self.rows -| 1;
+    }
+
     /// First viewport column, 0-based.
     pub fn viewportX(self: Layout) u16 {
         return self.sidebar_w + 1;
     }
 
-    /// Rows available for session entries between the header and the
-    /// new-session/status rows.
+    /// Sidebar rows available for session entries between the header
+    /// and the new-session row.
     pub fn listRows(self: Layout) u16 {
         return self.rows -| 3;
     }
 
+    /// Whole session entries that fit in the list area.
+    pub fn visibleEntries(self: Layout) usize {
+        return @max(1, self.listRows() / entry_rows);
+    }
+
     pub const Hit = union(enum) {
         header,
-        /// Index into the visible session list (scroll already applied
-        /// by the caller).
+        /// Display row within the visible session list (entry_rows
+        /// rows per session; scroll applied by the caller).
         session: struct { row: u16, kill: bool },
         new_button,
         status,
@@ -89,12 +103,12 @@ pub const Layout = struct {
     /// report whether the kill target ('x' in the last column) was hit.
     pub fn hit(self: Layout, x: u16, y: u16) Hit {
         if (y >= self.rows or x >= self.cols) return .none;
+        if (y == self.rows -| 1) return .status; // full-width bar
         if (x >= self.viewportX()) {
             return .{ .viewport = .{ .x = x - self.viewportX(), .y = y } };
         }
         if (x >= self.sidebar_w) return .none; // separator column
         if (y == 0) return .header;
-        if (y == self.rows -| 1) return .status;
         if (y == self.rows -| 2) return .new_button;
         return .{ .session = .{
             .row = y - 1,
@@ -510,8 +524,10 @@ fn appendClipped(
     while (used < width) : (used += 1) try out.append(alloc, ' ');
 }
 
-/// One sidebar session row: marker, name, age, and a kill target in
-/// the last column. Exactly `width` display columns plus SGR codes.
+/// One sidebar session name row: attached marker, name, age, and a
+/// kill target in the last column. Exactly `width` display columns
+/// plus SGR codes; the inverse-video highlight alone marks the
+/// selected session.
 pub fn appendSessionRow(
     alloc: std.mem.Allocator,
     out: *std.ArrayList(u8),
@@ -525,7 +541,9 @@ pub fn appendSessionRow(
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(alloc);
 
-    const marker: u8 = if (selected) '>' else if (entry.attached) '*' else ' ';
+    // '*': attached by another client. The selected session is
+    // attached by this UI itself, which is not worth a marker.
+    const marker: u8 = if (!selected and entry.attached) '*' else ' ';
     try scratch.append(alloc, marker);
 
     if (width >= 12) {
@@ -541,6 +559,28 @@ pub fn appendSessionRow(
         try appendClipped(alloc, &scratch, entry.name, width - 1);
     }
     try out.appendSlice(alloc, scratch.items[0..@min(scratch.items.len, width)]);
+    try out.appendSlice(alloc, sgr_reset);
+}
+
+/// The second sidebar row of a session entry: the window title, dim,
+/// indented under the name. Blank when the session has no title.
+pub fn appendSessionTitleRow(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    entry: Entry,
+    width: u16,
+    selected: bool,
+) !void {
+    if (width == 0) return;
+    if (selected) try out.appendSlice(alloc, style_selected);
+    try out.appendSlice(alloc, style_dim);
+
+    if (entry.title.len > 0 and width > 2) {
+        try out.appendSlice(alloc, "  ");
+        try appendClipped(alloc, out, entry.title, width - 2);
+    } else {
+        try appendClipped(alloc, out, "", width);
+    }
     try out.appendSlice(alloc, sgr_reset);
 }
 
@@ -634,6 +674,10 @@ const Ui = struct {
     parser: InputParser = .{},
     /// Pending kill confirmation: index into sessions.
     confirm_kill: ?usize = null,
+    /// Rename input buffer; non-null while the rename prompt is open.
+    rename_input: ?std.ArrayList(u8) = null,
+    /// Session index being renamed while the prompt is open.
+    rename_target: usize = 0,
     /// Transient status message and its expiry time.
     message: std.ArrayList(u8) = .empty,
     message_deadline: i64 = 0,
@@ -661,6 +705,7 @@ const Ui = struct {
         if (self.view) |v| v.destroy();
         freeEntries(self.alloc, &self.sessions);
         if (self.last_name) |n| self.alloc.free(n);
+        if (self.rename_input) |*input| input.deinit(self.alloc);
         self.message.deinit(self.alloc);
         for (self.row_cache.items) |*row| row.deinit(self.alloc);
         self.row_cache.deinit(self.alloc);
@@ -751,7 +796,7 @@ const Ui = struct {
         const ws = ptypkg.getSize(self.tty) catch return;
         self.layout = .init(ws.row, ws.col);
         if (self.view) |v| {
-            v.resize(self.layout.rows, self.layout.viewportCols()) catch |err| {
+            v.resize(self.layout.viewportRows(), self.layout.viewportCols()) catch |err| {
                 log.warn("viewport resize failed: {}", .{err});
             };
         }
@@ -773,10 +818,19 @@ const Ui = struct {
                 try h.ui.handleEvent(ev);
             }
         };
+        // The status bar shows the keybind list while the prefix is
+        // armed, so arming and disarming both need a repaint.
+        const was_pending = self.parser.pending_prefix;
         try self.parser.feed(buf[0..n], Handler{ .ui = self });
+        if (self.parser.pending_prefix != was_pending) self.need_render = true;
     }
 
     fn handleEvent(self: *Ui, ev: InputEvent) !void {
+        // An open rename prompt captures keyboard input.
+        if (self.rename_input != null) {
+            if (self.handleRenameEvent(ev)) return;
+        }
+
         // A pending kill confirmation swallows the next key.
         if (self.confirm_kill) |idx| {
             switch (ev) {
@@ -820,10 +874,58 @@ const Ui = struct {
         }
     }
 
+    /// Input while the rename prompt is open edits the new name.
+    /// Returns true when the event was consumed.
+    fn handleRenameEvent(self: *Ui, ev: InputEvent) bool {
+        const input = &(self.rename_input.?);
+        switch (ev) {
+            .forward => |bytes| {
+                // A bare escape cancels; longer escape sequences
+                // (arrow keys and friends) are ignored.
+                if (bytes.len > 0 and bytes[0] == 0x1b) {
+                    if (bytes.len == 1) self.cancelRename();
+                    return true;
+                }
+                for (bytes) |byte| switch (byte) {
+                    '\r', '\n' => {
+                        self.commitRename();
+                        return true;
+                    },
+                    0x7f, 0x08 => _ = input.pop(),
+                    0x03 => {
+                        self.cancelRename();
+                        return true;
+                    },
+                    else => {
+                        if (byte >= 0x20 and byte < 0x7f and
+                            input.items.len < paths.max_name_len)
+                        {
+                            input.append(self.alloc, byte) catch {};
+                        }
+                    },
+                };
+                self.need_render = true;
+                return true;
+            },
+            .prefix => {
+                self.cancelRename();
+                return true;
+            },
+            .mouse => |m| {
+                if (!m.release and !m.isMotion() and !m.isWheel()) {
+                    self.cancelRename();
+                }
+                return true;
+            },
+            .paste, .focus => return true,
+        }
+    }
+
     fn handlePrefix(self: *Ui, byte: u8) !void {
         switch (byte) {
             'c', 0x03 => self.createSession(),
             'k', 0x0b => self.confirmKill(),
+            'r', 0x12 => self.startRename(),
             'd', 0x04, 'q' => self.quitting = true,
             'n', 0x0e => self.focusOffset(1),
             'p', 0x10 => self.focusOffset(-1),
@@ -846,9 +948,9 @@ const Ui = struct {
             },
             else => {
                 if (std.ascii.isPrint(byte)) {
-                    self.setMessage("^A {c}? c new k kill n/p d quit", .{byte});
+                    self.setMessage("^A {c} is not bound (press Ctrl+A alone for keybinds)", .{byte});
                 } else {
-                    self.setMessage("^A ^{c}? c new k kill n/p d quit", .{byte ^ 0x40});
+                    self.setMessage("^A ^{c} is not bound (press Ctrl+A alone for keybinds)", .{byte ^ 0x40});
                 }
             },
         }
@@ -888,9 +990,9 @@ const Ui = struct {
             .viewport => return self.forwardMouse(m),
             .session => |s| {
                 if (m.release or m.isMotion()) return;
-                const idx = self.scroll + s.row;
+                const idx = self.scroll + s.row / Layout.entry_rows;
                 if (idx >= self.sessions.items.len) return;
-                if (s.kill) {
+                if (s.kill and s.row % Layout.entry_rows == 0) {
                     self.armKillConfirm(idx);
                     return;
                 }
@@ -1137,7 +1239,7 @@ const Ui = struct {
         self.view = View.create(
             self.alloc,
             sock,
-            self.layout.rows,
+            self.layout.viewportRows(),
             self.layout.viewportCols(),
         ) catch |err| {
             self.setMessage("attach {s} failed: {s}", .{ name, @errorName(err) });
@@ -1251,6 +1353,72 @@ const Ui = struct {
         self.need_render = true;
     }
 
+    fn startRename(self: *Ui) void {
+        const idx = self.selected orelse {
+            self.setMessage("no session to rename", .{});
+            return;
+        };
+        self.confirm_kill = null;
+        self.rename_target = idx;
+        var input: std.ArrayList(u8) = .empty;
+        // Pre-fill with the current name for quick edits.
+        input.appendSlice(self.alloc, self.sessions.items[idx].name) catch {};
+        if (self.rename_input) |*old| old.deinit(self.alloc);
+        self.rename_input = input;
+        // The prompt renders from rename_input; a stale transient
+        // message would cover it up.
+        self.message.clearRetainingCapacity();
+        self.message_deadline = 0;
+        self.need_render = true;
+    }
+
+    fn cancelRename(self: *Ui) void {
+        if (self.rename_input) |*input| input.deinit(self.alloc);
+        self.rename_input = null;
+        self.setMessage("rename cancelled", .{});
+    }
+
+    /// Ask the daemon to rename the prompt's target session. On
+    /// success the local entry is patched in place: selection is
+    /// restored by name on refresh, and the attached view's socket
+    /// stays connected across the rename.
+    fn commitRename(self: *Ui) void {
+        var input = self.rename_input.?;
+        self.rename_input = null;
+        defer input.deinit(self.alloc);
+        const new_name = input.items;
+
+        const idx = self.rename_target;
+        if (idx >= self.sessions.items.len) return;
+        const entry = &self.sessions.items[idx];
+        if (std.mem.eql(u8, entry.name, new_name)) {
+            self.need_render = true;
+            return;
+        }
+        paths.validateName(new_name) catch {
+            self.setMessage("invalid session name '{s}'", .{new_name});
+            return;
+        };
+
+        const sock = paths.socketPath(self.alloc, self.dir, entry.name) catch return;
+        defer self.alloc.free(sock);
+        const result = client.control(self.alloc, sock, &.{ "rename", new_name }) catch {
+            self.setMessage("rename failed", .{});
+            return;
+        };
+        defer self.alloc.free(result.text);
+        if (!result.ok) {
+            self.setMessage("{s}", .{result.text});
+            return;
+        }
+
+        self.setMessage("renamed {s} to {s}", .{ entry.name, new_name });
+        const owned = self.alloc.dupe(u8, new_name) catch return;
+        self.alloc.free(entry.name);
+        entry.name = owned;
+        self.refreshSessions() catch {};
+    }
+
     fn killSession(self: *Ui, idx: usize) void {
         if (idx >= self.sessions.items.len) return;
         const name = self.sessions.items[idx].name;
@@ -1276,7 +1444,7 @@ const Ui = struct {
     }
 
     fn clampScroll(self: *Ui) void {
-        const max_scroll = self.sessions.items.len -| self.layout.listRows();
+        const max_scroll = self.sessions.items.len -| self.layout.visibleEntries();
         if (self.scroll > max_scroll) self.scroll = max_scroll;
     }
 
@@ -1285,11 +1453,11 @@ const Ui = struct {
     /// list freely without snapping back to the selection.
     fn scrollSelectedIntoView(self: *Ui) void {
         self.clampScroll();
-        const list_rows = self.layout.listRows();
+        const visible = self.layout.visibleEntries();
         const idx = self.selected orelse return;
         if (idx < self.scroll) self.scroll = idx;
-        if (list_rows > 0 and idx >= self.scroll + list_rows) {
-            self.scroll = idx + 1 - list_rows;
+        if (idx >= self.scroll + visible) {
+            self.scroll = idx + 1 - visible;
         }
     }
 
@@ -1369,9 +1537,10 @@ const Ui = struct {
 
     fn cursorSequence(self: *Ui) CursorState {
         var state: CursorState = .{};
+        if (self.renameCursor()) |s| return s;
         const v = self.liveView() orelse return state;
         const cursor = &v.term.screens.active.cursor;
-        const row: usize = @min(cursor.y, self.layout.rows -| 1);
+        const row: usize = @min(cursor.y, self.layout.viewportRows() -| 1);
         const col: usize = @min(
             @as(usize, cursor.x) + self.layout.viewportX(),
             self.layout.cols -| 1,
@@ -1385,18 +1554,79 @@ const Ui = struct {
         return state;
     }
 
-    /// One full screen row: sidebar columns, separator, then the
+    /// While the rename prompt is open, the cursor sits at the end
+    /// of the typed name in the status bar.
+    fn renameCursor(self: *Ui) ?CursorState {
+        const input = self.rename_input orelse return null;
+        if (self.rename_target >= self.sessions.items.len) return null;
+        var state: CursorState = .{};
+        const prompt_len = " rename ".len +
+            self.sessions.items[self.rename_target].name.len + ": ".len;
+        const col = @min(prompt_len + input.items.len + 1, self.layout.cols);
+        const text = std.fmt.bufPrint(&state.pos, "\x1b[{d};{d}H", .{
+            self.layout.rows,
+            col,
+        }) catch return state;
+        state.pos_len = text.len;
+        state.visible = true;
+        return state;
+    }
+
+    /// One full screen row. The last row is the full-width status
+    /// bar; every other row is sidebar columns, separator, then the
     /// viewport slice. The sidebar segment is always exactly
     /// sidebar_w columns so the row never bleeds into the viewport.
     fn composeRow(self: *Ui, y: u16, out: *std.ArrayList(u8)) !void {
         const alloc = self.alloc;
 
         try out.appendSlice(alloc, sgr_reset);
+        if (y == self.layout.rows -| 1) {
+            try self.composeStatusRow(out);
+            return;
+        }
         try self.composeSidebarCell(y, out);
         try out.appendSlice(alloc, style_dim);
         try out.appendSlice(alloc, "\u{2502}");
         try out.appendSlice(alloc, sgr_reset);
         try self.composeViewportCell(y, out);
+    }
+
+    const keybind_bar =
+        " C-a +  c new  k kill  r rename  n/p switch  d quit  C-a last  a literal  l redraw";
+
+    /// The full-width bar on the last screen row: rename prompt, kill
+    /// confirmation, the keybind list while the prefix is armed, a
+    /// transient message, or the default hint.
+    fn composeStatusRow(self: *Ui, out: *std.ArrayList(u8)) !void {
+        const alloc = self.alloc;
+        const w = self.layout.cols;
+
+        try out.appendSlice(alloc, style_dim);
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(alloc);
+
+        // Prompts outlive transient messages, so they are regenerated
+        // from their state rather than stored.
+        if (self.rename_input) |input| {
+            if (self.rename_target < self.sessions.items.len) {
+                try text.print(alloc, " rename {s}: {s}", .{
+                    self.sessions.items[self.rename_target].name,
+                    input.items,
+                });
+            }
+        } else if (self.confirm_kill) |idx| {
+            if (idx < self.sessions.items.len) {
+                try text.print(alloc, " kill {s}? y/n", .{self.sessions.items[idx].name});
+            }
+        } else if (self.parser.pending_prefix) {
+            try text.appendSlice(alloc, keybind_bar);
+        } else if (self.message.items.len > 0) {
+            try text.print(alloc, " {s}", .{self.message.items});
+        } else {
+            try text.appendSlice(alloc, " Press Ctrl+A for keybinds");
+        }
+        try appendClipped(alloc, out, text.items, w);
+        try out.appendSlice(alloc, sgr_reset);
     }
 
     fn composeSidebarCell(self: *Ui, y: u16, out: *std.ArrayList(u8)) !void {
@@ -1417,26 +1647,6 @@ const Ui = struct {
             return;
         }
 
-        if (y == l.rows -| 1) {
-            try out.appendSlice(alloc, style_dim);
-            // A pending confirmation outlives transient messages, so
-            // the prompt is regenerated rather than stored.
-            if (self.confirm_kill) |idx| {
-                var prompt: std.ArrayList(u8) = .empty;
-                defer prompt.deinit(alloc);
-                if (idx < self.sessions.items.len) {
-                    try prompt.print(alloc, "kill {s}? y/n", .{self.sessions.items[idx].name});
-                }
-                try appendClipped(alloc, out, prompt.items, w);
-            } else if (self.message.items.len > 0) {
-                try appendClipped(alloc, out, self.message.items, w);
-            } else {
-                try appendClipped(alloc, out, "^A c new k kill d quit", w);
-            }
-            try out.appendSlice(alloc, sgr_reset);
-            return;
-        }
-
         if (y == l.rows -| 2) {
             try out.appendSlice(alloc, style_dim);
             try appendClipped(alloc, out, " + new session", w);
@@ -1444,15 +1654,16 @@ const Ui = struct {
             return;
         }
 
-        const idx = self.scroll + (y - 1);
+        const row = y - 1;
+        const idx = self.scroll + row / Layout.entry_rows;
         if (idx < self.sessions.items.len) {
-            try appendSessionRow(
-                alloc,
-                out,
-                self.sessions.items[idx],
-                w,
-                self.selected != null and self.selected.? == idx,
-            );
+            const entry = self.sessions.items[idx];
+            const selected = self.selected != null and self.selected.? == idx;
+            if (row % Layout.entry_rows == 0) {
+                try appendSessionRow(alloc, out, entry, w, selected);
+            } else {
+                try appendSessionTitleRow(alloc, out, entry, w, selected);
+            }
             return;
         }
 
@@ -1497,7 +1708,7 @@ const Ui = struct {
         out: *std.ArrayList(u8),
     ) !void {
         const l = self.layout;
-        const mid = l.rows / 2;
+        const mid = l.viewportRows() / 2;
         const text: []const u8 = if (y == mid)
             line1
         else if (y == mid + 1)
@@ -1657,12 +1868,16 @@ test "layout: geometry and hit testing" {
     try std.testing.expectEqual(@as(u16, 24), l.sidebar_w);
     try std.testing.expectEqual(@as(u16, 75), l.viewportCols());
     try std.testing.expectEqual(@as(u16, 25), l.viewportX());
+    try std.testing.expectEqual(@as(u16, 23), l.viewportRows());
 
     try std.testing.expectEqual(Layout.Hit.header, l.hit(3, 0));
+    // The status bar spans the full width of the last row.
     try std.testing.expectEqual(Layout.Hit.status, l.hit(3, 23));
+    try std.testing.expectEqual(Layout.Hit.status, l.hit(80, 23));
     try std.testing.expectEqual(Layout.Hit.new_button, l.hit(3, 22));
     try std.testing.expectEqual(Layout.Hit.none, l.hit(24, 5)); // separator
 
+    // Sessions take two display rows: name, then title.
     const s = l.hit(3, 5);
     try std.testing.expectEqual(@as(u16, 4), s.session.row);
     try std.testing.expect(!s.session.kill);
@@ -1712,11 +1927,43 @@ test "sidebar session row is exactly the requested width" {
     try std.testing.expect(std.mem.indexOf(u8, text, "12s") != null);
     try std.testing.expect(std.mem.endsWith(u8, text, "x "));
 
-    // Selected rows are wrapped in inverse video.
+    // Selected rows are wrapped in inverse video; the highlight is
+    // the only selection marker.
     out.clearRetainingCapacity();
     try appendSessionRow(alloc, &out, entry, 24, true);
     try std.testing.expect(std.mem.startsWith(u8, out.items, style_selected));
-    try std.testing.expect(std.mem.indexOf(u8, out.items, ">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, ">") == null);
+}
+
+test "sidebar title row renders the title dim under the name" {
+    const alloc = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    var name_buf: [4]u8 = "work".*;
+    var title_buf: [9]u8 = "vim notes".*;
+    const entry: Entry = .{
+        .name = &name_buf,
+        .attached = false,
+        .idle_ms = 0,
+        .title = &title_buf,
+    };
+
+    try appendSessionTitleRow(alloc, &out, entry, 24, false);
+    try std.testing.expect(std.mem.startsWith(u8, out.items, style_dim));
+    const text = out.items[style_dim.len .. out.items.len - sgr_reset.len];
+    try std.testing.expectEqual(@as(usize, 24), text.len);
+    try std.testing.expectEqualStrings("  vim notes", std.mem.trimRight(u8, text, " "));
+
+    // Without a title the row is blank but still full width.
+    var no_title: [0]u8 = .{};
+    var bare = entry;
+    bare.title = &no_title;
+    out.clearRetainingCapacity();
+    try appendSessionTitleRow(alloc, &out, bare, 24, false);
+    const blank = out.items[style_dim.len .. out.items.len - sgr_reset.len];
+    try std.testing.expectEqual(@as(usize, 24), blank.len);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.trim(u8, blank, " ").len);
 }
 
 test "appendTermRow renders styled content for one row only" {

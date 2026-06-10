@@ -33,6 +33,7 @@ pub const overview =
     \\  peek <name>                  print the session's screen
     \\  wait <name>                  block until output matches or settles
     \\  kill <name | --all>          end a session, or all of them
+    \\  rename <name> <new-name>     rename a session
     \\  version                      print the version
     \\  help [command | topic]       this overview, or detailed help
     \\
@@ -127,12 +128,15 @@ pub const commands = [_]Entry{
         \\keys (prefix C-a, control variants match GNU screen):
         \\  C-a c   create a session and focus it
         \\  C-a k   kill the focused session (asks y/n)
+        \\  C-a r   rename the focused session
         \\  C-a n   focus the next session
         \\  C-a p   focus the previous session
         \\  C-a C-a focus the previously focused session
         \\  C-a d   quit the UI (sessions keep running)
         \\  C-a l   redraw
         \\  C-a a   send a literal C-a to the application
+        \\
+        \\Pressing C-a alone lists these bindings in the bottom bar.
         \\
         \\Everything else is typed into the focused session. Unlike a
         \\plain attach, pasted text may contain C-a bytes safely
@@ -238,6 +242,20 @@ pub const commands = [_]Entry{
         \\examples:
         \\  boo kill build
         \\  boo kill --all
+        \\
+        ,
+    },
+    .{
+        .name = "rename",
+        .body =
+        \\usage: boo rename <name> <new-name>
+        \\
+        \\Rename a session. The running program is unaffected and an
+        \\attached client stays attached. The old name accepts a
+        \\unique prefix, like attach.
+        \\
+        \\example:
+        \\  boo rename work api-server
         \\
         ,
     },
