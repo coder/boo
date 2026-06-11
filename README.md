@@ -9,7 +9,7 @@
 
 Sessions that haunt your terminal.
 
-[Install](#install) | [Usage](#usage) | [Automation](#automation) | [Architecture](#architecture)
+[Why](#why-boo) | [Install](#install) | [Usage](#usage) | [Automation](#automation) | [Architecture](#architecture)
 
 [![ci](https://github.com/coder/boo/actions/workflows/ci.yml/badge.svg)](https://github.com/coder/boo/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/coder/boo)](https://github.com/coder/boo/releases/latest)
@@ -37,6 +37,25 @@ exactly as a human would see it.
 - Agent-friendly automation primitives: `send`, `peek`, `wait`, and `--json` output, all usable without a TTY.
 
 <video src="https://github.com/user-attachments/assets/d9310edd-68e8-4bc2-aac5-80f1da431dae" autoplay="autoplay" loop muted playsinline></video>
+
+## Why boo?
+
+GNU screen works the same way boo does, architecturally: it parses all
+output through its own built-in terminal emulator and redraws from
+that state on reattach. But that emulator is decades old and lags far
+behind what modern programs emit. Whatever it doesn't understand gets
+dropped or mangled on redraw. boo swaps that layer for `libghostty-vt`,
+Ghostty's VT core, so the saved state matches what your terminal would
+actually display, and terminal queries are answered while detached so
+TUIs don't hang unattended.
+
+Scripting is the other win: `send`, `peek --json`, and
+`wait --text`/`--idle` instead of `-X stuff`, hardcopy files, and
+sleep loops.
+
+tmux is great, it was just never the model I wanted. I really liked
+screen's simplicity, sessions and a prefix key and nothing else to
+learn, and boo keeps exactly that.
 
 ## Install
 
