@@ -1,12 +1,10 @@
 <div align="center">
 <pre>
-<code>
  _                     .-.
 | |__   ___   ___     (o o)
 | '_ \ / _ \ / _ \    | O \
 | |_) | (_) | (_) |    \   \
 |_.__/ \___/ \___/      `~~~'
-</code>
 </pre>
 
 Sessions that haunt your terminal.
