@@ -206,6 +206,19 @@ const PtyClient = struct {
         rows: u16,
         cols: u16,
     ) !PtyClient {
+        return spawnProgram(harness, exe_path, argv, rows, cols);
+    }
+
+    /// Like spawn, but runs an arbitrary program instead of the boo
+    /// binary, e.g. a shell wrapping an attach the way a login shell
+    /// does for a user.
+    fn spawnProgram(
+        harness: *Harness,
+        program: []const u8,
+        argv: []const []const u8,
+        rows: u16,
+        cols: u16,
+    ) !PtyClient {
         const alloc = harness.alloc;
 
         // PTY pair.
@@ -240,7 +253,7 @@ const PtyClient = struct {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        const argv0 = try arena.dupeZ(u8, exe_path);
+        const argv0 = try arena.dupeZ(u8, program);
         const argv_z = try arena.allocSentinel(?[*:0]const u8, argv.len + 1, null);
         argv_z[0] = argv0;
         for (argv, 1..) |arg, i| argv_z[i] = try arena.dupeZ(u8, arg);
@@ -654,6 +667,109 @@ test "auto-repeated C-a stays armed until the command key" {
     defer alloc.free(result.stderr);
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "rpt") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "detached") != null);
+}
+
+/// Drive a detach with a command key that is still held while the
+/// detach completes, the way a human does it over a remote link: the
+/// key keeps auto-repeating until the restored screen is visible, and
+/// one final repeat lands after the client has already restored. The
+/// attach runs under a wrapping shell on the same tty (a login shell
+/// stand-in) whose `read` exposes any input that boo leaks: leaked
+/// repeats corrupt the typed probe line, and a leaked C-d (EOF) ends
+/// the read prematurely, which is the SSH-session-killer variant.
+fn expectNoDetachKeyLeak(
+    h: *Harness,
+    session: []const u8,
+    key: []const u8,
+    late_repeat_ms: ?u64,
+) !void {
+    const alloc = h.alloc;
+
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_abs = try std.fs.cwd().realpath(exe_path, &exe_buf);
+    const script = try std.fmt.allocPrint(
+        alloc,
+        "{s} attach {s}; IFS= read -r line; printf 'GOT[%s]\\n' \"$line\"",
+        .{ exe_abs, session },
+    );
+    defer alloc.free(script);
+
+    var client = try PtyClient.spawnProgram(h, "/bin/sh", &.{ "-c", script }, 24, 80);
+    defer client.deinit();
+    try client.waitFor("\x1b[?1049h");
+
+    // Arm the prefix, then press the command key. The key arrives
+    // with its first auto-repeat coalesced into one read, the way a
+    // remote link batches keystrokes; the repeat must not be
+    // forwarded into the window after the detach dispatches.
+    try client.send("\x01");
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+    const pressed = try std.mem.concat(alloc, u8, &.{ key, key });
+    defer alloc.free(pressed);
+    try client.send(pressed);
+
+    // Hold the key: auto-repeats keep arriving until the user sees
+    // the restored screen.
+    var deadline = Deadline.init(default_timeout_ms);
+    while (std.mem.indexOf(u8, client.output.items, "\x1b[?1049l") == null) {
+        try client.send(key);
+        _ = try client.pump(30);
+        try deadline.tick("detach restore never arrived");
+    }
+    // The release lags the restored screen by one repeat interval, so
+    // this repeat arrives after the client's own restore write. It
+    // must be absorbed before the shell regains the terminal.
+    try client.send(key);
+
+    // A keyboard with a long repeat delay sends its first repeat well
+    // after the detach; the EOF guard has to outlast it.
+    if (late_repeat_ms) |ms| {
+        std.Thread.sleep(ms * std.time.ns_per_ms);
+        try client.send(key);
+    }
+
+    // Type at the shell prompt once the key is long released. The
+    // pause must outlast the client's post-detach drain window so the
+    // probe reaches the shell, not the drain.
+    std.Thread.sleep(1500 * std.time.ns_per_ms);
+    try client.send("ok\n");
+    try client.waitFor("GOT[ok]");
+    try std.testing.expectEqual(@as(u32, 0), try client.waitExit());
+
+    // The detach happened and the session survived.
+    const result = try h.run(&.{"ls"});
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, session) != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "detached") != null);
+
+    // Nothing leaked into the window either: the idle cat session's
+    // screen stays empty.
+    const peek = try h.run(&.{ "peek", session });
+    defer alloc.free(peek.stdout);
+    defer alloc.free(peek.stderr);
+    try std.testing.expect(peek.term.Exited == 0);
+    try std.testing.expect(std.mem.indexOf(u8, peek.stdout, "d") == null);
+}
+
+test "held C-a d: repeats do not leak into the shell after detach" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("dleak", &.{"cat"});
+    try expectNoDetachKeyLeak(&h, "dleak", "d", null);
+}
+
+test "held C-a C-d: repeats do not EOF the shell after detach" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // The late repeat models a default Linux keyboard (repeat delay
+    // ~660ms): only the long EOF guard absorbs it.
+    try h.startDetached("eofleak", &.{"cat"});
+    try expectNoDetachKeyLeak(&h, "eofleak", "\x04", 600);
 }
 
 test "alt screen apps: toggles are filtered and screens repaint from state" {

@@ -75,7 +75,10 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
     var raw = saved;
     rawMode(&raw);
     try posix.tcsetattr(tty, .FLUSH, raw);
-    defer restoreTty(tty, saved);
+    // Set by the outcome paths below when a held C-d may still be
+    // repeating; read by the deferred restore.
+    var drain_guard_ms: i64 = drain_guard_short_ms;
+    defer restoreTty(tty, saved, drain_guard_ms);
     try protocol.writeAll(1, enter_sequence);
 
     // Handshake with our current size.
@@ -143,9 +146,19 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
                 switch (msg.type) {
                     .output => try protocol.writeAll(1, msg.payload),
                     .detached => {
-                        return if (std.mem.eql(u8, msg.payload, "stolen")) .stolen else .detached;
+                        if (std.mem.eql(u8, msg.payload, "stolen")) return .stolen;
+                        if (std.mem.eql(u8, msg.payload, "detached-eof")) {
+                            drain_guard_ms = drain_guard_eof_ms;
+                        }
+                        return .detached;
                     },
-                    .exit => return .ended,
+                    .exit => {
+                        // Sessions often end because the user typed
+                        // C-d at the session's shell; treat the tail
+                        // as EOF-dangerous.
+                        drain_guard_ms = drain_guard_eof_ms;
+                        return .ended;
+                    },
                     else => {},
                 }
             }
@@ -176,8 +189,63 @@ pub fn rawMode(t: *posix.termios) void {
     t.cc[@intFromEnum(posix.V.TIME)] = 0;
 }
 
-fn restoreTty(tty: posix.fd_t, saved: posix.termios) void {
+/// Read and discard terminal input until it goes quiet.
+///
+/// When a detach is triggered by a key the user is still holding, the
+/// terminal keeps producing input after the daemon has already decided
+/// to detach: auto-repeats of the command key, kitty release reports,
+/// impatient re-presses, and (on a remote connection) anything in
+/// flight during the round trip. The final TCSAFLUSH only discards
+/// what has reached the tty queue at that instant, so without this
+/// wait the tail is delivered to the shell that regains the terminal:
+/// a stray `d` typed at the prompt, or worse, a leaked C-d that EOFs
+/// the login shell and ends the SSH session.
+///
+/// Runs while the terminal is still in raw mode, so the discarded
+/// bytes are never echoed. Two timers bound the wait: `guard_ms`
+/// covers the silence between the triggering press and the first
+/// auto-repeat (keyboard repeat delays reach ~660ms on common
+/// configurations, so EOF-dangerous detaches use the long guard),
+/// then each absorbed chunk extends the wait by a short tail until
+/// the input stays quiet, all capped at drain_cap_ms.
+fn drainInput(tty: posix.fd_t, guard_ms: i64) void {
+    const start = std.time.milliTimestamp();
+    const cap = start + drain_cap_ms;
+    var deadline = start + guard_ms;
+    var buf: [256]u8 = undefined;
+    while (true) {
+        const now = std.time.milliTimestamp();
+        const until = @min(deadline, cap);
+        if (now >= until) return;
+        var fds = [_]posix.pollfd{
+            .{ .fd = tty, .events = posix.POLL.IN, .revents = 0 },
+        };
+        const ready = posix.poll(&fds, @intCast(until - now)) catch return;
+        if (ready == 0) return;
+        const n = posix.read(tty, &buf) catch return;
+        if (n == 0) return;
+        deadline = @max(deadline, std.time.milliTimestamp() + drain_tail_ms);
+    }
+}
+
+/// Guard for detaches with no reason to expect a held key.
+const drain_guard_short_ms = 300;
+/// Guard for flows where the user plausibly holds C-d, the byte that
+/// EOFs a cooked-mode shell: a C-a C-d detach and a session that ends
+/// while attached (often a C-d typed at the session's own shell).
+const drain_guard_eof_ms = 800;
+const drain_tail_ms = 100;
+const drain_cap_ms = 1500;
+
+fn restoreTty(tty: posix.fd_t, saved: posix.termios, guard_ms: i64) void {
+    // Screen restore first: the user sees the detach immediately, and
+    // a kitty-mode terminal stops CSI-u key reporting as soon as the
+    // reset reaches it, so a still-held key repeats in legacy bytes
+    // that the drain below absorbs. Only then hand the tty back; the
+    // FLUSH discards anything that slips in between the last drained
+    // read and the mode switch.
     protocol.writeAll(1, restore_sequence) catch {};
+    drainInput(tty, guard_ms);
     posix.tcsetattr(tty, .FLUSH, saved) catch {};
 }
 

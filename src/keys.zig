@@ -17,7 +17,9 @@ pub const escape_byte: u8 = 0x01; // C-a
 pub const Command = union(enum) {
     /// Bytes to forward to the window.
     forward: []const u8,
-    detach,
+    /// The command key that triggered the detach; C-d (0x04) marks
+    /// the detach as EOF-dangerous for the client's input drain.
+    detach: u8,
     redraw,
     unknown: u8,
 };
@@ -216,7 +218,7 @@ pub const Parser = struct {
 
     fn dispatch(byte: u8, handler: anytype) !void {
         switch (byte) {
-            'd', 0x04 => try handler.command(.detach),
+            'd', 0x04 => try handler.command(.{ .detach = byte }),
             'l', 0x0c => try handler.command(.redraw),
             'a' => try handler.command(.{ .forward = &.{escape_byte} }),
             else => try handler.command(.{ .unknown = byte }),
@@ -299,7 +301,7 @@ test "prefix commands" {
     try std.testing.expectEqualStrings("abdef", h.forwarded.items);
     try std.testing.expectEqual(@as(usize, 2), h.cmds.items.len);
     try std.testing.expectEqual(Command.redraw, h.cmds.items[0]);
-    try std.testing.expectEqual(Command.detach, h.cmds.items[1]);
+    try std.testing.expectEqual(Command{ .detach = 'd' }, h.cmds.items[1]);
 }
 
 test "literal escape via C-a a" {
@@ -320,7 +322,7 @@ test "prefix split across feeds" {
     try std.testing.expectEqual(@as(usize, 0), h.cmds.items.len);
     try p.feed("d", false, &h);
     try std.testing.expectEqual(@as(usize, 1), h.cmds.items.len);
-    try std.testing.expectEqual(Command.detach, h.cmds.items[0]);
+    try std.testing.expectEqual(Command{ .detach = 'd' }, h.cmds.items[0]);
 }
 
 test "control variants match screen defaults" {
@@ -329,7 +331,7 @@ test "control variants match screen defaults" {
     var p: Parser = .{};
     try p.feed("\x01\x04\x01\x0c", false, &h);
     try std.testing.expectEqual(@as(usize, 2), h.cmds.items.len);
-    try std.testing.expectEqual(Command.detach, h.cmds.items[0]);
+    try std.testing.expectEqual(Command{ .detach = 0x04 }, h.cmds.items[0]);
     try std.testing.expectEqual(Command.redraw, h.cmds.items[1]);
     try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
 }
@@ -342,7 +344,7 @@ test "holding the prefix key stays armed until a command key" {
     // the window (an unconsumed 0x04 would EOF a shell).
     try p.feed("\x01\x01\x01\x04", false, &h);
     try std.testing.expectEqual(@as(usize, 1), h.cmds.items.len);
-    try std.testing.expectEqual(Command.detach, h.cmds.items[0]);
+    try std.testing.expectEqual(Command{ .detach = 0x04 }, h.cmds.items[0]);
     try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
 }
 
@@ -360,7 +362,7 @@ test "kitty: encoded Ctrl+A starts the prefix, plain d detaches" {
     var p: Parser = .{};
     try p.feed("\x1b[97;5ud", true, &h);
     try std.testing.expectEqual(@as(usize, 1), h.cmds.items.len);
-    try std.testing.expectEqual(Command.detach, h.cmds.items[0]);
+    try std.testing.expectEqual(Command{ .detach = 'd' }, h.cmds.items[0]);
     try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
 }
 
@@ -370,7 +372,7 @@ test "kitty: encoded Ctrl+A then encoded Ctrl+D detaches" {
     var p: Parser = .{};
     try p.feed("\x1b[97;5u\x1b[100;5u", true, &h);
     try std.testing.expectEqual(@as(usize, 1), h.cmds.items.len);
-    try std.testing.expectEqual(Command.detach, h.cmds.items[0]);
+    try std.testing.expectEqual(Command{ .detach = 0x04 }, h.cmds.items[0]);
     try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
 }
 
@@ -380,7 +382,7 @@ test "kitty: report-all plain d arrives as CSI-u and detaches" {
     var p: Parser = .{};
     try p.feed("\x1b[97;5u\x1b[100u", true, &h);
     try std.testing.expectEqual(@as(usize, 1), h.cmds.items.len);
-    try std.testing.expectEqual(Command.detach, h.cmds.items[0]);
+    try std.testing.expectEqual(Command{ .detach = 'd' }, h.cmds.items[0]);
 }
 
 test "kitty: sequence split across feeds" {
@@ -391,7 +393,7 @@ test "kitty: sequence split across feeds" {
     try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
     try p.feed("ud", true, &h);
     try std.testing.expectEqual(@as(usize, 1), h.cmds.items.len);
-    try std.testing.expectEqual(Command.detach, h.cmds.items[0]);
+    try std.testing.expectEqual(Command{ .detach = 'd' }, h.cmds.items[0]);
 }
 
 test "kitty: press and release events" {
@@ -401,7 +403,7 @@ test "kitty: press and release events" {
     // Press (explicit event), release while pending, then the command.
     try p.feed("\x1b[97;5:1u\x1b[97;5:3ud", true, &h);
     try std.testing.expectEqual(@as(usize, 1), h.cmds.items.len);
-    try std.testing.expectEqual(Command.detach, h.cmds.items[0]);
+    try std.testing.expectEqual(Command{ .detach = 'd' }, h.cmds.items[0]);
     try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
     // A stray prefix release outside a pending sequence is swallowed.
     try p.feed("\x1b[97;5:3u", true, &h);
@@ -416,7 +418,7 @@ test "kitty: prefix auto-repeat stays armed" {
     // With event types: press, repeat, then encoded Ctrl+D.
     try p.feed("\x1b[97;5u\x1b[97;5:2u\x1b[100;5u", true, &h);
     try std.testing.expectEqual(@as(usize, 1), h.cmds.items.len);
-    try std.testing.expectEqual(Command.detach, h.cmds.items[0]);
+    try std.testing.expectEqual(Command{ .detach = 0x04 }, h.cmds.items[0]);
     try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
 }
 
@@ -427,7 +429,7 @@ test "kitty: prefix repeat without event types stays armed" {
     // Without the event-types flag a repeat looks like a second press.
     try p.feed("\x1b[97;5u\x1b[97;5u\x1b[100;5u", true, &h);
     try std.testing.expectEqual(@as(usize, 1), h.cmds.items.len);
-    try std.testing.expectEqual(Command.detach, h.cmds.items[0]);
+    try std.testing.expectEqual(Command{ .detach = 0x04 }, h.cmds.items[0]);
     try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
 }
 
@@ -439,7 +441,7 @@ test "kitty: modifier key events while armed do not eat the command" {
     // (kitty report-all-keys flag) is not the command key.
     try p.feed("\x1b[97;5u\x1b[57442;5u\x1b[100;5u", true, &h);
     try std.testing.expectEqual(@as(usize, 1), h.cmds.items.len);
-    try std.testing.expectEqual(Command.detach, h.cmds.items[0]);
+    try std.testing.expectEqual(Command{ .detach = 0x04 }, h.cmds.items[0]);
     try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
 }
 
@@ -449,7 +451,7 @@ test "kitty: lock modifiers do not hide the prefix" {
     var p: Parser = .{};
     // mods 69 = 1 + ctrl(4) + caps lock(64).
     try p.feed("\x1b[97;69ud", true, &h);
-    try std.testing.expectEqual(Command.detach, h.cmds.items[0]);
+    try std.testing.expectEqual(Command{ .detach = 'd' }, h.cmds.items[0]);
 }
 
 test "kitty: other CSI-u keys pass through verbatim" {
@@ -487,7 +489,7 @@ test "kitty: raw 0x01 still works" {
     defer h.deinit();
     var p: Parser = .{};
     try p.feed("\x01d", true, &h);
-    try std.testing.expectEqual(Command.detach, h.cmds.items[0]);
+    try std.testing.expectEqual(Command{ .detach = 'd' }, h.cmds.items[0]);
 }
 
 test "kitty: CSI-u encodings pass through when kitty mode is off" {
@@ -517,5 +519,5 @@ test "kitty: pending command key in CSI-u form split across feeds" {
     try p.feed("\x1b[97;5u\x1b[100;", true, &h);
     try std.testing.expectEqual(@as(usize, 0), h.cmds.items.len);
     try p.feed("5u", true, &h);
-    try std.testing.expectEqual(Command.detach, h.cmds.items[0]);
+    try std.testing.expectEqual(Command{ .detach = 0x04 }, h.cmds.items[0]);
 }

@@ -285,11 +285,22 @@ pub const Daemon = struct {
     }
 
     fn handleKeyCommand(self: *Daemon, conn: *Conn, cmd: keys.Command) !void {
+        // A detach earlier in the same input batch ended the
+        // attachment. Bytes after the detach key (auto-repeats of a
+        // held C-d arriving coalesced, or keys typed during the
+        // detach round trip) belong to no window; forwarding them
+        // would EOF or garble the program the user just left.
+        if (!conn.attached) return;
         switch (cmd) {
             .forward => |bytes| if (self.liveWindow()) |w| {
                 w.writeInput(bytes) catch {};
             },
-            .detach => self.detachConn(conn, "detached"),
+            .detach => |byte| self.detachConn(
+                conn,
+                // A C-d triggered detach warns the client that the
+                // user may be holding the byte that EOFs shells.
+                if (byte == 0x04) "detached-eof" else "detached",
+            ),
             .redraw => try self.repaintTo(conn),
             .unknown => |byte| if (std.ascii.isPrint(byte))
                 self.message(conn, "unknown key: ^A {c}", .{byte})
