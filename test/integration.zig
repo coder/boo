@@ -1520,6 +1520,41 @@ fn waitLastRow(
     }
 }
 
+test "ui: the focused session exiting hands focus to the next one" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("fallback", &.{"cat"});
+    try h.startDetached("doomed", &.{"/bin/sh"});
+    try h.sendLine("doomed", "DOOMED-MARK");
+    const seeded = try h.waitPeekContains("doomed", "DOOMED-MARK");
+    alloc.free(seeded);
+
+    // doomed saw input last, so the UI focuses it on startup.
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("DOOMED-MARK");
+
+    // The focused session's command exits: the daemon reports the
+    // exit, the session leaves the listing, and the refresh that
+    // follows attaches the surviving session. The refresh used to
+    // run inside the view's message loop and freed the view out
+    // from under it.
+    try h.sendLine("doomed", "exit");
+    try ui.waitFor("session ended");
+    try waitUiSessionCount(&h, 1);
+
+    // The UI is still alive and renders the surviving session.
+    try h.sendLine("fallback", "FALLBACK-MARK");
+    try ui.waitFor("FALLBACK-MARK");
+
+    // And it still shuts down cleanly.
+    try ui.send("\x01d");
+    try ui.waitFor("[boo ui closed]");
+    try std.testing.expectEqual(@as(u32, 0), try ui.waitExit());
+}
+
 test "ui: the keybind bar overlays the bottom row and C-a r renames" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);

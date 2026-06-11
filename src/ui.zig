@@ -782,13 +782,15 @@ const Ui = struct {
                 self.need_render = true;
             }
             if (self.view) |v| {
-                if (v.title_changed) {
-                    v.title_changed = false;
-                    self.refreshSessions() catch {};
-                }
                 if (v.bell) {
                     v.bell = false;
                     protocol.writeAll(1, "\x07") catch {};
+                }
+                // Last: refreshSessions can destroy the view, so `v`
+                // must not be touched after it runs.
+                if (v.title_changed) {
+                    v.title_changed = false;
+                    self.refreshSessions() catch {};
                 }
             }
         }
@@ -1294,6 +1296,11 @@ const Ui = struct {
             self.markViewLost();
             return;
         };
+        // refreshSessions can destroy the view (it collects dead
+        // views and attaches replacement sessions), which would leave
+        // `v` dangling, so an exit defers the refresh until the
+        // message loop is done with the pointer.
+        var ended = false;
         while (true) {
             const msg = v.decoder.next() catch {
                 self.markViewLost();
@@ -1311,14 +1318,15 @@ const Ui = struct {
                 },
                 .exit => {
                     v.state = .ended;
+                    ended = true;
                     self.setMessage("session ended", .{});
-                    self.refreshSessions() catch {};
                     self.need_render = true;
                 },
                 else => {},
             }
             if (v.state != .live) break;
         }
+        if (ended) self.refreshSessions() catch {};
     }
 
     fn liveView(self: *Ui) ?*View {
