@@ -681,7 +681,7 @@ fn expectNoDetachKeyLeak(
     h: *Harness,
     session: []const u8,
     key: []const u8,
-    late_repeat_ms: ?u64,
+    late_repeat_ms: ?i64,
 ) !void {
     const alloc = h.alloc;
 
@@ -704,6 +704,7 @@ fn expectNoDetachKeyLeak(
     // forwarded into the window after the detach dispatches.
     try client.send("\x01");
     std.Thread.sleep(50 * std.time.ns_per_ms);
+    const pressed_at = std.time.milliTimestamp();
     const pressed = try std.mem.concat(alloc, u8, &.{ key, key });
     defer alloc.free(pressed);
     try client.send(pressed);
@@ -722,9 +723,15 @@ fn expectNoDetachKeyLeak(
     try client.send(key);
 
     // A keyboard with a long repeat delay sends its first repeat well
-    // after the detach; the EOF guard has to outlast it.
+    // after the detach; the EOF guard has to outlast it. Real repeat
+    // delays anchor at the press, so anchor there too: the margin to
+    // the 800ms guard stays wide even on slow CI runners, while still
+    // proving the 300ms short guard alone would have missed it.
     if (late_repeat_ms) |ms| {
-        std.Thread.sleep(ms * std.time.ns_per_ms);
+        const elapsed = std.time.milliTimestamp() - pressed_at;
+        if (elapsed < ms) {
+            std.Thread.sleep(@intCast((ms - elapsed) * std.time.ns_per_ms));
+        }
         try client.send(key);
     }
 
@@ -766,10 +773,11 @@ test "held C-a C-d: repeats do not EOF the shell after detach" {
     var h = try Harness.init(alloc);
     defer h.deinit();
 
-    // The late repeat models a default Linux keyboard (repeat delay
-    // ~660ms): only the long EOF guard absorbs it.
+    // The late repeat models a keyboard with a slow repeat delay
+    // (450ms after the press): past the short guard, only the long
+    // EOF guard absorbs it.
     try h.startDetached("eofleak", &.{"cat"});
-    try expectNoDetachKeyLeak(&h, "eofleak", "\x04", 600);
+    try expectNoDetachKeyLeak(&h, "eofleak", "\x04", 450);
 }
 
 test "alt screen apps: toggles are filtered and screens repaint from state" {
