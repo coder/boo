@@ -5,12 +5,17 @@ on:
     branches: [main]
   pull_request:
 
+# mlugg/setup-zig still declares node20, which GitHub runners are
+# deprecating; force Node 24 ahead of the switchover.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   fmt:
     name: zig fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
@@ -24,7 +29,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
@@ -47,7 +52,7 @@ jobs:
     name: test ReleaseSafe
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2

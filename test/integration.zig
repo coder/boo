@@ -631,6 +631,31 @@ test "C-a C-d detaches like GNU screen" {
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "detached") != null);
 }
 
+test "auto-repeated C-a stays armed until the command key" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    var client = try PtyClient.spawn(&h, &.{ "new", "rpt", "--", "cat" }, 24, 80);
+    defer client.deinit();
+    try h.waitSessionUp("rpt");
+
+    // Holding the prefix key auto-repeats it: C-a C-a C-d. The
+    // repeats must keep the prefix armed rather than claim the
+    // command slot, or the trailing C-d leaks into the window and
+    // EOFs the program.
+    try client.send("\x01\x01\x04");
+    try client.waitFor("detached from rpt");
+    try std.testing.expectEqual(@as(u32, 0), try client.waitExit());
+
+    // The session survived: nothing reached cat.
+    const result = try h.run(&.{"ls"});
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "rpt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "detached") != null);
+}
+
 test "alt screen apps: toggles are filtered and screens repaint from state" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
@@ -761,6 +786,12 @@ test "help: overview, command pages, topics, and version" {
     try std.testing.expect(overview.term.Exited == 0);
     try std.testing.expect(std.mem.indexOf(u8, overview.stdout, "commands:") != null);
     try std.testing.expect(std.mem.indexOf(u8, overview.stdout, "kill") != null);
+    try std.testing.expect(std.mem.indexOf(u8, overview.stdout, "attach, at, a <name>") != null);
+
+    // The overview stays lean: no topics or exit-code sections (the
+    // codes live on the automation page).
+    try std.testing.expect(std.mem.indexOf(u8, overview.stdout, "topics:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, overview.stdout, "exit codes:") == null);
 
     const send_page = try h.run(&.{ "help", "send" });
     defer alloc.free(send_page.stdout);
@@ -923,11 +954,13 @@ test "exit codes distinguish usage, missing sessions, and ambiguity" {
     try h.runOk(&.{ "peek", "alp" });
     try h.runExit(&.{ "peek", "al" }, 3);
     try h.runExit(&.{ "attach", "nosuchzz" }, 3);
+    try h.runExit(&.{ "a", "nosuchzz" }, 3);
     try h.runExit(&.{ "kill", "nosuchzz" }, 3);
 
     // Session names are required; nothing is guessed.
     try h.runExit(&.{"kill"}, 2);
     try h.runExit(&.{"attach"}, 2);
+    try h.runExit(&.{"a"}, 2);
     try h.runExit(&.{"peek"}, 2);
 
     // Usage errors exit 2.
@@ -983,6 +1016,39 @@ test "kitty keyboard apps: encoded C-a still detaches" {
     try second.send("\x1b[97;5u\x1b[100;5u");
     try second.waitFor("detached from kt");
     try std.testing.expectEqual(@as(u32, 0), try second.waitExit());
+}
+
+test "kitty keyboard apps: auto-repeated C-a still detaches" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // The session enables kitty disambiguation before any client
+    // attaches, so an attaching client's terminal kitty-encodes
+    // every key, including the held prefix.
+    try h.startDetached("krpt", &.{
+        "sh", "-c", "printf '\\033[>1uKITTY-ON\\n'; exec cat",
+    });
+    const seeded = try h.waitPeekContains("krpt", "KITTY-ON");
+    alloc.free(seeded);
+
+    var client = try PtyClient.spawn(&h, &.{ "attach", "krpt" }, 24, 80);
+    defer client.deinit();
+    try client.waitFor("KITTY-ON");
+
+    // Holding the prefix repeats CSI 97;5u. The repeat must not be
+    // taken as the command key; the C-d that follows still detaches.
+    client.clearOutput();
+    try client.send("\x1b[97;5u\x1b[97;5u\x1b[100;5u");
+    try client.waitFor("detached from krpt");
+    try std.testing.expectEqual(@as(u32, 0), try client.waitExit());
+
+    // The keys were intercepted, not leaked into the window.
+    const peek = try h.run(&.{ "peek", "krpt" });
+    defer alloc.free(peek.stdout);
+    defer alloc.free(peek.stderr);
+    try std.testing.expect(peek.term.Exited == 0);
+    try std.testing.expect(std.mem.indexOf(u8, peek.stdout, "97;5u") == null);
 }
 
 test "agent loop: new, send, wait, peek, kill" {
@@ -1496,6 +1562,65 @@ test "ui: the keybind bar overlays the bottom row and C-a r renames" {
     defer alloc.free(ls.stderr);
     try std.testing.expect(std.mem.indexOf(u8, ls.stdout, "fresh") != null);
     try std.testing.expect(std.mem.indexOf(u8, ls.stdout, "oldname") == null);
+}
+
+test "ui: a single esc cancels the rename prompt" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("esc1", &.{"cat"});
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("esc1");
+
+    try ui.send("\x01r");
+    try ui.waitFor("rename esc1:");
+
+    // A lone ESC with no follow-up bytes must cancel by itself: the
+    // input parser flushes a held ESC after a short deadline instead
+    // of waiting for the next keypress.
+    try ui.send("\x1b");
+    try ui.waitFor("rename cancelled");
+}
+
+test "ui: C-a s searches sessions by name and focuses the match" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("alpha", &.{"cat"});
+    try h.startDetached("bravo", &.{"cat"});
+    try h.sendLine("bravo", "BRAVO-MARK");
+    const seeded = try h.waitPeekContains("bravo", "BRAVO-MARK");
+    alloc.free(seeded);
+
+    // bravo saw input last, so the UI focuses it on startup.
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("BRAVO-MARK");
+
+    // C-a s opens the search prompt; a name prefix selects the
+    // matching session and Enter focuses it. Each step waits for
+    // its echo: bytes that arrive in the same read as the
+    // committing Enter would be consumed by the prompt.
+    try ui.send("\x01s");
+    try ui.waitFor(" search: ");
+    try ui.send("al");
+    try ui.waitFor("search: al");
+
+    // The commit closes the prompt and the focus switch forces a
+    // full repaint: the sidebar hint returning proves both.
+    ui.clearOutput();
+    try ui.send("\r");
+    try ui.waitFor("Keybinds: Ctrl+A");
+
+    // Typing lands in alpha now.
+    try ui.send("ALPHA-TYPED-MARK\r");
+    try ui.waitFor("ALPHA-TYPED-MARK");
+    const peeked = try h.waitPeekContains("alpha", "ALPHA-TYPED-MARK");
+    defer alloc.free(peeked);
 }
 
 test "ui: session titles render in the sidebar" {

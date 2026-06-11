@@ -81,6 +81,15 @@ pub const Parser = struct {
                     start = i;
                     continue;
                 }
+                if (byte == escape_byte) {
+                    // The prefix key repeating (held a beat too long)
+                    // or pressed again: stay armed instead of
+                    // consuming the repeat as a command key, so
+                    // C-a .. C-d still detaches.
+                    i += 1;
+                    start = i;
+                    continue;
+                }
                 self.pending = false;
                 i += 1;
                 start = i;
@@ -160,6 +169,13 @@ pub const Parser = struct {
             // A release while a command key is awaited is the prefix
             // key itself being let go; ignore it.
             if (release) return;
+            // The prefix key repeating while held (or pressed again)
+            // is not a command key; stay armed.
+            if (key.cp == 'a' and ctrl_only) return;
+            // Modifier and lock keys are reported as keys of their
+            // own under the kitty "report all keys" flag; holding or
+            // tapping one while armed must not eat the command key.
+            if (isModifierKey(key.cp)) return;
             self.pending = false;
             if (ctrl_only and key.cp >= 'a' and key.cp <= 'z') {
                 return dispatch(@intCast(key.cp & 0x1f), handler);
@@ -213,6 +229,13 @@ const KittyKey = struct {
     mods: u32,
     event: u32,
 };
+
+/// Kitty functional codepoints for keys that never act as command
+/// keys: CAPS_LOCK, NUM_LOCK, and LEFT_SHIFT through
+/// ISO_LEVEL5_SHIFT (modifiers).
+fn isModifierKey(cp: u32) bool {
+    return cp == 57358 or cp == 57360 or (cp >= 57441 and cp <= 57454);
+}
 
 /// Parse the parameter body of a kitty CSI-u key: sections separated
 /// by ';' (codepoint, modifiers, text), subfields by ':'. Returns null
@@ -311,6 +334,18 @@ test "control variants match screen defaults" {
     try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
 }
 
+test "holding the prefix key stays armed until a command key" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: Parser = .{};
+    // Auto-repeat of C-a then C-d: one detach, nothing typed into
+    // the window (an unconsumed 0x04 would EOF a shell).
+    try p.feed("\x01\x01\x01\x04", false, &h);
+    try std.testing.expectEqual(@as(usize, 1), h.cmds.items.len);
+    try std.testing.expectEqual(Command.detach, h.cmds.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+}
+
 test "unknown command reported" {
     var h: TestHandler = .{ .alloc = std.testing.allocator };
     defer h.deinit();
@@ -371,6 +406,40 @@ test "kitty: press and release events" {
     // A stray prefix release outside a pending sequence is swallowed.
     try p.feed("\x1b[97;5:3u", true, &h);
     try std.testing.expectEqual(@as(usize, 1), h.cmds.items.len);
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+}
+
+test "kitty: prefix auto-repeat stays armed" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: Parser = .{};
+    // With event types: press, repeat, then encoded Ctrl+D.
+    try p.feed("\x1b[97;5u\x1b[97;5:2u\x1b[100;5u", true, &h);
+    try std.testing.expectEqual(@as(usize, 1), h.cmds.items.len);
+    try std.testing.expectEqual(Command.detach, h.cmds.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+}
+
+test "kitty: prefix repeat without event types stays armed" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: Parser = .{};
+    // Without the event-types flag a repeat looks like a second press.
+    try p.feed("\x1b[97;5u\x1b[97;5u\x1b[100;5u", true, &h);
+    try std.testing.expectEqual(@as(usize, 1), h.cmds.items.len);
+    try std.testing.expectEqual(Command.detach, h.cmds.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+}
+
+test "kitty: modifier key events while armed do not eat the command" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: Parser = .{};
+    // A reported left-ctrl press between the prefix and the command
+    // (kitty report-all-keys flag) is not the command key.
+    try p.feed("\x1b[97;5u\x1b[57442;5u\x1b[100;5u", true, &h);
+    try std.testing.expectEqual(@as(usize, 1), h.cmds.items.len);
+    try std.testing.expectEqual(Command.detach, h.cmds.items[0]);
     try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
 }
 

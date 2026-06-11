@@ -22,11 +22,9 @@ pub const overview =
     \\usage:
     \\  boo <command> [arguments]
     \\
-    \\  With no arguments, boo prints this overview.
-    \\
     \\commands:
     \\  new [name] [-d] [-- cmd...]  start a session (attach unless -d)
-    \\  attach, at <name>            attach a session (steals politely)
+    \\  attach, at, a <name>         attach a session (steals politely)
     \\  ui                           manage sessions in a full-screen UI
     \\  ls [--json]                  list sessions
     \\  send <name> [flags]          type into a session
@@ -35,14 +33,11 @@ pub const overview =
     \\  kill <name | --all>          end a session, or all of them
     \\  rename <name> <new-name>     rename a session
     \\  version                      print the version
-    \\  help [command | topic]       this overview, or detailed help
+    \\  help [page]                  this overview, or detailed help
     \\
-    \\topics:
-    \\  keys        the C-a key bindings inside a session
-    \\  automation  driving boo from scripts and AI agents
-    \\
-    \\Run 'boo help <command>' for flags and examples, or
-    \\'boo help --all' to print every page at once.
+    \\Run 'boo help <command>' for flags and examples, 'boo help keys'
+    \\for the key bindings inside a session, 'boo help automation' for
+    \\driving boo from scripts, or 'boo help --all' for every page.
     \\
     \\session selection:
     \\  Commands taking <name> accept a unique prefix of the session
@@ -52,10 +47,6 @@ pub const overview =
     \\  BOO_DIR  socket directory
     \\           (default: $XDG_RUNTIME_DIR/boo, else /tmp/boo-<uid>)
     \\  BOO_LOG  append daemon logs to this file (debugging)
-    \\
-    \\exit codes:
-    \\  0 success    1 error    2 usage error
-    \\  3 no such session       4 wait timed out
     \\
 ;
 
@@ -91,6 +82,7 @@ pub const commands = [_]Entry{
         .body =
         \\usage: boo attach <name>
         \\       boo at <name>
+        \\       boo a <name>
         \\
         \\Attach this terminal to a session. The screen, scrollback,
         \\cursor, and title are restored from terminal state. If the
@@ -132,6 +124,7 @@ pub const commands = [_]Entry{
         \\  C-a c   create a session and focus it
         \\  C-a k   kill the focused session (asks y/n)
         \\  C-a r   rename the focused session
+        \\  C-a s   search sessions by name and focus the match
         \\  C-a n   focus the next session
         \\  C-a p   focus the previous session
         \\  C-a C-a focus the previously focused session
@@ -275,12 +268,14 @@ pub const commands = [_]Entry{
     .{
         .name = "help",
         .body =
-        \\usage: boo help [command | topic] [--all]
+        \\usage: boo help [page] [--all]
         \\
-        \\Show the overview, a command's detailed help, or a topic
-        \\page ('keys', 'automation'). --all prints every page in one
-        \\pass, which is handy for piping into a pager or for tools
-        \\that want to learn the whole CLI in one call.
+        \\Show the overview or a detailed page. There is a page for
+        \\every command, plus 'keys' (the C-a bindings inside a
+        \\session) and 'automation' (driving boo from scripts and AI
+        \\agents). --all prints every page in one pass, which is handy
+        \\for piping into a pager or for tools that want to learn the
+        \\whole CLI in one call.
         \\
         ,
     },

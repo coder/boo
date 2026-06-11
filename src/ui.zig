@@ -39,6 +39,10 @@ const message_ttl_ms: i64 = 4000;
 /// Render coalescing: at most one repaint per interval while output
 /// is streaming.
 const render_interval_ms: i64 = 15;
+/// A lone ESC held by the input parser is delivered as session input
+/// after this long without a follow-up byte. Escape sequences arrive
+/// as one chunk, so only a human pressing the ESC key waits this long.
+const esc_flush_ms: i64 = 50;
 
 // -- Layout -----------------------------------------------------------------
 
@@ -675,12 +679,19 @@ const Ui = struct {
     view: ?*View = null,
 
     parser: InputParser = .{},
+    /// When nonzero, the parser holds a lone ESC that is flushed as
+    /// input once this deadline passes without follow-up bytes.
+    esc_deadline: i64 = 0,
     /// Pending kill confirmation: index into sessions.
     confirm_kill: ?usize = null,
     /// Rename input buffer; non-null while the rename prompt is open.
     rename_input: ?std.ArrayList(u8) = null,
     /// Session index being renamed while the prompt is open.
     rename_target: usize = 0,
+    /// Search input buffer; non-null while the search prompt is open.
+    search_input: ?std.ArrayList(u8) = null,
+    /// Selection to restore when the search prompt is cancelled.
+    search_origin: ?usize = null,
     /// Transient status message and its expiry time.
     message: std.ArrayList(u8) = .empty,
     message_deadline: i64 = 0,
@@ -719,6 +730,7 @@ const Ui = struct {
         if (self.last_name) |n| self.alloc.free(n);
         if (self.view_name) |n| self.alloc.free(n);
         if (self.rename_input) |*input| input.deinit(self.alloc);
+        if (self.search_input) |*input| input.deinit(self.alloc);
         self.message.deinit(self.alloc);
         for (self.row_cache.items) |*row| row.deinit(self.alloc);
         self.row_cache.deinit(self.alloc);
@@ -749,6 +761,7 @@ const Ui = struct {
 
             if (fds[0].revents != 0) try self.readTty(&buf);
             if (self.quitting) break;
+            try self.flushPendingEsc();
 
             // Input handling may have switched the focused session;
             // the poll result then describes the old socket, and
@@ -789,6 +802,9 @@ const Ui = struct {
         }
         if (self.message_deadline != 0) {
             deadline = @min(deadline, self.message_deadline);
+        }
+        if (self.esc_deadline != 0) {
+            deadline = @min(deadline, self.esc_deadline);
         }
         return @intCast(std.math.clamp(deadline - now, 0, 1000));
     }
@@ -839,12 +855,39 @@ const Ui = struct {
         const was_pending = self.parser.pending_prefix;
         try self.parser.feed(buf[0..n], Handler{ .ui = self });
         if (self.parser.pending_prefix != was_pending) self.need_render = true;
+        // A read that ends in a bare ESC is ambiguous: the ESC key,
+        // or a split escape sequence. Deliver it on a short timeout
+        // instead of waiting for the next keypress.
+        self.esc_deadline = if (self.parser.held_len == 1)
+            std.time.milliTimestamp() + esc_flush_ms
+        else
+            0;
+    }
+
+    /// Deliver a lone held ESC once the flush deadline passes: the
+    /// user pressed the ESC key and no sequence followed.
+    fn flushPendingEsc(self: *Ui) !void {
+        if (self.esc_deadline == 0) return;
+        if (std.time.milliTimestamp() < self.esc_deadline) return;
+        self.esc_deadline = 0;
+        const Handler = struct {
+            ui: *Ui,
+            pub fn event(h: @This(), ev: InputEvent) !void {
+                try h.ui.handleEvent(ev);
+            }
+        };
+        try self.parser.flushHeld(Handler{ .ui = self });
     }
 
     fn handleEvent(self: *Ui, ev: InputEvent) !void {
         // An open rename prompt captures keyboard input.
         if (self.rename_input != null) {
             if (self.handleRenameEvent(ev)) return;
+        }
+
+        // An open search prompt captures keyboard input.
+        if (self.search_input != null) {
+            if (self.handleSearchEvent(ev)) return;
         }
 
         // A pending kill confirmation swallows the next key.
@@ -937,11 +980,64 @@ const Ui = struct {
         }
     }
 
+    /// Input while the search prompt is open edits the query; the
+    /// sidebar selection follows the best match live. Returns true
+    /// when the event was consumed.
+    fn handleSearchEvent(self: *Ui, ev: InputEvent) bool {
+        const input = &(self.search_input.?);
+        switch (ev) {
+            .forward => |bytes| {
+                // A bare escape cancels; longer escape sequences
+                // (arrow keys and friends) are ignored.
+                if (bytes.len > 0 and bytes[0] == 0x1b) {
+                    if (bytes.len == 1) self.cancelSearch();
+                    return true;
+                }
+                for (bytes) |byte| switch (byte) {
+                    '\r', '\n' => {
+                        self.commitSearch();
+                        return true;
+                    },
+                    0x7f, 0x08 => _ = input.pop(),
+                    0x03 => {
+                        self.cancelSearch();
+                        return true;
+                    },
+                    else => {
+                        if (byte >= 0x20 and byte < 0x7f and
+                            input.items.len < paths.max_name_len)
+                        {
+                            input.append(self.alloc, byte) catch {};
+                        }
+                    },
+                };
+                if (self.searchMatch(input.items)) |idx| {
+                    self.selected = idx;
+                    self.scrollSelectedIntoView();
+                }
+                self.need_render = true;
+                return true;
+            },
+            .prefix => {
+                self.cancelSearch();
+                return true;
+            },
+            .mouse => |m| {
+                if (!m.release and !m.isMotion() and !m.isWheel()) {
+                    self.cancelSearch();
+                }
+                return true;
+            },
+            .paste, .focus => return true,
+        }
+    }
+
     fn handlePrefix(self: *Ui, byte: u8) !void {
         switch (byte) {
             'c', 0x03 => self.createSession(),
             'k', 0x0b => self.confirmKill(),
             'r', 0x12 => self.startRename(),
+            's', 0x13 => self.startSearch(),
             'd', 0x04, 'q' => self.quitting = true,
             'n', 0x0e => self.focusOffset(1),
             'p', 0x10 => self.focusOffset(-1),
@@ -1585,6 +1681,69 @@ const Ui = struct {
         self.refreshSessions() catch {};
     }
 
+    /// First session whose name starts with `query`, else the first
+    /// whose name contains it; case-insensitive. Null for an empty
+    /// query or no match.
+    fn searchMatch(self: *Ui, query: []const u8) ?usize {
+        if (query.len == 0) return null;
+        var contains: ?usize = null;
+        for (self.sessions.items, 0..) |entry, idx| {
+            if (std.ascii.startsWithIgnoreCase(entry.name, query)) return idx;
+            if (contains == null and
+                std.ascii.indexOfIgnoreCase(entry.name, query) != null)
+            {
+                contains = idx;
+            }
+        }
+        return contains;
+    }
+
+    fn startSearch(self: *Ui) void {
+        if (self.sessions.items.len == 0) {
+            self.setMessage("no sessions to search", .{});
+            return;
+        }
+        self.confirm_kill = null;
+        self.search_origin = self.selected;
+        if (self.search_input) |*old| old.deinit(self.alloc);
+        self.search_input = .empty;
+        // The prompt renders from search_input; a stale transient
+        // message would cover it up.
+        self.message.clearRetainingCapacity();
+        self.message_deadline = 0;
+        self.need_render = true;
+    }
+
+    fn cancelSearch(self: *Ui) void {
+        if (self.search_input) |*input| input.deinit(self.alloc);
+        self.search_input = null;
+        // Put the selection back where it was before the live
+        // matching moved it.
+        if (self.search_origin) |idx| {
+            if (idx < self.sessions.items.len) {
+                self.selected = idx;
+                self.scrollSelectedIntoView();
+            }
+        }
+        self.search_origin = null;
+        self.setMessage("search cancelled", .{});
+    }
+
+    /// Focus the best match for the typed query and close the prompt.
+    fn commitSearch(self: *Ui) void {
+        var input = self.search_input.?;
+        self.search_input = null;
+        defer input.deinit(self.alloc);
+        self.search_origin = null;
+        self.need_render = true;
+        if (input.items.len == 0) return;
+        const idx = self.searchMatch(input.items) orelse {
+            self.setMessage("no session matches '{s}'", .{input.items});
+            return;
+        };
+        self.focusIndex(idx);
+    }
+
     fn setMessage(self: *Ui, comptime fmt: []const u8, args: anytype) void {
         self.message.clearRetainingCapacity();
         self.message.print(self.alloc, fmt, args) catch {};
@@ -1687,6 +1846,7 @@ const Ui = struct {
     fn cursorSequence(self: *Ui) CursorState {
         var state: CursorState = .{};
         if (self.renameCursor()) |s| return s;
+        if (self.searchCursor()) |s| return s;
         const v = self.liveView() orelse return state;
         const cursor = &v.term.screens.active.cursor;
         const row: usize = @min(cursor.y, self.layout.viewportRows() -| 1);
@@ -1727,11 +1887,28 @@ const Ui = struct {
         return state;
     }
 
+    /// While the search prompt is open, the cursor sits at the end
+    /// of the typed query in the status bar.
+    fn searchCursor(self: *Ui) ?CursorState {
+        const input = self.search_input orelse return null;
+        var state: CursorState = .{};
+        const prompt_len = " search: ".len;
+        const col = @min(prompt_len + input.items.len + 1, self.layout.cols);
+        const text = std.fmt.bufPrint(&state.pos, "\x1b[{d};{d}H", .{
+            self.layout.rows,
+            col,
+        }) catch return state;
+        state.pos_len = text.len;
+        state.visible = true;
+        return state;
+    }
+
     /// Whether the bottom-row status overlay has content to show: an
     /// open prompt, the armed-prefix keybind list, or a live message.
     fn statusActive(self: *Ui) bool {
-        return self.rename_input != null or self.confirm_kill != null or
-            self.parser.pending_prefix or self.message.items.len > 0;
+        return self.rename_input != null or self.search_input != null or
+            self.confirm_kill != null or self.parser.pending_prefix or
+            self.message.items.len > 0;
     }
 
     /// One full screen row: sidebar columns, separator, then the
@@ -1755,7 +1932,7 @@ const Ui = struct {
     }
 
     const keybind_bar =
-        " c new  k kill  r rename  n/p switch  d quit  C-a last  a literal  l redraw  esc cancel";
+        " c new  k kill  r rename  s search  n/p switch  d quit  C-a last  a literal  l redraw  esc cancel";
 
     /// Status content overlaid full-width on the last screen row
     /// while present: rename prompt, kill confirmation, the keybind
@@ -1777,6 +1954,8 @@ const Ui = struct {
                     input.items,
                 });
             }
+        } else if (self.search_input) |input| {
+            try text.print(alloc, " search: {s}", .{input.items});
         } else if (self.confirm_kill) |idx| {
             if (idx < self.sessions.items.len) {
                 try text.print(alloc, " kill {s}? y/n", .{self.sessions.items[idx].name});
@@ -2169,6 +2348,29 @@ test "ui: automatic focus skips attached sessions and prefers recent ones" {
     ui.sessions.items[0].attached = true;
     ui.sessions.items[2].attached = true;
     try std.testing.expectEqual(@as(?usize, null), ui.autoFocusable());
+}
+
+test "ui: search matches prefer name prefixes over substrings" {
+    const alloc = std.testing.allocator;
+    var ui: Ui = .{ .alloc = alloc, .dir = "", .tty = -1 };
+    defer ui.sessions.deinit(alloc);
+
+    var build = "build".*;
+    var debug = "debug".*;
+    var ugly = "ugly".*;
+    var no_title: [0]u8 = .{};
+    try ui.sessions.append(alloc, .{ .name = &build, .attached = false, .idle_ms = 0, .title = &no_title });
+    try ui.sessions.append(alloc, .{ .name = &debug, .attached = false, .idle_ms = 0, .title = &no_title });
+    try ui.sessions.append(alloc, .{ .name = &ugly, .attached = false, .idle_ms = 0, .title = &no_title });
+
+    // A prefix match wins even when an earlier name contains the query.
+    try std.testing.expectEqual(@as(?usize, 2), ui.searchMatch("ug"));
+    // Substring fallback, case-insensitive.
+    try std.testing.expectEqual(@as(?usize, 0), ui.searchMatch("UILD"));
+    try std.testing.expectEqual(@as(?usize, 1), ui.searchMatch("deb"));
+    // No match and empty queries select nothing.
+    try std.testing.expectEqual(@as(?usize, null), ui.searchMatch("zzz"));
+    try std.testing.expectEqual(@as(?usize, null), ui.searchMatch(""));
 }
 
 test "layout: geometry and hit testing" {

@@ -70,7 +70,7 @@ boo new work -d -- make    # create detached, running a command
 boo ui                     # manage sessions in a full-screen UI
 boo ls                     # list sessions
 boo attach work            # reattach (steals if attached elsewhere)
-boo at w                   # same: alias + unique-prefix matching
+boo a w                    # same: alias + unique-prefix matching
 boo rename work api        # rename a session
 boo kill work              # end a session
 boo kill --all             # end every session
@@ -94,9 +94,9 @@ Bindings follow GNU screen's defaults, including the `C-x` variants
 | `C-a a`   | send a literal `C-a`                |
 
 `boo ui` adds bindings for switching (`C-a n`/`C-a p`/`C-a C-a`),
-creating (`C-a c`), killing (`C-a k`), and renaming (`C-a r`)
-sessions; pressing `C-a` alone lists them in the bottom bar. See
-`boo help ui`.
+creating (`C-a c`), killing (`C-a k`), renaming (`C-a r`), and
+searching (`C-a s`) sessions; pressing `C-a` alone lists them in the
+bottom bar. See `boo help ui`.
 
 ## Automation
 

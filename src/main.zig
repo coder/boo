@@ -64,7 +64,7 @@ pub fn main() !void {
     }.f;
 
     if (eql(cmd, "new")) return cmdNew(alloc, rest);
-    if (eql(cmd, "attach") or eql(cmd, "at")) return cmdAttach(alloc, rest);
+    if (eql(cmd, "attach") or eql(cmd, "at") or eql(cmd, "a")) return cmdAttach(alloc, rest);
     if (eql(cmd, "ui")) return cmdUi(alloc, rest);
     if (eql(cmd, "ls") or eql(cmd, "list")) return cmdLs(alloc, rest);
     if (eql(cmd, "send")) return cmdSend(alloc, rest);
@@ -788,7 +788,7 @@ fn cmdVersion(alloc: std.mem.Allocator) !void {
 fn cmdHelp(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     _ = alloc;
     if (args.len == 0) return stdoutWrite(help.overview);
-    if (args.len > 1) usageFail("help", "expected one command or topic", .{});
+    if (args.len > 1) usageFail("help", "expected one help page", .{});
 
     const topic = args[0];
     if (std.mem.eql(u8, topic, "--all")) {
