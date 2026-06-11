@@ -1361,6 +1361,84 @@ test "ui: clicking the kill target asks for confirmation" {
     try waitUiSessionCount(&h, 0);
 }
 
+test "ui: killing the focused session moves focus to the next one" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("doomed", &.{"cat"});
+    try h.startDetached("stay", &.{"cat"});
+    try h.sendLine("stay", "STAY-MARK");
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("stay");
+
+    // Focus "doomed" (first alphabetically, sidebar row 3) so its
+    // death has somewhere to fall back to.
+    try ui.send("\x1b[<0;5;3M\x1b[<0;5;3m");
+    try h.sendLine("doomed", "DOOM-MARK");
+    try ui.waitFor("DOOM-MARK");
+
+    // Killing the focused session attaches the remaining free one:
+    // its screen contents render without any further input.
+    try ui.send("\x01k");
+    try ui.waitFor("kill doomed? y/n");
+    try ui.send("y");
+    try ui.waitFor("STAY-MARK");
+    try std.testing.expect(std.mem.indexOf(u8, ui.output.items, "no session focused") == null);
+}
+
+test "ui: killing the last free session points at a held one" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("held", &.{"cat"});
+    var holder = try PtyClient.spawn(&h, &.{ "attach", "held" }, 24, 80);
+    defer holder.deinit();
+    try h.sendLine("held", "HELD-MARK");
+    try holder.waitFor("HELD-MARK");
+
+    try h.startDetached("doomed", &.{"cat"});
+
+    // The UI auto-focuses "doomed", the only free session.
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try h.sendLine("doomed", "DOOM-MARK");
+    try ui.waitFor("DOOM-MARK");
+
+    // After the kill nothing is free to attach: the held session is
+    // selected without stealing it, with the viewport explaining how
+    // to take it over.
+    try ui.send("\x01k");
+    try ui.waitFor("kill doomed? y/n");
+    try ui.send("y");
+    try ui.waitFor("attached elsewhere");
+    try ui.waitFor("click the session to take it over");
+    try std.testing.expect(std.mem.indexOf(u8, ui.output.items, "no session focused") == null);
+}
+
+test "ui: killing the only session brings back the splash" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("solo", &.{"cat"});
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try h.sendLine("solo", "SOLO-MARK");
+    try ui.waitFor("SOLO-MARK");
+
+    try ui.send("\x01k");
+    try ui.waitFor("kill solo? y/n");
+    try ui.send("y");
+    try ui.waitFor("(o o)");
+    try ui.waitFor("no sessions");
+    try std.testing.expect(std.mem.indexOf(u8, ui.output.items, "no session focused") == null);
+}
+
 test "ui: quit with C-a d leaves sessions running and restores the terminal" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
