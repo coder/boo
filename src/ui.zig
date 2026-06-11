@@ -155,11 +155,19 @@ pub const InputEvent = union(enum) {
     forward: []const u8,
     /// Command key following the C-a prefix.
     prefix: u8,
+    /// Plain up/down arrow key (ESC [ A / ESC [ B). `prefixed` marks
+    /// an arrow that followed the C-a prefix.
+    arrow: Arrow,
     mouse: Mouse,
     /// Bracketed paste begin (true) / end (false).
     paste: bool,
     /// Focus in (true) / out (false).
     focus: bool,
+
+    pub const Arrow = struct {
+        up: bool,
+        prefixed: bool,
+    };
 };
 
 /// Splits raw terminal input into session bytes and UI events: the
@@ -171,10 +179,13 @@ pub const InputParser = struct {
     /// A C-a was seen; the next byte is a command key.
     pending_prefix: bool = false,
     /// Held bytes of a possible CSI sequence that may need to be
-    /// intercepted (mouse/focus/paste reports). Replayed verbatim the
-    /// moment the sequence diverges.
+    /// intercepted (arrows and mouse/focus/paste reports). Replayed
+    /// verbatim the moment the sequence diverges.
     held: [hold_max]u8 = undefined,
     held_len: u8 = 0,
+    /// The held sequence followed an armed prefix: an arrow binds to
+    /// it (C-a Up/Down), anything else cancels the prefix as before.
+    prefix_held: bool = false,
     in_paste: bool = false,
 
     const hold_max = 40;
@@ -206,9 +217,13 @@ pub const InputParser = struct {
                     // is the cancel key and is consumed; when more
                     // bytes follow immediately it starts a key or
                     // mouse sequence, which must be reprocessed so
-                    // its tail is not typed into the application.
+                    // its tail is not typed into the application. An
+                    // arrow sequence binds back to the prefix
+                    // (C-a Up/Down) via prefix_held.
                     if (i + 1 == input.len) {
                         i += 1;
+                    } else {
+                        self.prefix_held = true;
                     }
                     start = i;
                     continue;
@@ -243,13 +258,14 @@ pub const InputParser = struct {
     }
 
     /// Whether `byte` keeps the held bytes a candidate for a sequence
-    /// this parser intercepts: CSI mouse (ESC [ < ... M/m), focus
-    /// (ESC [ I, ESC [ O), or paste markers (ESC [ 200~, ESC [ 201~).
+    /// this parser intercepts: plain arrows (ESC [ A, ESC [ B), CSI
+    /// mouse (ESC [ < ... M/m), focus (ESC [ I, ESC [ O), or paste
+    /// markers (ESC [ 200~, ESC [ 201~).
     fn heldAccepts(self: *const InputParser, byte: u8) bool {
         const len = self.held_len;
         if (len == 1) return byte == '[';
         if (len == 2) return switch (byte) {
-            '<', 'I', 'O', '2' => true,
+            '<', 'I', 'O', '2', 'A', 'B' => true,
             else => false,
         };
         return switch (self.held[2]) {
@@ -267,7 +283,7 @@ pub const InputParser = struct {
 
     fn isCsiFinal(byte: u8) bool {
         return switch (byte) {
-            'M', 'm', '~', 'I', 'O' => true,
+            'M', 'm', '~', 'I', 'O', 'A', 'B' => true,
             else => false,
         };
     }
@@ -276,6 +292,19 @@ pub const InputParser = struct {
         const seq = self.held[0..self.held_len];
         const body = seq[2 .. seq.len - 1];
         const final = seq[seq.len - 1];
+        const prefixed = self.prefix_held;
+        self.prefix_held = false;
+
+        // Plain arrows. heldAccepts admits the final only directly
+        // after the bracket, so the body is always empty; modified
+        // arrows (ESC [ 1;5 A) diverge earlier and are replayed.
+        if (final == 'A' or final == 'B') {
+            self.held_len = 0;
+            return handler.event(.{ .arrow = .{
+                .up = final == 'A',
+                .prefixed = prefixed,
+            } });
+        }
 
         // Focus reports arrive as a bare final byte.
         if (final == 'I' or final == 'O') {
@@ -320,11 +349,12 @@ pub const InputParser = struct {
     }
 
     /// Replay held bytes as session input: the sequence is some other
-    /// key encoding (arrows, function keys, ...) that belongs to the
-    /// application.
+    /// key encoding (function keys, modified arrows, ...) that belongs
+    /// to the application.
     fn flushHeld(self: *InputParser, handler: anytype) !void {
         const held = self.held[0..self.held_len];
         self.held_len = 0;
+        self.prefix_held = false;
         if (held.len > 0) try handler.event(.{ .forward = held });
     }
 };
@@ -692,6 +722,11 @@ const Ui = struct {
     search_input: ?std.ArrayList(u8) = null,
     /// Selection to restore when the search prompt is cancelled.
     search_origin: ?usize = null,
+    /// Sidebar browse: armed by C-a Up/Down (or plain arrows when
+    /// nothing live is focused). The selection moves without
+    /// attaching; Enter attaches it, Esc snaps it back to the
+    /// focused session.
+    browsing: bool = false,
     /// Transient status message and its expiry time.
     message: std.ArrayList(u8) = .empty,
     message_deadline: i64 = 0,
@@ -904,7 +939,7 @@ const Ui = struct {
                     }
                     return;
                 },
-                .prefix => {
+                .prefix, .arrow => {
                     self.confirm_kill = null;
                     self.setMessage("kill cancelled", .{});
                     return;
@@ -915,10 +950,22 @@ const Ui = struct {
 
         switch (ev) {
             .forward => |bytes| {
+                if (self.browseConsumes(bytes)) return;
                 const v = self.liveView() orelse return;
                 v.sendInput(bytes) catch self.markViewLost();
             },
             .prefix => |byte| try self.handlePrefix(byte),
+            .arrow => |a| {
+                // A prefixed arrow always browses; a bare one browses
+                // only while the browse is active or nothing live is
+                // focused, and belongs to the application otherwise.
+                if (a.prefixed or self.browsing or self.liveView() == null) {
+                    self.browseMove(if (a.up) -1 else 1);
+                    return;
+                }
+                const v = self.liveView() orelse return;
+                v.sendInput(if (a.up) "\x1b[A" else "\x1b[B") catch self.markViewLost();
+            },
             .mouse => |m| try self.handleMouse(m),
             .paste => |begin| {
                 const v = self.liveView() orelse return;
@@ -978,7 +1025,7 @@ const Ui = struct {
                 }
                 return true;
             },
-            .paste, .focus => return true,
+            .arrow, .paste, .focus => return true,
         }
     }
 
@@ -1030,7 +1077,7 @@ const Ui = struct {
                 }
                 return true;
             },
-            .paste, .focus => return true,
+            .arrow, .paste, .focus => return true,
         }
     }
 
@@ -1434,8 +1481,10 @@ const Ui = struct {
     /// no other client holds it: stolen views recover when the thief
     /// lets go, lost sockets when the daemon answers again, and a
     /// selection that never attached (no-steal startup) binds as soon
-    /// as the session frees up.
+    /// as the session frees up. An active browse suppresses the
+    /// reclaim: the selection is a candidate, not a commitment.
     fn maybeReclaim(self: *Ui, idx: usize) void {
+        if (self.browsing) return;
         if (self.sessions.items[idx].attached) return;
         const broken = if (self.view) |v|
             v.state == .stolen or v.state == .lost
@@ -1447,8 +1496,10 @@ const Ui = struct {
     /// The most recently active session eligible for automatic
     /// attachment: never this UI's host, and never a session some
     /// other client holds. Automatic focus must not steal; only a
-    /// deliberate click or keypress may.
+    /// deliberate click or keypress may. An active browse also
+    /// suppresses it, so the highlight is not yanked mid-decision.
     fn autoFocusable(self: *Ui) ?usize {
+        if (self.browsing) return null;
         var best: ?usize = null;
         for (self.sessions.items, 0..) |entry, i| {
             if (self.isHost(i)) continue;
@@ -1498,6 +1549,9 @@ const Ui = struct {
         };
         self.view_name = self.alloc.dupe(u8, name) catch null;
         self.select_anchor = null;
+        // Any attach ends an in-progress browse: the selection and
+        // the focused session are one again.
+        self.browsing = false;
         self.view_gen += 1;
         self.full_render = true;
         self.need_render = true;
@@ -1549,6 +1603,89 @@ const Ui = struct {
             }
         }
         self.setMessage("no previous session", .{});
+    }
+
+    /// Move the sidebar selection one row without attaching: arrow
+    /// browsing. Wraps and steps past the host session like
+    /// focusOffset.
+    fn browseMove(self: *Ui, dir: i2) void {
+        const len = self.sessions.items.len;
+        if (len == 0) return;
+        self.browsing = true;
+        // The browse hint renders on the bottom row; a stale
+        // transient message would cover it up.
+        self.message.clearRetainingCapacity();
+        self.message_deadline = 0;
+        const cur = self.selected orelse len - 1;
+        var idx = cur;
+        for (0..len) |_| {
+            idx = if (dir > 0)
+                (idx + 1) % len
+            else
+                (idx + len - 1) % len;
+            if (!self.isHost(idx)) break;
+        }
+        if (!self.isHost(idx)) self.selected = idx;
+        self.scrollSelectedIntoView();
+        self.need_render = true;
+    }
+
+    /// Enter/Esc handling while the browse is active, or while
+    /// nothing live is focused and key forwarding has no target:
+    /// Enter attaches the selection, a lone Esc cancels the browse,
+    /// and any other key ends it and flows onward.
+    fn browseConsumes(self: *Ui, bytes: []const u8) bool {
+        if (!self.browsing and self.liveView() != null) return false;
+        if (bytes.len == 0) return false;
+        switch (bytes[0]) {
+            '\r', '\n' => {
+                self.commitBrowse();
+                return true;
+            },
+            0x1b => {
+                // A lone Esc cancels; longer escape sequences were
+                // already split off as arrow/mouse events upstream.
+                if (bytes.len == 1 and self.browsing) {
+                    self.cancelBrowse();
+                    return true;
+                }
+                return false;
+            },
+            else => {
+                self.browsing = false;
+                return false;
+            },
+        }
+    }
+
+    /// Attach the browsed selection. Enter on the already-focused
+    /// session just ends the browse instead of re-attaching it.
+    fn commitBrowse(self: *Ui) void {
+        self.browsing = false;
+        self.need_render = true;
+        const idx = self.selected orelse return;
+        if (self.liveView() != null and idx < self.sessions.items.len) {
+            if (self.view_name) |focused| {
+                if (std.mem.eql(u8, self.sessions.items[idx].name, focused)) return;
+            }
+        }
+        self.focusIndex(idx);
+    }
+
+    /// Drop the browse and snap the selection back to the focused
+    /// session, mirroring how a cancelled search restores its origin.
+    fn cancelBrowse(self: *Ui) void {
+        self.browsing = false;
+        if (self.view_name) |want| {
+            for (self.sessions.items, 0..) |entry, i| {
+                if (std.mem.eql(u8, entry.name, want)) {
+                    self.selected = i;
+                    self.scrollSelectedIntoView();
+                    break;
+                }
+            }
+        }
+        self.need_render = true;
     }
 
     /// Create a session by re-running our own binary with `new -d`.
@@ -1912,11 +2049,12 @@ const Ui = struct {
     }
 
     /// Whether the bottom-row status overlay has content to show: an
-    /// open prompt, the armed-prefix keybind list, or a live message.
+    /// open prompt, the armed-prefix keybind list, an active browse,
+    /// or a live message.
     fn statusActive(self: *Ui) bool {
         return self.rename_input != null or self.search_input != null or
             self.confirm_kill != null or self.parser.pending_prefix or
-            self.message.items.len > 0;
+            self.browsing or self.message.items.len > 0;
     }
 
     /// One full screen row: sidebar columns, separator, then the
@@ -1940,7 +2078,7 @@ const Ui = struct {
     }
 
     const keybind_bar =
-        " c new  k kill  r rename  s search  n/p switch  d quit  C-a last  a literal  l redraw  esc cancel";
+        " c new  k kill  r rename  s search  n/p switch  up/dn browse  d quit  C-a last  a literal  l redraw  esc cancel";
 
     /// Status content overlaid full-width on the last screen row
     /// while present: rename prompt, kill confirmation, the keybind
@@ -1972,6 +2110,8 @@ const Ui = struct {
             try text.appendSlice(alloc, keybind_bar);
         } else if (self.message.items.len > 0) {
             try text.print(alloc, " {s}", .{self.message.items});
+        } else if (self.browsing) {
+            try text.appendSlice(alloc, " up/down select  enter attach  esc cancel");
         }
         try appendClipped(alloc, out, text.items, w);
         try out.appendSlice(alloc, sgr_reset);
@@ -2305,9 +2445,61 @@ test "parser: non-intercepted CSI passes through" {
     var h: TestHandler = .{ .alloc = std.testing.allocator };
     defer h.deinit();
     var p: InputParser = .{};
-    try p.feed("\x1b[A\x1b[1;5C", &h);
-    try std.testing.expectEqualStrings("\x1b[A\x1b[1;5C", h.forwarded.items);
+    try p.feed("\x1b[1;5A\x1b[1;5C", &h);
+    try std.testing.expectEqualStrings("\x1b[1;5A\x1b[1;5C", h.forwarded.items);
     try std.testing.expectEqual(@as(usize, 0), h.events.items.len);
+}
+
+test "parser: plain arrows become arrow events" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    try p.feed("\x1b[A\x1b[B", &h);
+    try std.testing.expectEqual(@as(usize, 2), h.events.items.len);
+    try std.testing.expectEqual(
+        InputEvent{ .arrow = .{ .up = true, .prefixed = false } },
+        h.events.items[0],
+    );
+    try std.testing.expectEqual(
+        InputEvent{ .arrow = .{ .up = false, .prefixed = false } },
+        h.events.items[1],
+    );
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+}
+
+test "parser: arrows bind to an armed prefix" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    try p.feed("\x01\x1b[B", &h);
+    try std.testing.expectEqual(@as(usize, 1), h.events.items.len);
+    try std.testing.expectEqual(
+        InputEvent{ .arrow = .{ .up = false, .prefixed = true } },
+        h.events.items[0],
+    );
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+    // The prefix was consumed: the next bytes are plain input, and a
+    // later bare arrow is not marked prefixed.
+    try p.feed("x\x1b[A", &h);
+    try std.testing.expectEqualStrings("x", h.forwarded.items);
+    try std.testing.expectEqual(
+        InputEvent{ .arrow = .{ .up = true, .prefixed = false } },
+        h.events.items[1],
+    );
+}
+
+test "parser: arrow split across feeds" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    try p.feed("\x1b[", &h);
+    try std.testing.expectEqual(@as(usize, 0), h.events.items.len);
+    try p.feed("A", &h);
+    try std.testing.expectEqual(
+        InputEvent{ .arrow = .{ .up = true, .prefixed = false } },
+        h.events.items[0],
+    );
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
 }
 
 test "parser: bracketed paste protects the prefix byte" {

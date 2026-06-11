@@ -1562,25 +1562,26 @@ test "ui: the keybind bar overlays the bottom row and C-a r renames" {
 
     try h.startDetached("oldname", &.{"cat"});
 
-    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 120);
     defer ui.deinit();
     try ui.waitFor("oldname");
 
     // The keybind hint sits in the sidebar's bottom row and the
     // separator runs through the last row: no reserved status bar.
-    try waitLastRow(alloc, &ui, 24, 100, &.{ "Keybinds: Ctrl+A", "\u{2502}" }, &.{});
+    try waitLastRow(alloc, &ui, 24, 120, &.{ "Keybinds: Ctrl+A", "\u{2502}" }, &.{});
 
     // Arming the prefix overlays the keybind list across the whole
     // bottom row, covering the sidebar hint and the separator.
     try ui.send("\x01");
     try ui.waitFor("r rename");
+    try ui.waitFor("up/dn browse");
     try ui.waitFor("esc cancel");
-    try waitLastRow(alloc, &ui, 24, 100, &.{"r rename"}, &.{"\u{2502}"});
+    try waitLastRow(alloc, &ui, 24, 120, &.{"r rename"}, &.{"\u{2502}"});
 
     // Esc backs out: the overlay reverts to the hint, the separator,
     // and whatever the viewport had underneath.
     try ui.send("\x1b");
-    try waitLastRow(alloc, &ui, 24, 100, &.{ "Keybinds: Ctrl+A", "\u{2502}" }, &.{"r rename"});
+    try waitLastRow(alloc, &ui, 24, 120, &.{ "Keybinds: Ctrl+A", "\u{2502}" }, &.{"r rename"});
 
     // C-a r opens the prompt pre-filled with the old name; erase it
     // and type a new one.
@@ -1656,6 +1657,103 @@ test "ui: C-a s searches sessions by name and focuses the match" {
     try ui.waitFor("ALPHA-TYPED-MARK");
     const peeked = try h.waitPeekContains("alpha", "ALPHA-TYPED-MARK");
     defer alloc.free(peeked);
+}
+
+test "ui: arrow browsing selects without attaching until enter" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("alpha", &.{"cat"});
+    try h.startDetached("bravo", &.{"cat"});
+    try h.sendLine("bravo", "BRAVO-MARK");
+    const seeded = try h.waitPeekContains("bravo", "BRAVO-MARK");
+    alloc.free(seeded);
+
+    // bravo saw input last, so the UI focuses it on startup.
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("BRAVO-MARK");
+
+    // C-a Down moves the selection to alpha without attaching it;
+    // the bottom row hints at the browse keys.
+    try ui.send("\x01\x1b[B");
+    try ui.waitFor("enter attach");
+
+    // The selection move stole nothing: alpha is still free. The
+    // attach would have happened synchronously before the hint
+    // rendered.
+    const ls = try h.run(&.{"ls"});
+    defer alloc.free(ls.stdout);
+    defer alloc.free(ls.stderr);
+    var lines = std.mem.splitScalar(u8, ls.stdout, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "alpha") == null) continue;
+        try std.testing.expect(std.mem.indexOf(u8, line, "detached") != null);
+    }
+
+    // Enter attaches the selection; the focus switch forces a full
+    // repaint, proven by the sidebar hint returning.
+    ui.clearOutput();
+    try ui.send("\r");
+    try ui.waitFor("Keybinds: Ctrl+A");
+
+    // Typing lands in alpha now.
+    try ui.send("ALPHA-TYPED-MARK\r");
+    try ui.waitFor("ALPHA-TYPED-MARK");
+    const peeked = try h.waitPeekContains("alpha", "ALPHA-TYPED-MARK");
+    defer alloc.free(peeked);
+
+    // Browse again and cancel with Esc: the selection snaps back to
+    // alpha, so a following Enter is a no-op and typing still lands
+    // in alpha rather than the browsed-to session.
+    try ui.send("\x01\x1b[A");
+    try ui.waitFor("enter attach");
+    try ui.send("\x1b");
+    try ui.send("\rSTILL-ALPHA-MARK\r");
+    const still = try h.waitPeekContains("alpha", "STILL-ALPHA-MARK");
+    defer alloc.free(still);
+    const bravo_peek = try h.run(&.{ "peek", "bravo" });
+    defer alloc.free(bravo_peek.stdout);
+    defer alloc.free(bravo_peek.stderr);
+    try std.testing.expect(std.mem.indexOf(u8, bravo_peek.stdout, "STILL-ALPHA-MARK") == null);
+}
+
+test "ui: enter attaches the selection when nothing is focused" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("one", &.{"cat"});
+    try h.startDetached("two", &.{"cat"});
+
+    var holder1 = try PtyClient.spawn(&h, &.{ "attach", "one" }, 24, 80);
+    defer holder1.deinit();
+    var holder2 = try PtyClient.spawn(&h, &.{ "attach", "two" }, 24, 80);
+    defer holder2.deinit();
+    try h.sendLine("two", "TWO-HELD-MARK");
+    try holder2.waitFor("TWO-HELD-MARK");
+
+    // Every session is held elsewhere: the UI starts unfocused and
+    // points at the most recently active session without stealing.
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("click the session to take it over");
+
+    // With nothing live focused, bare arrows browse: Down wraps the
+    // selection from two to one.
+    try ui.send("\x1b[B");
+    try ui.waitFor("enter attach");
+
+    // Enter is a deliberate attach and may steal: one's holder is
+    // kicked and typing from the UI lands in one.
+    try ui.send("\r");
+    try holder1.waitFor("attached elsewhere");
+    _ = try holder1.waitExit();
+    try ui.send("ONE-TYPED-MARK\r");
+    const peeked = try h.waitPeekContains("one", "ONE-TYPED-MARK");
+    defer alloc.free(peeked);
+    try std.testing.expect(std.mem.indexOf(u8, holder2.output.items, "attached elsewhere") == null);
 }
 
 test "ui: session titles render in the sidebar" {

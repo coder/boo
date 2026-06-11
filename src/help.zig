@@ -127,6 +127,10 @@ pub const commands = [_]Entry{
         \\  C-a s   search sessions by name and focus the match
         \\  C-a n   focus the next session
         \\  C-a p   focus the previous session
+        \\  C-a Up, C-a Down
+        \\          browse the session list without attaching:
+        \\          Up/Down move the selection, Enter attaches it,
+        \\          Esc returns to the focused session
         \\  C-a C-a focus the previously focused session
         \\  C-a d   quit the UI (sessions keep running)
         \\  C-a l   redraw
