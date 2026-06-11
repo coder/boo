@@ -43,7 +43,15 @@
 
           installPhase = ''
             export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-cache"
-            zig build --fetch=all
+            # Dependency hosts intermittently fail; retry like CI
+            # does. Zig resumes from its cache, so completed fetches
+            # are not repeated and the output stays reproducible.
+            for i in 1 2 3 4 5; do
+              zig build --fetch=all && break
+              if [ "$i" = 5 ]; then exit 1; fi
+              echo "fetch attempt $i failed; retrying in 10s" >&2
+              sleep 10
+            done
             mv "$ZIG_GLOBAL_CACHE_DIR/p" "$out"
           '';
 
