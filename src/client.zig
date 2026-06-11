@@ -133,7 +133,15 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
                 stdin_open = false;
                 protocol.writeMsg(sock, .detach_req, "") catch {};
             } else {
-                try protocol.writeMsg(sock, .input, buf[0..n]);
+                // The daemon may already have detached this client
+                // and closed the connection while these bytes were
+                // in flight (a held key racing the detach
+                // acknowledgement). The failure is not fatal: stop
+                // forwarding and let the queued lifecycle message or
+                // the socket EOF below decide the outcome.
+                protocol.writeMsg(sock, .input, buf[0..n]) catch {
+                    stdin_open = false;
+                };
             }
         }
 
