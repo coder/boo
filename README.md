@@ -1,7 +1,19 @@
-# boo
+<div align="center">
+  <h1>boo</h1>
 
-Sessions that haunt your terminal. A GNU `screen` style terminal
-multiplexer built on [libghostty](https://github.com/ghostty-org/ghostty)
+Sessions that haunt your terminal.
+
+[Install](#install) | [Usage](#usage) | [Automation](#automation) | [Architecture](#architecture)
+
+[![ci](https://github.com/coder/boo/actions/workflows/ci.yml/badge.svg)](https://github.com/coder/boo/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/coder/boo)](https://github.com/coder/boo/releases/latest)
+[![license](https://img.shields.io/github/license/coder/boo)](./LICENSE)
+[![discord](https://img.shields.io/discord/747933592273027093?label=discord)](https://discord.gg/coder)
+
+</div>
+
+A GNU `screen` style terminal multiplexer built on
+[libghostty](https://github.com/ghostty-org/ghostty)
 (`libghostty-vt`), written in Zig.
 
 Every session's output is parsed through Ghostty's terminal emulation
@@ -37,6 +49,8 @@ exactly as a human would see it.
 
 ## Install
 
+### Install script
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/coder/boo/main/install.sh | sh
 ```
@@ -47,6 +61,19 @@ Pre-built binaries for Linux (x86_64, aarch64; fully static) and macOS
 `BOO_VERSION` to pin a release and `BOO_INSTALL_DIR` to change the
 install location (default: `/usr/local/bin` when writable, otherwise
 `~/.local/bin`).
+
+### Nix
+
+With [flakes](https://wiki.nixos.org/wiki/Flakes) enabled:
+
+```sh
+nix run github:coder/boo            # try it without installing
+nix profile add github:coder/boo    # install into your profile
+```
+
+Or add `github:coder/boo` as an input to your own flake and reference
+`packages.<system>.default` from your NixOS, nix-darwin, or Home
+Manager configuration.
 
 ## Building
 
@@ -61,6 +88,9 @@ zig build test-all             # everything
 
 The libghostty dependency is fetched and built from source
 automatically (pinned in `build.zig.zon`).
+
+With Nix, `nix develop` opens a shell with the right Zig version, and
+`nix build` builds the package to `./result/bin/boo`.
 
 ## Usage
 
@@ -171,6 +201,27 @@ This is a young project, not a drop-in GNU screen replacement:
   `boo ui` is immune thanks to bracketed paste).
 - No status line, monitoring, or copy mode yet.
 - Sessions run with `TERM=xterm-256color`.
+
+## Support
+
+Feel free to [open an issue](https://github.com/coder/boo/issues/new)
+if you have questions, run into bugs, or have a feature request.
+
+[Join the Coder Discord](https://discord.gg/coder) to chat with the
+community.
+
+## Contributing
+
+Contributions are welcome:
+
+1. Fork and clone the repository.
+2. Make your change and cover it with tests.
+3. Run `zig build test-all` and
+   `zig fmt build.zig build.zig.zon src test`.
+4. Open a pull request against `main`.
+
+CI runs formatting checks, unit tests, and PTY integration tests on
+Linux and macOS, plus a Nix build.
 
 ## License
 

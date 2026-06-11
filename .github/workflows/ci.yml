@@ -65,3 +65,13 @@ jobs:
           done
           exit 1
       - run: zig build test-all -Doptimize=ReleaseSafe --summary all
+
+  nix:
+    name: nix build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: DeterminateSystems/nix-installer-action@v22
+      - run: nix flake check
+      - run: nix build -L
+      - run: nix run . -- version
