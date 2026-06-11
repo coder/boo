@@ -130,9 +130,9 @@ Scripting is the other win: `send`, `peek --json`, and
 `wait --text`/`--idle` instead of `-X stuff`, hardcopy files, and
 sleep loops.
 
-tmux is great, it was just never the model I wanted. I really liked
-screen's simplicity, sessions and a prefix key and nothing else to
-learn, and boo keeps exactly that.
+tmux is great, it just solves a different problem. boo keeps screen's
+model by design: sessions, a prefix key, and nothing else to learn.
+One session per task, with `boo ui` to juggle them.
 
 ## Contributing
 
