@@ -36,6 +36,8 @@ exactly as a human would see it.
 - Faithful redraws from libghostty terminal state, including SGR styles, cursor position, scrolling regions, window title, and terminal modes.
 - Agent-friendly automation primitives: `send`, `peek`, `wait`, and `--json` output, all usable without a TTY.
 
+<video src="demo.mp4" controls autoplay loop muted></video>
+
 ## Install
 
 For Linux and macOS:
