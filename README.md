@@ -18,7 +18,8 @@ exactly as a human would see it.
 - A full-screen session manager: `boo ui` lists sessions in a sidebar
   with their titles, and renders the focused one next to it. Click to
   switch, create, kill, or rename sessions; drag to select and copy
-  text (OSC 52); everything also works from the keyboard.
+  text (OSC 52); scroll the wheel to page through a session's history;
+  everything also works from the keyboard.
 - One command per session, named after your current directory by
   default. Sessions are cheap; run one per task.
 - Faithful redraws from libghostty terminal state, including SGR styles,

@@ -29,6 +29,11 @@ pub const MsgType = enum(u8) {
     exit = 66,
     ok = 67,
     err = 68,
+    /// Which screen the application is on ("alt" or "primary"),
+    /// sent alongside every repaint. The passthrough strips screen
+    /// toggles, so clients cannot tell on their own; the ui uses it
+    /// to decide what a wheel over the viewport should do.
+    screen = 69,
     _,
 };
 

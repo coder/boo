@@ -571,6 +571,10 @@ pub const Daemon = struct {
         // from a clean slate.
         win.alt_filter.reset();
         conn.send(.output, bytes);
+        // Repaints accompany every screen identity change (attach,
+        // redraw, alt-screen switches), so this keeps the client's
+        // picture of the application's screen current.
+        conn.send(.screen, if (win.onAltScreen()) "alt" else "primary");
     }
 
     fn detachConn(self: *Daemon, conn: *Conn, reason: []const u8) void {

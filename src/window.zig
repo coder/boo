@@ -205,6 +205,13 @@ pub const Window = struct {
         return self.term.screens.active.kitty_keyboard.current().int() != 0;
     }
 
+    /// Whether the application is on the alternate screen. The
+    /// passthrough strips screen toggles, so clients cannot tell
+    /// from the byte stream.
+    pub fn onAltScreen(self: *Window) bool {
+        return self.term.screens.active_key == .alternate;
+    }
+
     /// Plain-text dump of the screen, for peek.
     pub fn plainScreen(self: *Window, alloc: std.mem.Allocator) ![]const u8 {
         return self.term.plainString(alloc);

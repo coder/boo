@@ -117,6 +117,10 @@ pub const commands = [_]Entry{
         \\  click its 'x'       kill it (asks for confirmation)
         \\  click + new session start a session running $SHELL
         \\  scroll the sidebar  scroll the session list
+        \\  wheel in viewport   scroll the session's history; wheel
+        \\                      back down or press esc to return to
+        \\                      live output (full-screen applications
+        \\                      receive arrow keys instead)
         \\  in the viewport     forwarded to the application when it
         \\                      asked for mouse reporting; otherwise
         \\                      dragging selects text and copies it on

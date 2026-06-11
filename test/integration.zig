@@ -1844,6 +1844,75 @@ fn waitPeekSize(h: *Harness, name: []const u8, rows: u16, cols: u16) !void {
     }
 }
 
+test "ui: wheel scrolls primary-screen scrollback" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("scrolly", &.{"cat"});
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("+ new session");
+
+    // Stream enough lines through cat that the earliest ones scroll
+    // off the 24-row screen into the view's scrollback.
+    var n: usize = 1;
+    while (n <= 40) : (n += 1) {
+        var buf: [16]u8 = undefined;
+        const line = try std.fmt.bufPrint(&buf, "SCROLL-{d:0>3}", .{n});
+        try h.sendLine("scrolly", line);
+    }
+    try ui.waitFor("SCROLL-040");
+
+    // cat never asked for mouse reporting and stays on the primary
+    // screen, so wheel-up over the viewport pages local scrollback.
+    // Over-scrolling clamps at the top, which puts the first line on
+    // screen regardless of exact row math.
+    ui.clearOutput();
+    for (0..35) |_| try ui.send("\x1b[<64;50;10M");
+    try ui.waitFor(" scrollback");
+    try ui.waitFor("SCROLL-001");
+
+    // A lone Esc snaps the viewport back to the live bottom.
+    ui.clearOutput();
+    try ui.send("\x1b");
+    try ui.waitFor("SCROLL-040");
+}
+
+test "ui: wheel sends arrows to alternate-screen applications" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // The application switches to the alternate screen before the UI
+    // attaches; the painted marker proves the switch landed. cat -v
+    // makes the arrow bytes visible in peek.
+    try h.startDetached("alty", &.{
+        "bash", "-c", "printf '\\033[?1049hALTREADY'; exec cat -v",
+    });
+    const seeded = try h.waitPeekContains("alty", "ALTREADY");
+    alloc.free(seeded);
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("ALTREADY");
+
+    // Round-trip a typed marker before wheeling: its echo rendering
+    // in the viewport proves the attach repaint, and the `.screen`
+    // message sent with it, has been processed.
+    try ui.send("READY\r");
+    try ui.waitFor("READY");
+
+    // One wheel-up tick over the viewport turns into arrow keys for
+    // the application instead of paging local scrollback. The tty is
+    // canonical, so Enter flushes the buffered arrows through cat -v.
+    try ui.send("\x1b[<64;50;10M");
+    try ui.send("\r");
+    const peeked = try h.waitPeekContains("alty", "^[[A^[[A^[[A");
+    alloc.free(peeked);
+}
+
 test "ui: session titles render in the sidebar" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);

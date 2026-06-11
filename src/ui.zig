@@ -43,6 +43,9 @@ const render_interval_ms: i64 = 15;
 /// after this long without a follow-up byte. Escape sequences arrive
 /// as one chunk, so only a human pressing the ESC key waits this long.
 const esc_flush_ms: i64 = 50;
+/// Rows per mouse wheel tick, both for paging local scrollback and
+/// for the arrow keys sent to alternate-screen applications.
+const wheel_lines = 3;
 
 // -- Layout -----------------------------------------------------------------
 
@@ -387,6 +390,10 @@ pub const View = struct {
     title_changed: bool = false,
     /// The application rang the bell; the UI forwards it.
     bell: bool = false,
+    /// The application is on the alternate screen, per the daemon's
+    /// `.screen` messages. Decides whether a wheel over the viewport
+    /// pages local scrollback or sends arrow keys.
+    app_alt: bool = false,
 
     pub const State = enum { live, ended, stolen, lost };
     pub const Stream = vt.TerminalStream;
@@ -415,7 +422,10 @@ pub const View = struct {
         self.term = try vt.Terminal.init(alloc, .{
             .cols = @max(cols, 1),
             .rows = @max(rows, 1),
-            .max_scrollback = 0,
+            // Output that scrolls off while attached accumulates
+            // here; the wheel pages through it for primary-screen
+            // applications.
+            .max_scrollback = 512 * 1024,
         });
         errdefer self.term.deinit(alloc);
 
@@ -973,7 +983,9 @@ const Ui = struct {
             .forward => |bytes| {
                 if (self.resizeConsumes(bytes)) return;
                 if (self.browseConsumes(bytes)) return;
+                if (self.scrollConsumes(bytes)) return;
                 const v = self.liveView() orelse return;
+                self.snapViewBottom();
                 v.sendInput(bytes) catch self.markViewLost();
             },
             .prefix => |byte| {
@@ -999,6 +1011,7 @@ const Ui = struct {
                         self.need_render = true;
                     }
                     const v = self.liveView() orelse return;
+                    self.snapViewBottom();
                     v.sendInput(if (a.dir == .left) "\x1b[D" else "\x1b[C") catch
                         self.markViewLost();
                 },
@@ -1014,6 +1027,7 @@ const Ui = struct {
                         return;
                     }
                     const v = self.liveView() orelse return;
+                    self.snapViewBottom();
                     v.sendInput(if (a.dir == .up) "\x1b[A" else "\x1b[B") catch
                         self.markViewLost();
                 },
@@ -1027,6 +1041,7 @@ const Ui = struct {
             .paste => |begin| {
                 const v = self.liveView() orelse return;
                 if (!v.term.modes.get(.bracketed_paste)) return;
+                self.snapViewBottom();
                 const marker: []const u8 = if (begin) "\x1b[200~" else "\x1b[201~";
                 v.sendInput(marker) catch self.markViewLost();
             },
@@ -1194,7 +1209,7 @@ const Ui = struct {
 
         if (m.isWheel() and !m.release) {
             switch (self.layout.hit(x, y)) {
-                .viewport => return self.forwardMouse(m),
+                .viewport => return self.wheelViewport(m),
                 else => {
                     // Wheel over the sidebar scrolls the session list.
                     const down = m.code & 1 != 0;
@@ -1240,6 +1255,72 @@ const Ui = struct {
             },
             else => {},
         }
+    }
+
+    /// Wheel over the viewport. Applications that asked for mouse
+    /// reporting get the event. Alternate-screen applications get
+    /// arrow keys per tick, like terminals' alternate-scroll mode,
+    /// so pagers scroll without mouse support. Otherwise the wheel
+    /// pages the view's local scrollback.
+    fn wheelViewport(self: *Ui, m: Mouse) !void {
+        const v = self.liveView() orelse return;
+        if (v.term.flags.mouse_event != .none) return self.forwardMouse(m);
+        const down = m.code & 1 != 0;
+        if (v.app_alt) {
+            const seq: []const u8 = if (v.term.modes.get(.cursor_keys))
+                (if (down) "\x1bOB" else "\x1bOA")
+            else
+                (if (down) "\x1b[B" else "\x1b[A");
+            for (0..wheel_lines) |_| {
+                v.sendInput(seq) catch return self.markViewLost();
+            }
+            return;
+        }
+        self.scrollView(if (down) wheel_lines else -@as(isize, wheel_lines));
+    }
+
+    /// Page the focused view's scrollback by delta rows (up is
+    /// negative). A scrolled viewport pins to its content, so
+    /// streaming output does not move it; the bottom row hints how
+    /// to get back.
+    fn scrollView(self: *Ui, delta: isize) void {
+        const v = self.liveView() orelse return;
+        if (!self.viewScrolled()) {
+            // The scrollback hint renders on the bottom row; a stale
+            // transient message would cover it up.
+            self.message.clearRetainingCapacity();
+            self.message_deadline = 0;
+        }
+        v.term.scrollViewport(.{ .delta = delta });
+        self.full_render = true;
+        self.need_render = true;
+    }
+
+    /// Whether the focused view's viewport is scrolled into history.
+    fn viewScrolled(self: *Ui) bool {
+        const v = self.view orelse return false;
+        if (v.state != .live) return false;
+        return !v.term.screens.active.viewportIsBottom();
+    }
+
+    /// Return the viewport to the live bottom, so input lands where
+    /// the user can see it.
+    fn snapViewBottom(self: *Ui) void {
+        if (!self.viewScrolled()) return;
+        if (self.view) |v| v.term.scrollViewport(.{ .bottom = {} });
+        self.full_render = true;
+        self.need_render = true;
+    }
+
+    /// A lone Esc while the view is scrolled returns it to the
+    /// bottom instead of reaching the application.
+    fn scrollConsumes(self: *Ui, bytes: []const u8) bool {
+        if (!self.viewScrolled()) return false;
+        if (bytes.len == 1 and bytes[0] == 0x1b) {
+            self.snapViewBottom();
+            return true;
+        }
+        return false;
     }
 
     /// Track press state and forward the event to the application
@@ -1350,8 +1431,8 @@ const Ui = struct {
         if (e.y < s.y or (e.y == s.y and e.x < s.x)) std.mem.swap(CellPos, &s, &e);
 
         const screen = v.term.screens.active;
-        const start = screen.pages.pin(.{ .active = .{ .x = s.x, .y = s.y } }) orelse return;
-        const end = screen.pages.pin(.{ .active = .{ .x = e.x, .y = e.y } }) orelse return;
+        const start = screen.pages.pin(.{ .viewport = .{ .x = s.x, .y = s.y } }) orelse return;
+        const end = screen.pages.pin(.{ .viewport = .{ .x = e.x, .y = e.y } }) orelse return;
 
         var formatter: vt.formatter.ScreenFormatter = .init(screen, .plain);
         formatter.content = .{ .selection = vt.Selection.init(start, end, false) };
@@ -1419,6 +1500,9 @@ const Ui = struct {
                     v.state = .stolen;
                     self.setMessage("session attached elsewhere", .{});
                     self.need_render = true;
+                },
+                .screen => {
+                    v.app_alt = std.mem.eql(u8, msg.payload, "alt");
                 },
                 .exit => {
                     v.state = .ended;
@@ -2137,6 +2221,10 @@ const Ui = struct {
         if (self.renameCursor()) |s| return s;
         if (self.searchCursor()) |s| return s;
         const v = self.liveView() orelse return state;
+        // While scrolled back the cursor coordinates belong to the
+        // bottom of the screen, not the history rows on display, so
+        // keep the cursor hidden until the viewport snaps back.
+        if (self.viewScrolled()) return state;
         const cursor = &v.term.screens.active.cursor;
         const row: usize = @min(cursor.y, self.layout.viewportRows() -| 1);
         const col: usize = @min(
@@ -2193,12 +2281,13 @@ const Ui = struct {
     }
 
     /// Whether the bottom-row status overlay has content to show: an
-    /// open prompt, the armed-prefix keybind list, an active browse
-    /// or resize, or a live message.
+    /// open prompt, the armed-prefix keybind list, an active browse,
+    /// resize, or scrollback, or a live message.
     fn statusActive(self: *Ui) bool {
         return self.rename_input != null or self.search_input != null or
             self.confirm_kill != null or self.parser.pending_prefix or
-            self.browsing or self.resizing or self.message.items.len > 0;
+            self.browsing or self.resizing or self.viewScrolled() or
+            self.message.items.len > 0;
     }
 
     /// One full screen row: sidebar columns, separator, then the
@@ -2258,6 +2347,8 @@ const Ui = struct {
             try text.appendSlice(alloc, " left/right resize  enter done  esc cancel");
         } else if (self.browsing) {
             try text.appendSlice(alloc, " up/down select  enter attach  esc cancel");
+        } else if (self.viewScrolled()) {
+            try text.appendSlice(alloc, " scrollback  wheel down or esc to return");
         }
         try appendClipped(alloc, out, text.items, w);
         try out.appendSlice(alloc, sgr_reset);
@@ -2436,8 +2527,10 @@ pub fn appendTermRow(
 ) !void {
     const screen = term.screens.active;
     if (term.cols == 0) return;
-    const start = screen.pages.pin(.{ .active = .{ .x = 0, .y = y } }) orelse return;
-    const end = screen.pages.pin(.{ .active = .{ .x = term.cols - 1, .y = y } }) orelse return;
+    // Viewport pins follow scrollback paging; at the bottom the
+    // viewport and the active screen are the same rows.
+    const start = screen.pages.pin(.{ .viewport = .{ .x = 0, .y = y } }) orelse return;
+    const end = screen.pages.pin(.{ .viewport = .{ .x = term.cols - 1, .y = y } }) orelse return;
 
     var formatter: vt.formatter.ScreenFormatter = .init(screen, .vt);
     formatter.content = .{ .selection = vt.Selection.init(start, end, true) };
@@ -2467,8 +2560,8 @@ fn appendPlainSpan(
     out: *std.ArrayList(u8),
 ) !void {
     const screen = term.screens.active;
-    const start = screen.pages.pin(.{ .active = .{ .x = x0, .y = y } }) orelse return;
-    const end = screen.pages.pin(.{ .active = .{ .x = x1, .y = y } }) orelse return;
+    const start = screen.pages.pin(.{ .viewport = .{ .x = x0, .y = y } }) orelse return;
+    const end = screen.pages.pin(.{ .viewport = .{ .x = x1, .y = y } }) orelse return;
 
     var formatter: vt.formatter.ScreenFormatter = .init(screen, .plain);
     formatter.content = .{ .selection = vt.Selection.init(start, end, false) };
