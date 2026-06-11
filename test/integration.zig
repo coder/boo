@@ -1711,6 +1711,7 @@ test "ui: arrow browsing selects without attaching until enter" {
     try ui.waitFor("enter attach");
     try ui.send("\x1b");
     try ui.send("\rSTILL-ALPHA-MARK\r");
+    try ui.waitFor("STILL-ALPHA-MARK");
     const still = try h.waitPeekContains("alpha", "STILL-ALPHA-MARK");
     defer alloc.free(still);
     const bravo_peek = try h.run(&.{ "peek", "bravo" });
@@ -1746,11 +1747,16 @@ test "ui: enter attaches the selection when nothing is focused" {
     try ui.waitFor("enter attach");
 
     // Enter is a deliberate attach and may steal: one's holder is
-    // kicked and typing from the UI lands in one.
+    // kicked and typing from the UI lands in one. Waiting on the
+    // repaint and the echo also keeps the UI's output drained; an
+    // undrained pty would wedge the UI before it reads the keys.
+    ui.clearOutput();
     try ui.send("\r");
+    try ui.waitFor("Keybinds: Ctrl+A");
     try holder1.waitFor("attached elsewhere");
     _ = try holder1.waitExit();
     try ui.send("ONE-TYPED-MARK\r");
+    try ui.waitFor("ONE-TYPED-MARK");
     const peeked = try h.waitPeekContains("one", "ONE-TYPED-MARK");
     defer alloc.free(peeked);
     try std.testing.expect(std.mem.indexOf(u8, holder2.output.items, "attached elsewhere") == null);
