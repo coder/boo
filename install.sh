@@ -85,5 +85,36 @@ install -m 0755 "$tmp/boo" "$install_dir/boo"
 log "Installed $("$install_dir/boo" -V 2>&1) to $install_dir/boo"
 case ":$PATH:" in
 *":$install_dir:"*) ;;
-*) log "warning: $install_dir is not in your PATH" ;;
+*)
+	# Reference the directory via $HOME where possible so the
+	# suggested rc line survives a home directory move.
+	dir_ref=$install_dir
+	case "$install_dir" in
+	"$HOME"/*) dir_ref="\$HOME${install_dir#"$HOME"}" ;;
+	esac
+	log ""
+	log "warning: $install_dir is not in your PATH"
+	case "$(basename "${SHELL:-sh}")" in
+	zsh)
+		log "To add it, run:"
+		log "  echo 'export PATH=\"$dir_ref:\$PATH\"' >> ~/.zshrc"
+		log "then restart your shell."
+		;;
+	bash)
+		log "To add it, run:"
+		log "  echo 'export PATH=\"$dir_ref:\$PATH\"' >> ~/.bashrc"
+		log "then restart your shell."
+		;;
+	fish)
+		log "To add it, run:"
+		log "  fish_add_path \"$install_dir\""
+		;;
+	*)
+		log "Add it to your shell's PATH to run boo by name."
+		;;
+	esac
+	log ""
+	log "For a system-wide install instead, rerun with:"
+	log "  curl -fsSL https://raw.githubusercontent.com/coder/boo/main/install.sh | sudo BOO_INSTALL_DIR=/usr/local/bin sh"
+	;;
 esac
