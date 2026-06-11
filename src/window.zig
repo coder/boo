@@ -215,13 +215,23 @@ pub const Window = struct {
         return self.term.screens.active.dumpStringAlloc(alloc, .{ .screen = .{} });
     }
 
-    /// VT bytes that reproduce this window's full terminal state on a
+    /// VT bytes that reproduce this window's visible screen on a
     /// freshly sanitized terminal: contents, styles, cursor, and modes.
     pub fn repaint(self: *Window, alloc: std.mem.Allocator) ![]u8 {
         var raw: std.Io.Writer.Allocating = .init(alloc);
         defer raw.deinit();
 
         var formatter: vt.formatter.TerminalFormatter = .init(&self.term, .{ .emit = .vt });
+        // Repaint the visible screen only. Every canvas drops
+        // scrolled-off rows (attached clients render in the user
+        // terminal's alternate screen and ui views keep no
+        // scrollback), and the formatter always trims trailing blank
+        // rows from its dump. Including history scrolls the canvas,
+        // so whenever the screen ends in blank rows the content lands
+        // shifted up by the trimmed count and the cursor restore below
+        // points at the wrong row; every relative redraw the
+        // application makes after that corrupts the client's view.
+        formatter.content = .{ .selection = self.screenSelection() };
         formatter.extra = .{
             // Keep the client's own palette: colors are emitted as
             // palette references, not redefined.
@@ -253,6 +263,20 @@ pub const Window = struct {
         try self.writeCursorPos(&out.writer);
 
         return alloc.dupe(u8, out.writer.buffered());
+    }
+
+    /// Selection spanning the visible screen of the active terminal
+    /// screen, so a repaint excludes scrollback history. Null (the
+    /// formatter's dump-everything default) only if the pins cannot
+    /// resolve, which a sized terminal never produces.
+    fn screenSelection(self: *Window) ?vt.Selection {
+        const pages = &self.term.screens.active.pages;
+        const tl = pages.pin(.{ .active = .{ .x = 0, .y = 0 } }) orelse return null;
+        const br = pages.pin(.{ .active = .{
+            .x = self.term.cols - 1,
+            .y = self.term.rows - 1,
+        } }) orelse return null;
+        return vt.Selection.init(tl, br, false);
     }
 
     fn writeCursorPos(self: *Window, writer: *std.Io.Writer) !void {
@@ -337,6 +361,62 @@ test "window state machine without a child" {
     const repainted = out.writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, repainted, "red") != null);
     try std.testing.expect(std.mem.indexOf(u8, repainted, "\x1b[") != null);
+}
+
+test "repaint reproduces the screen once output has scrolled" {
+    // The shape every frame-based TUI leaves behind (Claude Code's
+    // idle prompt is the motivating case): output has scrolled into
+    // history, the application then redraws a short frame at the top
+    // and erases the rest, leaving trailing blank rows below the
+    // cursor. The repaint must land every row and the cursor exactly
+    // where the emulator has them, or every subsequent relative
+    // redraw by the application corrupts the client's view.
+    const alloc = std.testing.allocator;
+
+    var win: Window = .{
+        .alloc = alloc,
+        .pty_fd = -1,
+        .child_pid = -1,
+        .command_title = "test",
+        .last_output_ms = 0,
+        .term = try vt.Terminal.init(alloc, .{
+            .cols = 20,
+            .rows = 5,
+            .max_scrollback = 512 * 1024,
+        }),
+        .stream = undefined,
+    };
+    defer win.term.deinit(alloc);
+    var stream = win.term.vtStream();
+    defer stream.deinit();
+
+    // Eight lines scroll three into history, then a two-row frame
+    // is drawn and everything below it erased: the screen is
+    // L4, "boo>", and three blank rows, cursor after the "boo>".
+    stream.nextSlice("L1\r\nL2\r\nL3\r\nL4\r\nL5\r\nL6\r\nL7\r\nL8");
+    stream.nextSlice("\x1b[2;1Hboo>\x1b[0J");
+
+    const bytes = try win.repaint(alloc);
+    defer alloc.free(bytes);
+
+    // Replay on a fresh terminal of the same size, standing in for
+    // an attached client's alternate-screen canvas or a ui view.
+    var canvas = try vt.Terminal.init(alloc, .{ .cols = 20, .rows = 5 });
+    defer canvas.deinit(alloc);
+    var canvas_stream = canvas.vtStream();
+    defer canvas_stream.deinit();
+    canvas_stream.nextSlice(bytes);
+
+    const want = try win.term.plainString(alloc);
+    defer alloc.free(want);
+    const got = try canvas.plainString(alloc);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings(want, got);
+
+    const want_cursor = win.term.screens.active.cursor;
+    const got_cursor = canvas.screens.active.cursor;
+    try std.testing.expectEqual(want_cursor.y, got_cursor.y);
+    try std.testing.expectEqual(want_cursor.x, got_cursor.x);
 }
 
 test "title set via OSC is tracked and emitted sanitized" {
