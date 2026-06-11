@@ -1,5 +1,13 @@
 <div align="center">
-  <h1>boo</h1>
+<pre>
+<code>
+ _                     .-.
+| |__   ___   ___     (o o)
+| '_ \ / _ \ / _ \    | O \
+| |_) | (_) | (_) |    \   \
+|_.__/ \___/ \___/      `~~~'
+</code>
+</pre>
 
 Sessions that haunt your terminal.
 
@@ -25,72 +33,22 @@ exactly as a human would see it.
 
 ## Features
 
-- Sessions that survive disconnects: detach with `C-a d`, reattach with
-  `boo attach`.
-- A full-screen session manager: `boo ui` lists sessions in a sidebar
-  with their titles, and renders the focused one next to it. Click to
-  switch or kill sessions; drag to select and copy text (OSC 52);
-  scroll the wheel to page through a session's history; create,
-  rename, and everything else works from the keyboard.
-- One command per session, named after your current directory by
-  default. Sessions are cheap; run one per task.
-- Faithful redraws from libghostty terminal state, including SGR styles,
-  cursor position, scrolling regions, window title, and terminal modes
-  (alt screen, bracketed paste, mouse reporting, kitty keyboard, ...).
-- Screen-style terminal etiquette: the attached client renders inside
-  your terminal's alternate screen, so attaching never disturbs your
-  shell scrollback and detaching restores your pre-attach view.
-  Alternate-screen switches by apps inside a session are tracked in
-  terminal state and repainted, never passed through raw.
-- Agent-friendly automation primitives: `send`, `peek`, `wait`, and
-  `--json` output, all usable without a terminal.
-- Resize propagation end to end (SIGWINCH -> client -> daemon ->
-  PTY -> application).
+- Sessions that survive disconnects: detach with `Ctrl-A d`, reattach with `boo attach`.
+- A full-screen session manager: `boo ui` lists sessions in a sidebar.
+- Faithful redraws from libghostty terminal state, including SGR styles, cursor position, scrolling regions, window title, and terminal modes.
+- Agent-friendly automation primitives: `send`, `peek`, `wait`, and `--json` output, all usable without a TTY.
 
 ## Install
 
-### Install script
+For Linux and macOS:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/coder/boo/main/install.sh | sh
 ```
 
-Pre-built binaries for Linux (x86_64, aarch64; fully static) and macOS
-(x86_64, aarch64) are published on the
-[releases page](https://github.com/coder/boo/releases). Set
-`BOO_VERSION` to pin a release and `BOO_INSTALL_DIR` to change the
+Pre-built binaries are published on the [releases page](https://github.com/coder/boo/releases). Set `BOO_VERSION` to pin a release and `BOO_INSTALL_DIR` to change the
 install location (default: `/usr/local/bin` when writable, otherwise
 `~/.local/bin`).
-
-### Nix
-
-With [flakes](https://wiki.nixos.org/wiki/Flakes) enabled:
-
-```sh
-nix run github:coder/boo            # try it without installing
-nix profile add github:coder/boo    # install into your profile
-```
-
-Or add `github:coder/boo` as an input to your own flake and reference
-`packages.<system>.default` from your NixOS, nix-darwin, or Home
-Manager configuration.
-
-## Building
-
-Requires [Zig](https://ziglang.org) 0.15.2.
-
-```sh
-zig build                       # binary in zig-out/bin/boo
-zig build test                  # unit tests
-zig build test-integration     # end-to-end tests on a real PTY
-zig build test-all             # everything
-```
-
-The libghostty dependency is fetched and built from source
-automatically (pinned in `build.zig.zon`).
-
-With Nix, `nix develop` opens a shell with the right Zig version, and
-`nix build` builds the package to `./result/bin/boo`.
 
 ## Usage
 
@@ -100,8 +58,7 @@ boo new work               # named session
 boo new work -d -- make    # create detached, running a command
 boo ui                     # manage sessions in a full-screen UI (alias: i)
 boo ls                     # list sessions
-boo attach work            # reattach (steals if attached elsewhere)
-boo a w                    # same: alias + unique-prefix matching
+boo attach work            # reattach (alias: at, a)
 boo rename work api        # rename a session
 boo kill work              # end a session
 boo kill --all             # end every session
@@ -113,7 +70,7 @@ falling back to the process id when that name is taken or unusable.
 Run `boo help` for the full overview, `boo help <command>` for flags
 and examples, and `boo help --all` to print every help page at once.
 
-### Key bindings (prefix `C-a`)
+### Key bindings (prefix `Ctrl-a`)
 
 Bindings follow GNU screen's defaults, including the `C-x` variants
 (`C-a C-d` detaches just like `C-a d`).
@@ -124,15 +81,9 @@ Bindings follow GNU screen's defaults, including the `C-x` variants
 | `C-a l`, `C-a C-l` | redraw                     |
 | `C-a a`   | send a literal `C-a`                |
 
-`boo ui` adds bindings for switching (`C-a n`/`C-a p`/`C-a C-a`),
-browsing the list without attaching (`C-a Up`/`C-a Down`, then
-`Enter` to attach or `Esc` to cancel), resizing the sidebar
-(`C-a Left`/`C-a Right`, then `Enter` to keep or `Esc` to cancel),
-creating (`C-a c`), killing (`C-a k`), and renaming (`C-a r`)
-sessions, and going to a session by name (`C-a g`); pressing `C-a`
-alone lists them in the bottom bar. See `boo help ui`.
+`boo ui` adds additional keybinds for switching, resizing, creating sessions, and killing them.
 
-## Automation
+### Automation
 
 Everything except `attach` works without a terminal, which makes boo a
 natural sandbox for scripts and AI agents driving interactive programs.
@@ -164,11 +115,22 @@ boo kill build                         # 5. clean up
 
 See `boo help automation` for the full page.
 
-### Environment
+## Contributing
 
-- `BOO_DIR`: socket directory (default `$XDG_RUNTIME_DIR/boo`, else
-  `/tmp/boo-<uid>`).
-- `BOO_LOG`: daemon log file (daemon logging is otherwise discarded).
+Requires [Zig](https://ziglang.org) 0.15.2.
+
+```sh
+zig build                       # binary in zig-out/bin/boo
+zig build test                  # unit tests
+zig build test-integration     # end-to-end tests on a real PTY
+zig build test-all             # everything
+```
+
+The libghostty dependency is fetched and built from source
+automatically (pinned in `build.zig.zon`).
+
+With Nix, `nix develop` opens a shell with the right Zig version, and
+`nix build` builds the package to `./result/bin/boo`.
 
 ## Architecture
 
@@ -199,7 +161,6 @@ This is a young project, not a drop-in GNU screen replacement:
 - The `C-a` prefix is not yet configurable, and pasted bytes containing
   `0x01` are interpreted as the prefix (GNU screen has the same quirk;
   `boo ui` is immune thanks to bracketed paste).
-- No status line, monitoring, or copy mode yet.
 - Sessions run with `TERM=xterm-256color`.
 
 ## Support
@@ -209,19 +170,6 @@ if you have questions, run into bugs, or have a feature request.
 
 [Join the Coder Discord](https://discord.gg/coder) to chat with the
 community.
-
-## Contributing
-
-Contributions are welcome:
-
-1. Fork and clone the repository.
-2. Make your change and cover it with tests.
-3. Run `zig build test-all` and
-   `zig fmt build.zig build.zig.zon src test`.
-4. Open a pull request against `main`.
-
-CI runs formatting checks, unit tests, and PTY integration tests on
-Linux and macOS, plus a Nix build.
 
 ## License
 
