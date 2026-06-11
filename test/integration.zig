@@ -1150,7 +1150,6 @@ test "ui: sidebar lists sessions and the focused session renders in the viewport
     defer ui.deinit();
     try ui.waitFor("aa");
     try ui.waitFor("bb");
-    try ui.waitFor("+ new session");
     try ui.waitFor("BB-VIEW-MARK");
 
     // The UI renders on the alternate screen, like attach.
@@ -1174,7 +1173,7 @@ test "ui: dragging in the viewport selects text and copies it via osc 52" {
 
     var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
     defer ui.deinit();
-    try ui.waitFor("+ new session");
+    try ui.waitFor("cp");
 
     // The echoed line lands on the session's first row, rendered at
     // screen row 1 starting at column 26 (24-column sidebar plus the
@@ -1229,7 +1228,7 @@ test "ui: a row touching the viewport's right edge keeps its last cell" {
 
     var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
     defer ui.deinit();
-    try ui.waitFor("+ new session");
+    try ui.waitFor("edge");
 
     // Paint a marker whose final cell sits in the session's last
     // column (75 wide inside a 100-column UI), which lands in the
@@ -1252,12 +1251,8 @@ test "ui: a row touching the viewport's right edge keeps its last cell" {
     defer alloc.free(screen);
     try std.testing.expect(std.mem.indexOf(u8, screen, "EDGEZ") != null);
 
-    // The sidebar separates the new-session button from the first
-    // session row with a blank gap row.
+    // The session list starts on the first sidebar row.
     var lines = std.mem.splitScalar(u8, screen, '\n');
-    _ = lines.next(); // button row
-    const gap = lines.next().?;
-    try std.testing.expect(std.mem.startsWith(u8, gap, " " ** 24 ++ "\u{2502}"));
     const first = lines.next().?;
     try std.testing.expect(std.mem.indexOf(u8, first, "edge") != null);
 }
@@ -1301,11 +1296,11 @@ test "ui: clicking a session in the sidebar focuses it" {
     defer ui.deinit();
     try ui.waitFor("TWO-MARK"); // most recent session focused
 
-    // Sessions are sorted by name: "one" on sidebar row 3 (1-based,
-    // under the button and its gap row). An SGR press + release on
-    // that row switches the viewport.
+    // Sessions are sorted by name: "one" on sidebar row 1 (1-based,
+    // top of the list). An SGR press + release on that row switches
+    // the viewport.
     ui.clearOutput();
-    try ui.send("\x1b[<0;5;3M\x1b[<0;5;3m");
+    try ui.send("\x1b[<0;5;1M\x1b[<0;5;1m");
     try ui.waitFor("ONE-MARK");
 }
 
@@ -1321,10 +1316,9 @@ test "ui: create and kill sessions from the ui" {
     defer ui.deinit();
     try ui.waitFor("keep2");
 
-    // Clicking '+ new session' (the top sidebar row) creates a
-    // session (named after the cwd or the creating pid) and focuses
-    // it.
-    try ui.send("\x1b[<0;5;1M\x1b[<0;5;1m");
+    // C-a c creates a session (named after the cwd or the creating
+    // pid) and focuses it.
+    try ui.send("\x01c");
     try waitUiSessionCount(&h, 3);
 
     // C-a k asks for confirmation, then kills the focused (new)
@@ -1354,8 +1348,8 @@ test "ui: clicking the kill target asks for confirmation" {
     try ui.waitFor("victim");
 
     // The kill target is the 'x' in the second-to-last sidebar
-    // column (sidebar width 24 -> 1-based column 23), row 3.
-    try ui.send("\x1b[<0;23;3M\x1b[<0;23;3m");
+    // column (sidebar width 24 -> 1-based column 23), row 1.
+    try ui.send("\x1b[<0;23;1M\x1b[<0;23;1m");
     try ui.waitFor("kill victim? y/n");
     try ui.send("y");
     try waitUiSessionCount(&h, 0);
@@ -1374,9 +1368,9 @@ test "ui: killing the focused session moves focus to the next one" {
     defer ui.deinit();
     try ui.waitFor("stay");
 
-    // Focus "doomed" (first alphabetically, sidebar row 3) so its
+    // Focus "doomed" (first alphabetically, sidebar row 1) so its
     // death has somewhere to fall back to.
-    try ui.send("\x1b[<0;5;3M\x1b[<0;5;3m");
+    try ui.send("\x1b[<0;5;1M\x1b[<0;5;1m");
     try h.sendLine("doomed", "DOOM-MARK");
     try ui.waitFor("DOOM-MARK");
 
@@ -1517,7 +1511,7 @@ test "ui: a plain attach steals the focused session" {
     try ui.waitFor("attached elsewhere");
 
     // Clicking the session in the sidebar steals it back.
-    try ui.send("\x1b[<0;5;3M\x1b[<0;5;3m");
+    try ui.send("\x1b[<0;5;1M\x1b[<0;5;1m");
     try thief.waitFor("attached elsewhere");
     _ = try thief.waitExit();
 }
@@ -1931,7 +1925,7 @@ test "ui: wheel scrolls primary-screen scrollback" {
 
     var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
     defer ui.deinit();
-    try ui.waitFor("+ new session");
+    try ui.waitFor("scrolly");
 
     // Stream enough lines through cat that the earliest ones scroll
     // off the 24-row screen into the view's scrollback.

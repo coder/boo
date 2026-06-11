@@ -65,10 +65,6 @@ pub const Layout = struct {
     /// Each session occupies two sidebar rows: name and title.
     pub const entry_rows: u16 = 2;
 
-    /// Sidebar rows above the session list: the new-session button
-    /// and a separating blank row.
-    pub const list_top: u16 = 2;
-
     pub fn init(rows: u16, cols: u16) Layout {
         // Narrow terminals get a proportionally smaller sidebar; the
         // viewport keeps at least a sliver so the focused session
@@ -92,11 +88,10 @@ pub const Layout = struct {
         return self.sidebar_w + 1;
     }
 
-    /// Sidebar rows available for session entries between the
-    /// new-session button (plus its gap row) and the keybind hint
-    /// on the bottom row.
+    /// Sidebar rows available for session entries: everything above
+    /// the keybind hint on the bottom row.
     pub fn listRows(self: Layout) u16 {
-        return self.rows -| (list_top + 1);
+        return self.rows -| 1;
     }
 
     /// Whole session entries that fit in the list area.
@@ -108,7 +103,6 @@ pub const Layout = struct {
         /// Display row within the visible session list (entry_rows
         /// rows per session; scroll applied by the caller).
         session: struct { row: u16, kill: bool },
-        new_button,
         viewport: struct { x: u16, y: u16 },
         none,
     };
@@ -122,10 +116,8 @@ pub const Layout = struct {
         }
         if (x >= self.sidebar_w) return .none; // separator column
         if (y == self.rows -| 1) return .none; // keybind hint row
-        if (y == 0) return .new_button;
-        if (y < list_top) return .none; // gap under the button
         return .{ .session = .{
-            .row = y - list_top,
+            .row = y,
             .kill = self.sidebar_w >= 12 and x == self.sidebar_w - 2,
         } };
     }
@@ -1248,10 +1240,6 @@ const Ui = struct {
                     return;
                 }
                 self.focusIndex(idx);
-            },
-            .new_button => {
-                if (m.release or m.isMotion()) return;
-                self.createSession();
             },
             else => {},
         }
@@ -2377,24 +2365,11 @@ const Ui = struct {
             try out.appendSlice(alloc, sgr_reset);
             return;
         }
-        if (y == 0) {
-            try out.appendSlice(alloc, style_dim);
-            try appendClipped(alloc, out, " + new session", w);
-            try out.appendSlice(alloc, sgr_reset);
-            return;
-        }
-        if (y < Layout.list_top) {
-            // Blank gap between the button and the session list.
-            try appendClipped(alloc, out, "", w);
-            return;
-        }
-
-        const row = y - Layout.list_top;
-        const idx = self.scroll + row / Layout.entry_rows;
+        const idx = self.scroll + y / Layout.entry_rows;
         if (idx < self.sessions.items.len) {
             const entry = self.sessions.items[idx];
             const selected = self.selected != null and self.selected.? == idx;
-            if (row % Layout.entry_rows == 0) {
+            if (y % Layout.entry_rows == 0) {
                 try appendSessionRow(alloc, out, entry, w, selected);
             } else {
                 try appendSessionTitleRow(alloc, out, entry, w, selected);
@@ -2885,13 +2860,13 @@ test "layout: geometry and hit testing" {
     try std.testing.expectEqual(@as(u16, 75), l.viewportCols());
     try std.testing.expectEqual(@as(u16, 25), l.viewportX());
     try std.testing.expectEqual(@as(u16, 24), l.viewportRows());
-    try std.testing.expectEqual(@as(usize, 10), l.visibleEntries());
+    try std.testing.expectEqual(@as(usize, 11), l.visibleEntries());
 
-    // The new-session button is the top row and a blank gap sits
-    // under it. The bottom sidebar row holds the keybind hint, and
-    // the viewport extends through the last row.
-    try std.testing.expectEqual(Layout.Hit.new_button, l.hit(3, 0));
-    try std.testing.expectEqual(Layout.Hit.none, l.hit(3, 1));
+    // The session list starts on the top row. The bottom sidebar row
+    // holds the keybind hint, and the viewport extends through the
+    // last row.
+    try std.testing.expectEqual(@as(u16, 0), l.hit(3, 0).session.row);
+    try std.testing.expectEqual(@as(u16, 1), l.hit(3, 1).session.row);
     try std.testing.expectEqual(Layout.Hit.none, l.hit(3, 23));
     const bottom = l.hit(80, 23);
     try std.testing.expectEqual(@as(u16, 55), bottom.viewport.x);
@@ -2901,10 +2876,10 @@ test "layout: geometry and hit testing" {
 
     // Sessions take two display rows: name, then title.
     const s = l.hit(3, 5);
-    try std.testing.expectEqual(@as(u16, 3), s.session.row);
+    try std.testing.expectEqual(@as(u16, 5), s.session.row);
     try std.testing.expect(!s.session.kill);
     const k = l.hit(22, 4);
-    try std.testing.expectEqual(@as(u16, 2), k.session.row);
+    try std.testing.expectEqual(@as(u16, 4), k.session.row);
     try std.testing.expect(k.session.kill);
 
     const v = l.hit(30, 7);

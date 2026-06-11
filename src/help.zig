@@ -115,7 +115,6 @@ pub const commands = [_]Entry{
         \\mouse:
         \\  click a session     focus it (steals politely, like attach)
         \\  click its 'x'       kill it (asks for confirmation)
-        \\  click + new session start a session running $SHELL
         \\  scroll the sidebar  scroll the session list
         \\  wheel in viewport   scroll the session's history; wheel
         \\                      back down or press esc to return to
