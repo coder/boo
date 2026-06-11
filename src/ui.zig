@@ -1599,14 +1599,23 @@ const Ui = struct {
         } else if (self.autoFocusable()) |i| {
             self.selected = i;
             self.attachSelected();
-        } else if (self.view) |v| {
-            // No automatic candidate. A live view keeps running, but a
-            // dead one makes room for the empty state.
-            if (v.state != .live) {
-                v.destroy();
-                self.view = null;
-                if (self.view_name) |n| self.alloc.free(n);
-                self.view_name = null;
+        } else {
+            // No automatic candidate: every other session is held by
+            // some client or hosts this UI. A dead view makes room for
+            // the empty state, and selecting (without attaching) the
+            // most recent session keeps a focus target around, the
+            // same fallback startup uses.
+            if (self.view) |v| {
+                if (v.state != .live) {
+                    v.destroy();
+                    self.view = null;
+                    if (self.view_name) |n| self.alloc.free(n);
+                    self.view_name = null;
+                }
+            }
+            if (self.view == null and !self.browsing) {
+                self.selectInitial();
+                self.scrollSelectedIntoView();
             }
         }
         self.clampScroll();
@@ -1652,9 +1661,10 @@ const Ui = struct {
         return best;
     }
 
-    /// Startup fallback when every session is attached elsewhere:
-    /// select the most recently active one without attaching, so the
-    /// sidebar has a focus target but nothing is stolen.
+    /// Fallback when every session is attached elsewhere: select the
+    /// most recently active one without attaching, so the sidebar has
+    /// a focus target but nothing is stolen. Used at startup and when
+    /// the focused session goes away.
     fn selectInitial(self: *Ui) void {
         var best: ?usize = null;
         for (self.sessions.items, 0..) |entry, i| {
@@ -2405,13 +2415,16 @@ const Ui = struct {
         try out.appendSlice(alloc, "\x1b[K");
 
         const v = self.view orelse {
-            if (self.sessions.items.len == 0) {
-                try self.composeNoSessions(y, out);
-            } else if (self.selected != null and self.sessions.items[self.selected.?].attached) {
-                try self.composeEmptyRow(y, "attached elsewhere", "click the session to take it over", out);
-            } else {
-                try self.composeEmptyRow(y, "no session focused", "pick a session on the left", out);
+            if (self.selected) |i| {
+                if (self.sessions.items[i].attached) {
+                    try self.composeEmptyRow(y, "attached elsewhere", "click the session to take it over", out);
+                    return;
+                }
             }
+            // Nothing is focusable (no sessions, or only this UI's
+            // host): the splash, rather than a placard with no
+            // actionable advice.
+            try self.composeNoSessions(y, out);
             return;
         };
 
@@ -2469,7 +2482,7 @@ const Ui = struct {
         try out.appendSlice(self.alloc, sgr_reset);
     }
 
-    /// The boo wordmark and its ghost, shown when no sessions exist.
+    /// The boo wordmark and its ghost, shown when nothing is focused.
     const ghost_art = [_][]const u8{
         " _                     .-.",
         "| |__   ___   ___     (o o)",
@@ -2478,8 +2491,9 @@ const Ui = struct {
         "|_.__/ \\___/ \\___/      `~~~'",
     };
 
-    /// Empty state for a boo with no sessions at all: the wordmark
-    /// art centered as a block, then a hint underneath.
+    /// Empty state when nothing is focusable: no sessions at all, or
+    /// only ones this UI must not attach on its own. The wordmark art
+    /// centered as a block, then a hint underneath.
     fn composeNoSessions(self: *Ui, y: u16, out: *std.ArrayList(u8)) !void {
         const alloc = self.alloc;
         const l = self.layout;
@@ -2811,6 +2825,35 @@ test "ui: automatic focus skips attached sessions and prefers recent ones" {
     ui.sessions.items[0].attached = true;
     ui.sessions.items[2].attached = true;
     try std.testing.expectEqual(@as(?usize, null), ui.autoFocusable());
+}
+
+test "ui: an empty viewport shows the splash, not a placard" {
+    const alloc = std.testing.allocator;
+    var ui: Ui = .{ .alloc = alloc, .dir = "", .tty = -1 };
+    defer ui.sessions.deinit(alloc);
+    ui.layout = .init(24, 100);
+
+    var host = "host".*;
+    var no_title: [0]u8 = .{};
+    try ui.sessions.append(alloc, .{ .name = &host, .attached = true, .idle_ms = 0, .title = &no_title });
+
+    // Nothing selected (say, only this UI's host remains): the ghost
+    // splash renders instead of a "no session focused" placard.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    for (0..ui.layout.viewportRows()) |y| {
+        try ui.composeViewportCell(@intCast(y), &out);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "(o o)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "no session focused") == null);
+
+    // A selected session held by another client keeps its hint.
+    ui.selected = 0;
+    out.clearRetainingCapacity();
+    for (0..ui.layout.viewportRows()) |y| {
+        try ui.composeViewportCell(@intCast(y), &out);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "attached elsewhere") != null);
 }
 
 test "ui: search matches prefer name prefixes over substrings" {
