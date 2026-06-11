@@ -730,10 +730,10 @@ const Ui = struct {
     rename_input: ?std.ArrayList(u8) = null,
     /// Session index being renamed while the prompt is open.
     rename_target: usize = 0,
-    /// Search input buffer; non-null while the search prompt is open.
-    search_input: ?std.ArrayList(u8) = null,
-    /// Selection to restore when the search prompt is cancelled.
-    search_origin: ?usize = null,
+    /// Goto input buffer; non-null while the goto prompt is open.
+    goto_input: ?std.ArrayList(u8) = null,
+    /// Selection to restore when the goto prompt is cancelled.
+    goto_origin: ?usize = null,
     /// Sidebar browse: armed by C-a Up/Down (or plain arrows when
     /// nothing live is focused). The selection moves without
     /// attaching; Enter attaches it, Esc snaps it back to the
@@ -785,7 +785,7 @@ const Ui = struct {
         if (self.last_name) |n| self.alloc.free(n);
         if (self.view_name) |n| self.alloc.free(n);
         if (self.rename_input) |*input| input.deinit(self.alloc);
-        if (self.search_input) |*input| input.deinit(self.alloc);
+        if (self.goto_input) |*input| input.deinit(self.alloc);
         self.message.deinit(self.alloc);
         for (self.row_cache.items) |*row| row.deinit(self.alloc);
         self.row_cache.deinit(self.alloc);
@@ -945,9 +945,9 @@ const Ui = struct {
             if (self.handleRenameEvent(ev)) return;
         }
 
-        // An open search prompt captures keyboard input.
-        if (self.search_input != null) {
-            if (self.handleSearchEvent(ev)) return;
+        // An open goto prompt captures keyboard input.
+        if (self.goto_input != null) {
+            if (self.handleGotoEvent(ev)) return;
         }
 
         // A pending kill confirmation swallows the next key.
@@ -1093,27 +1093,27 @@ const Ui = struct {
         }
     }
 
-    /// Input while the search prompt is open edits the query; the
+    /// Input while the goto prompt is open edits the query; the
     /// sidebar selection follows the best match live. Returns true
     /// when the event was consumed.
-    fn handleSearchEvent(self: *Ui, ev: InputEvent) bool {
-        const input = &(self.search_input.?);
+    fn handleGotoEvent(self: *Ui, ev: InputEvent) bool {
+        const input = &(self.goto_input.?);
         switch (ev) {
             .forward => |bytes| {
                 // A bare escape cancels; longer escape sequences
                 // (arrow keys and friends) are ignored.
                 if (bytes.len > 0 and bytes[0] == 0x1b) {
-                    if (bytes.len == 1) self.cancelSearch();
+                    if (bytes.len == 1) self.cancelGoto();
                     return true;
                 }
                 for (bytes) |byte| switch (byte) {
                     '\r', '\n' => {
-                        self.commitSearch();
+                        self.commitGoto();
                         return true;
                     },
                     0x7f, 0x08 => _ = input.pop(),
                     0x03 => {
-                        self.cancelSearch();
+                        self.cancelGoto();
                         return true;
                     },
                     else => {
@@ -1124,7 +1124,7 @@ const Ui = struct {
                         }
                     },
                 };
-                if (self.searchMatch(input.items)) |idx| {
+                if (self.gotoMatch(input.items)) |idx| {
                     self.selected = idx;
                     self.scrollSelectedIntoView();
                 }
@@ -1132,12 +1132,12 @@ const Ui = struct {
                 return true;
             },
             .prefix => {
-                self.cancelSearch();
+                self.cancelGoto();
                 return true;
             },
             .mouse => |m| {
                 if (!m.release and !m.isMotion() and !m.isWheel()) {
-                    self.cancelSearch();
+                    self.cancelGoto();
                 }
                 return true;
             },
@@ -1150,7 +1150,7 @@ const Ui = struct {
             'c', 0x03 => self.createSession(),
             'k', 0x0b => self.confirmKill(),
             'r', 0x12 => self.startRename(),
-            's', 0x13 => self.startSearch(),
+            'g', 0x07 => self.startGoto(),
             'd', 0x04, 'q' => self.quitting = true,
             'n', 0x0e => self.focusOffset(1),
             'p', 0x10 => self.focusOffset(-1),
@@ -1812,7 +1812,7 @@ const Ui = struct {
     }
 
     /// Drop the browse and snap the selection back to the focused
-    /// session, mirroring how a cancelled search restores its origin.
+    /// session, mirroring how a cancelled goto restores its origin.
     fn cancelBrowse(self: *Ui) void {
         self.browsing = false;
         if (self.view_name) |want| {
@@ -2055,7 +2055,7 @@ const Ui = struct {
     /// First session whose name starts with `query`, else the first
     /// whose name contains it; case-insensitive. Null for an empty
     /// query or no match.
-    fn searchMatch(self: *Ui, query: []const u8) ?usize {
+    fn gotoMatch(self: *Ui, query: []const u8) ?usize {
         if (query.len == 0) return null;
         var contains: ?usize = null;
         for (self.sessions.items, 0..) |entry, idx| {
@@ -2069,46 +2069,46 @@ const Ui = struct {
         return contains;
     }
 
-    fn startSearch(self: *Ui) void {
+    fn startGoto(self: *Ui) void {
         if (self.sessions.items.len == 0) {
-            self.setMessage("no sessions to search", .{});
+            self.setMessage("no sessions to go to", .{});
             return;
         }
         self.confirm_kill = null;
-        self.search_origin = self.selected;
-        if (self.search_input) |*old| old.deinit(self.alloc);
-        self.search_input = .empty;
-        // The prompt renders from search_input; a stale transient
+        self.goto_origin = self.selected;
+        if (self.goto_input) |*old| old.deinit(self.alloc);
+        self.goto_input = .empty;
+        // The prompt renders from goto_input; a stale transient
         // message would cover it up.
         self.message.clearRetainingCapacity();
         self.message_deadline = 0;
         self.need_render = true;
     }
 
-    fn cancelSearch(self: *Ui) void {
-        if (self.search_input) |*input| input.deinit(self.alloc);
-        self.search_input = null;
+    fn cancelGoto(self: *Ui) void {
+        if (self.goto_input) |*input| input.deinit(self.alloc);
+        self.goto_input = null;
         // Put the selection back where it was before the live
         // matching moved it.
-        if (self.search_origin) |idx| {
+        if (self.goto_origin) |idx| {
             if (idx < self.sessions.items.len) {
                 self.selected = idx;
                 self.scrollSelectedIntoView();
             }
         }
-        self.search_origin = null;
-        self.setMessage("search cancelled", .{});
+        self.goto_origin = null;
+        self.setMessage("goto cancelled", .{});
     }
 
     /// Focus the best match for the typed query and close the prompt.
-    fn commitSearch(self: *Ui) void {
-        var input = self.search_input.?;
-        self.search_input = null;
+    fn commitGoto(self: *Ui) void {
+        var input = self.goto_input.?;
+        self.goto_input = null;
         defer input.deinit(self.alloc);
-        self.search_origin = null;
+        self.goto_origin = null;
         self.need_render = true;
         if (input.items.len == 0) return;
-        const idx = self.searchMatch(input.items) orelse {
+        const idx = self.gotoMatch(input.items) orelse {
             self.setMessage("no session matches '{s}'", .{input.items});
             return;
         };
@@ -2217,7 +2217,7 @@ const Ui = struct {
     fn cursorSequence(self: *Ui) CursorState {
         var state: CursorState = .{};
         if (self.renameCursor()) |s| return s;
-        if (self.searchCursor()) |s| return s;
+        if (self.gotoCursor()) |s| return s;
         const v = self.liveView() orelse return state;
         // While scrolled back the cursor coordinates belong to the
         // bottom of the screen, not the history rows on display, so
@@ -2262,12 +2262,12 @@ const Ui = struct {
         return state;
     }
 
-    /// While the search prompt is open, the cursor sits at the end
+    /// While the goto prompt is open, the cursor sits at the end
     /// of the typed query in the status bar.
-    fn searchCursor(self: *Ui) ?CursorState {
-        const input = self.search_input orelse return null;
+    fn gotoCursor(self: *Ui) ?CursorState {
+        const input = self.goto_input orelse return null;
         var state: CursorState = .{};
-        const prompt_len = " search: ".len;
+        const prompt_len = " goto: ".len;
         const col = @min(prompt_len + input.items.len + 1, self.layout.cols);
         const text = std.fmt.bufPrint(&state.pos, "\x1b[{d};{d}H", .{
             self.layout.rows,
@@ -2282,7 +2282,7 @@ const Ui = struct {
     /// open prompt, the armed-prefix keybind list, an active browse,
     /// resize, or scrollback, or a live message.
     fn statusActive(self: *Ui) bool {
-        return self.rename_input != null or self.search_input != null or
+        return self.rename_input != null or self.goto_input != null or
             self.confirm_kill != null or self.parser.pending_prefix or
             self.browsing or self.resizing or self.viewScrolled() or
             self.message.items.len > 0;
@@ -2309,7 +2309,7 @@ const Ui = struct {
     }
 
     const keybind_bar =
-        " c new  k kill  r rename  s search  n/p switch  up/dn browse  lt/rt resize  d quit  C-a last  a literal  l redraw  esc cancel";
+        " c new  k kill  r rename  g goto  n/p switch  up/dn browse  lt/rt resize  d quit  C-a last  a literal  l redraw  esc cancel";
 
     /// Status content overlaid full-width on the last screen row
     /// while present: rename prompt, kill confirmation, the keybind
@@ -2331,8 +2331,8 @@ const Ui = struct {
                     input.items,
                 });
             }
-        } else if (self.search_input) |input| {
-            try text.print(alloc, " search: {s}", .{input.items});
+        } else if (self.goto_input) |input| {
+            try text.print(alloc, " goto: {s}", .{input.items});
         } else if (self.confirm_kill) |idx| {
             if (idx < self.sessions.items.len) {
                 try text.print(alloc, " kill {s}? y/n", .{self.sessions.items[idx].name});
@@ -2831,7 +2831,7 @@ test "ui: an empty viewport shows the splash, not a placard" {
     try std.testing.expect(std.mem.indexOf(u8, out.items, "attached elsewhere") != null);
 }
 
-test "ui: search matches prefer name prefixes over substrings" {
+test "ui: goto matches prefer name prefixes over substrings" {
     const alloc = std.testing.allocator;
     var ui: Ui = .{ .alloc = alloc, .dir = "", .tty = -1 };
     defer ui.sessions.deinit(alloc);
@@ -2845,13 +2845,13 @@ test "ui: search matches prefer name prefixes over substrings" {
     try ui.sessions.append(alloc, .{ .name = &ugly, .attached = false, .idle_ms = 0, .title = &no_title });
 
     // A prefix match wins even when an earlier name contains the query.
-    try std.testing.expectEqual(@as(?usize, 2), ui.searchMatch("ug"));
+    try std.testing.expectEqual(@as(?usize, 2), ui.gotoMatch("ug"));
     // Substring fallback, case-insensitive.
-    try std.testing.expectEqual(@as(?usize, 0), ui.searchMatch("UILD"));
-    try std.testing.expectEqual(@as(?usize, 1), ui.searchMatch("deb"));
+    try std.testing.expectEqual(@as(?usize, 0), ui.gotoMatch("UILD"));
+    try std.testing.expectEqual(@as(?usize, 1), ui.gotoMatch("deb"));
     // No match and empty queries select nothing.
-    try std.testing.expectEqual(@as(?usize, null), ui.searchMatch("zzz"));
-    try std.testing.expectEqual(@as(?usize, null), ui.searchMatch(""));
+    try std.testing.expectEqual(@as(?usize, null), ui.gotoMatch("zzz"));
+    try std.testing.expectEqual(@as(?usize, null), ui.gotoMatch(""));
 }
 
 test "layout: geometry and hit testing" {

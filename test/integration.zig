@@ -1705,7 +1705,7 @@ test "ui: a single esc cancels the rename prompt" {
     try ui.waitFor("rename cancelled");
 }
 
-test "ui: C-a s searches sessions by name and focuses the match" {
+test "ui: C-a g goes to a session by name" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
     defer h.deinit();
@@ -1721,14 +1721,14 @@ test "ui: C-a s searches sessions by name and focuses the match" {
     defer ui.deinit();
     try ui.waitFor("BRAVO-MARK");
 
-    // C-a s opens the search prompt; a name prefix selects the
+    // C-a g opens the goto prompt; a name prefix selects the
     // matching session and Enter focuses it. Each step waits for
     // its echo: bytes that arrive in the same read as the
     // committing Enter would be consumed by the prompt.
-    try ui.send("\x01s");
-    try ui.waitFor(" search: ");
+    try ui.send("\x01g");
+    try ui.waitFor(" goto: ");
     try ui.send("al");
-    try ui.waitFor("search: al");
+    try ui.waitFor("goto: al");
 
     // The commit closes the prompt and the focus switch forces a
     // full repaint: the sidebar hint returning proves both.

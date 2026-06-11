@@ -98,9 +98,9 @@ Bindings follow GNU screen's defaults, including the `C-x` variants
 browsing the list without attaching (`C-a Up`/`C-a Down`, then
 `Enter` to attach or `Esc` to cancel), resizing the sidebar
 (`C-a Left`/`C-a Right`, then `Enter` to keep or `Esc` to cancel),
-creating (`C-a c`), killing (`C-a k`), renaming (`C-a r`), and
-searching (`C-a s`) sessions; pressing `C-a` alone lists them in
-the bottom bar. See `boo help ui`.
+creating (`C-a c`), killing (`C-a k`), and renaming (`C-a r`)
+sessions, and going to a session by name (`C-a g`); pressing `C-a`
+alone lists them in the bottom bar. See `boo help ui`.
 
 ## Automation
 

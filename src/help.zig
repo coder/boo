@@ -129,7 +129,7 @@ pub const commands = [_]Entry{
         \\  C-a c   create a session and focus it
         \\  C-a k   kill the focused session (asks y/n)
         \\  C-a r   rename the focused session
-        \\  C-a s   search sessions by name and focus the match
+        \\  C-a g   go to a session by name (best match)
         \\  C-a n   focus the next session
         \\  C-a p   focus the previous session
         \\  C-a Up, C-a Down
