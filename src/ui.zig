@@ -155,8 +155,8 @@ pub const InputEvent = union(enum) {
     forward: []const u8,
     /// Command key following the C-a prefix.
     prefix: u8,
-    /// Plain up/down arrow key (ESC [ A / ESC [ B). `prefixed` marks
-    /// an arrow that followed the C-a prefix.
+    /// Plain arrow key (ESC [ A/B/C/D). `prefixed` marks an arrow
+    /// that followed the C-a prefix.
     arrow: Arrow,
     mouse: Mouse,
     /// Bracketed paste begin (true) / end (false).
@@ -165,8 +165,10 @@ pub const InputEvent = union(enum) {
     focus: bool,
 
     pub const Arrow = struct {
-        up: bool,
+        dir: Dir,
         prefixed: bool,
+
+        pub const Dir = enum { up, down, left, right };
     };
 };
 
@@ -258,14 +260,14 @@ pub const InputParser = struct {
     }
 
     /// Whether `byte` keeps the held bytes a candidate for a sequence
-    /// this parser intercepts: plain arrows (ESC [ A, ESC [ B), CSI
+    /// this parser intercepts: plain arrows (ESC [ A/B/C/D), CSI
     /// mouse (ESC [ < ... M/m), focus (ESC [ I, ESC [ O), or paste
     /// markers (ESC [ 200~, ESC [ 201~).
     fn heldAccepts(self: *const InputParser, byte: u8) bool {
         const len = self.held_len;
         if (len == 1) return byte == '[';
         if (len == 2) return switch (byte) {
-            '<', 'I', 'O', '2', 'A', 'B' => true,
+            '<', 'I', 'O', '2', 'A', 'B', 'C', 'D' => true,
             else => false,
         };
         return switch (self.held[2]) {
@@ -283,7 +285,7 @@ pub const InputParser = struct {
 
     fn isCsiFinal(byte: u8) bool {
         return switch (byte) {
-            'M', 'm', '~', 'I', 'O', 'A', 'B' => true,
+            'M', 'm', '~', 'I', 'O', 'A', 'B', 'C', 'D' => true,
             else => false,
         };
     }
@@ -298,12 +300,20 @@ pub const InputParser = struct {
         // Plain arrows. heldAccepts admits the final only directly
         // after the bracket, so the body is always empty; modified
         // arrows (ESC [ 1;5 A) diverge earlier and are replayed.
-        if (final == 'A' or final == 'B') {
-            self.held_len = 0;
-            return handler.event(.{ .arrow = .{
-                .up = final == 'A',
-                .prefixed = prefixed,
-            } });
+        switch (final) {
+            'A', 'B', 'C', 'D' => {
+                self.held_len = 0;
+                return handler.event(.{ .arrow = .{
+                    .dir = switch (final) {
+                        'A' => .up,
+                        'B' => .down,
+                        'C' => .right,
+                        else => .left,
+                    },
+                    .prefixed = prefixed,
+                } });
+            },
+            else => {},
         }
 
         // Focus reports arrive as a bare final byte.
@@ -727,6 +737,14 @@ const Ui = struct {
     /// attaching; Enter attaches it, Esc snaps it back to the
     /// focused session.
     browsing: bool = false,
+    /// Sidebar resize: armed by C-a Left/Right. Arrows adjust the
+    /// width live; Enter keeps it, Esc restores the original.
+    resizing: bool = false,
+    /// Width to restore when the resize is cancelled.
+    resize_origin: u16 = 0,
+    /// Width kept by a completed resize, reapplied (clamped) when
+    /// the terminal itself resizes. Null until the first resize.
+    sidebar_pref: ?u16 = null,
     /// Transient status message and its expiry time.
     message: std.ArrayList(u8) = .empty,
     message_deadline: i64 = 0,
@@ -861,6 +879,9 @@ const Ui = struct {
     fn relayout(self: *Ui) void {
         const ws = ptypkg.getSize(self.tty) catch return;
         self.layout = .init(ws.row, ws.col);
+        if (self.sidebar_pref) |w| {
+            self.layout.sidebar_w = self.clampSidebarWidth(w);
+        }
         if (self.view) |v| {
             v.resize(self.layout.viewportRows(), self.layout.viewportCols()) catch |err| {
                 log.warn("viewport resize failed: {}", .{err});
@@ -950,23 +971,59 @@ const Ui = struct {
 
         switch (ev) {
             .forward => |bytes| {
+                if (self.resizeConsumes(bytes)) return;
                 if (self.browseConsumes(bytes)) return;
                 const v = self.liveView() orelse return;
                 v.sendInput(bytes) catch self.markViewLost();
             },
-            .prefix => |byte| try self.handlePrefix(byte),
-            .arrow => |a| {
-                // A prefixed arrow always browses; a bare one browses
-                // only while the browse is active or nothing live is
-                // focused, and belongs to the application otherwise.
-                if (a.prefixed or self.browsing or self.liveView() == null) {
-                    self.browseMove(if (a.up) -1 else 1);
-                    return;
-                }
-                const v = self.liveView() orelse return;
-                v.sendInput(if (a.up) "\x1b[A" else "\x1b[B") catch self.markViewLost();
+            .prefix => |byte| {
+                // A prefix command keeps the adjusted width, like
+                // any other key.
+                if (self.resizing) self.commitResize();
+                try self.handlePrefix(byte);
             },
-            .mouse => |m| try self.handleMouse(m),
+            .arrow => |a| switch (a.dir) {
+                .left, .right => {
+                    // A prefixed side arrow always resizes the
+                    // sidebar; a bare one resizes only while the
+                    // resize is active, and belongs to the
+                    // application otherwise.
+                    if (a.prefixed or self.resizing) {
+                        self.resizeMove(if (a.dir == .left) -1 else 1);
+                        return;
+                    }
+                    if (self.browsing) {
+                        // Like any other key, a bare side arrow
+                        // ends the browse and flows onward.
+                        self.browsing = false;
+                        self.need_render = true;
+                    }
+                    const v = self.liveView() orelse return;
+                    v.sendInput(if (a.dir == .left) "\x1b[D" else "\x1b[C") catch
+                        self.markViewLost();
+                },
+                .up, .down => {
+                    // An active resize keeps its width before the
+                    // arrow browses or forwards.
+                    if (self.resizing) self.commitResize();
+                    // A prefixed arrow always browses; a bare one browses
+                    // only while the browse is active or nothing live is
+                    // focused, and belongs to the application otherwise.
+                    if (a.prefixed or self.browsing or self.liveView() == null) {
+                        self.browseMove(if (a.dir == .up) -1 else 1);
+                        return;
+                    }
+                    const v = self.liveView() orelse return;
+                    v.sendInput(if (a.dir == .up) "\x1b[A" else "\x1b[B") catch
+                        self.markViewLost();
+                },
+            },
+            .mouse => |m| {
+                // Mouse actions may refocus or reorder everything
+                // underneath the resize; keep the adjusted width.
+                if (self.resizing) self.commitResize();
+                try self.handleMouse(m);
+            },
             .paste => |begin| {
                 const v = self.liveView() orelse return;
                 if (!v.term.modes.get(.bracketed_paste)) return;
@@ -1688,6 +1745,93 @@ const Ui = struct {
         self.need_render = true;
     }
 
+    /// Adjust the sidebar width by one column: arrow resizing, armed
+    /// by C-a Left/Right. The first move records the width to restore
+    /// on Esc. An active browse is cancelled, since the arrows now
+    /// resize instead of selecting.
+    fn resizeMove(self: *Ui, dir: i2) void {
+        if (self.browsing) self.cancelBrowse();
+        if (!self.resizing) {
+            self.resizing = true;
+            self.resize_origin = self.layout.sidebar_w;
+            // The resize hint renders on the bottom row; a stale
+            // transient message would cover it up.
+            self.message.clearRetainingCapacity();
+            self.message_deadline = 0;
+        }
+        self.applySidebarWidth(@as(i32, self.layout.sidebar_w) + dir);
+    }
+
+    /// Enter/Esc handling while the sidebar resize is active: Enter
+    /// keeps the width, a lone Esc restores the original, and any
+    /// other key keeps it and flows onward.
+    fn resizeConsumes(self: *Ui, bytes: []const u8) bool {
+        if (!self.resizing) return false;
+        if (bytes.len == 0) return false;
+        switch (bytes[0]) {
+            '\r', '\n' => {
+                self.commitResize();
+                return true;
+            },
+            0x1b => {
+                // A lone Esc cancels; longer escape sequences were
+                // already split off as arrow/mouse events upstream.
+                if (bytes.len == 1) {
+                    self.cancelResize();
+                    return true;
+                }
+                return false;
+            },
+            else => {
+                self.commitResize();
+                return false;
+            },
+        }
+    }
+
+    /// End the resize keeping the current width, and reapply it
+    /// (clamped) when the terminal itself resizes later.
+    fn commitResize(self: *Ui) void {
+        self.resizing = false;
+        self.sidebar_pref = self.layout.sidebar_w;
+        self.need_render = true;
+    }
+
+    /// Drop the resize and restore the width from before the first
+    /// arrow, mirroring how a cancelled browse restores its origin.
+    fn cancelResize(self: *Ui) void {
+        self.resizing = false;
+        self.applySidebarWidth(self.resize_origin);
+    }
+
+    /// Clamp and apply a sidebar width. The viewport shifts with it,
+    /// so the live view (and the session pty behind it) resizes and
+    /// every row repaints.
+    fn applySidebarWidth(self: *Ui, want: i32) void {
+        const w = self.clampSidebarWidth(want);
+        self.need_render = true;
+        if (w == self.layout.sidebar_w) return;
+        self.layout.sidebar_w = w;
+        if (self.view) |v| {
+            v.resize(self.layout.viewportRows(), self.layout.viewportCols()) catch |err| {
+                log.warn("viewport resize failed: {}", .{err});
+            };
+        }
+        // Cell coordinates shift with the layout, so any in-progress
+        // selection no longer points at the text the user dragged over.
+        self.select_anchor = null;
+        self.full_render = true;
+    }
+
+    /// Keep the sidebar between a usable minimum and a width that
+    /// leaves the viewport at least a sliver, like Layout.init does
+    /// for narrow terminals.
+    fn clampSidebarWidth(self: *Ui, want: i32) u16 {
+        const lo: i32 = 8;
+        const hi: i32 = @max(lo, @as(i32, self.layout.cols) - 12);
+        return @intCast(std.math.clamp(want, lo, hi));
+    }
+
     /// Create a session by re-running our own binary with `new -d`.
     /// The exec drops every inherited descriptor (they are all
     /// CLOEXEC), so the daemon cannot pin the UI's sockets open, and
@@ -2049,12 +2193,12 @@ const Ui = struct {
     }
 
     /// Whether the bottom-row status overlay has content to show: an
-    /// open prompt, the armed-prefix keybind list, an active browse,
-    /// or a live message.
+    /// open prompt, the armed-prefix keybind list, an active browse
+    /// or resize, or a live message.
     fn statusActive(self: *Ui) bool {
         return self.rename_input != null or self.search_input != null or
             self.confirm_kill != null or self.parser.pending_prefix or
-            self.browsing or self.message.items.len > 0;
+            self.browsing or self.resizing or self.message.items.len > 0;
     }
 
     /// One full screen row: sidebar columns, separator, then the
@@ -2078,7 +2222,7 @@ const Ui = struct {
     }
 
     const keybind_bar =
-        " c new  k kill  r rename  s search  n/p switch  up/dn browse  d quit  C-a last  a literal  l redraw  esc cancel";
+        " c new  k kill  r rename  s search  n/p switch  up/dn browse  lt/rt resize  d quit  C-a last  a literal  l redraw  esc cancel";
 
     /// Status content overlaid full-width on the last screen row
     /// while present: rename prompt, kill confirmation, the keybind
@@ -2110,6 +2254,8 @@ const Ui = struct {
             try text.appendSlice(alloc, keybind_bar);
         } else if (self.message.items.len > 0) {
             try text.print(alloc, " {s}", .{self.message.items});
+        } else if (self.resizing) {
+            try text.appendSlice(alloc, " left/right resize  enter done  esc cancel");
         } else if (self.browsing) {
             try text.appendSlice(alloc, " up/down select  enter attach  esc cancel");
         }
@@ -2457,12 +2603,36 @@ test "parser: plain arrows become arrow events" {
     try p.feed("\x1b[A\x1b[B", &h);
     try std.testing.expectEqual(@as(usize, 2), h.events.items.len);
     try std.testing.expectEqual(
-        InputEvent{ .arrow = .{ .up = true, .prefixed = false } },
+        InputEvent{ .arrow = .{ .dir = .up, .prefixed = false } },
         h.events.items[0],
     );
     try std.testing.expectEqual(
-        InputEvent{ .arrow = .{ .up = false, .prefixed = false } },
+        InputEvent{ .arrow = .{ .dir = .down, .prefixed = false } },
         h.events.items[1],
+    );
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+}
+
+test "parser: side arrows become arrow events" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    try p.feed("\x1b[D\x1b[C", &h);
+    try std.testing.expectEqual(@as(usize, 2), h.events.items.len);
+    try std.testing.expectEqual(
+        InputEvent{ .arrow = .{ .dir = .left, .prefixed = false } },
+        h.events.items[0],
+    );
+    try std.testing.expectEqual(
+        InputEvent{ .arrow = .{ .dir = .right, .prefixed = false } },
+        h.events.items[1],
+    );
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+    // A side arrow binds to an armed prefix like up/down do.
+    try p.feed("\x01\x1b[C", &h);
+    try std.testing.expectEqual(
+        InputEvent{ .arrow = .{ .dir = .right, .prefixed = true } },
+        h.events.items[2],
     );
     try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
 }
@@ -2474,7 +2644,7 @@ test "parser: arrows bind to an armed prefix" {
     try p.feed("\x01\x1b[B", &h);
     try std.testing.expectEqual(@as(usize, 1), h.events.items.len);
     try std.testing.expectEqual(
-        InputEvent{ .arrow = .{ .up = false, .prefixed = true } },
+        InputEvent{ .arrow = .{ .dir = .down, .prefixed = true } },
         h.events.items[0],
     );
     try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
@@ -2483,7 +2653,7 @@ test "parser: arrows bind to an armed prefix" {
     try p.feed("x\x1b[A", &h);
     try std.testing.expectEqualStrings("x", h.forwarded.items);
     try std.testing.expectEqual(
-        InputEvent{ .arrow = .{ .up = true, .prefixed = false } },
+        InputEvent{ .arrow = .{ .dir = .up, .prefixed = false } },
         h.events.items[1],
     );
 }
@@ -2496,7 +2666,7 @@ test "parser: arrow split across feeds" {
     try std.testing.expectEqual(@as(usize, 0), h.events.items.len);
     try p.feed("A", &h);
     try std.testing.expectEqual(
-        InputEvent{ .arrow = .{ .up = true, .prefixed = false } },
+        InputEvent{ .arrow = .{ .dir = .up, .prefixed = false } },
         h.events.items[0],
     );
     try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
@@ -2606,6 +2776,26 @@ test "layout: geometry and hit testing" {
     try std.testing.expectEqual(@as(u16, 7), v.viewport.y);
 
     try std.testing.expectEqual(Layout.Hit.none, l.hit(100, 5));
+}
+
+test "ui: sidebar resize clamps to the layout bounds" {
+    var ui: Ui = .{
+        .alloc = std.testing.allocator,
+        .dir = "",
+        .tty = -1,
+    };
+    ui.layout = .{ .rows = 24, .cols = 100, .sidebar_w = 24 };
+
+    // The width stays between the narrow-terminal floor and a cap
+    // that keeps the viewport usable.
+    try std.testing.expectEqual(@as(u16, 8), ui.clampSidebarWidth(0));
+    try std.testing.expectEqual(@as(u16, 8), ui.clampSidebarWidth(-5));
+    try std.testing.expectEqual(@as(u16, 30), ui.clampSidebarWidth(30));
+    try std.testing.expectEqual(@as(u16, 88), ui.clampSidebarWidth(999));
+
+    // Tiny terminals collapse the range to the floor.
+    ui.layout.cols = 15;
+    try std.testing.expectEqual(@as(u16, 8), ui.clampSidebarWidth(999));
 }
 
 test "layout: narrow terminals shrink the sidebar" {

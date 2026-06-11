@@ -133,6 +133,9 @@ pub const commands = [_]Entry{
         \\          browse the session list without attaching:
         \\          Up/Down move the selection, Enter attaches it,
         \\          Esc returns to the focused session
+        \\  C-a Left, C-a Right
+        \\          resize the sidebar: Left/Right adjust the width,
+        \\          Enter keeps it, Esc restores the previous width
         \\  C-a C-a focus the previously focused session
         \\  C-a d   quit the UI (sessions keep running)
         \\  C-a l   redraw

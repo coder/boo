@@ -95,9 +95,11 @@ Bindings follow GNU screen's defaults, including the `C-x` variants
 
 `boo ui` adds bindings for switching (`C-a n`/`C-a p`/`C-a C-a`),
 browsing the list without attaching (`C-a Up`/`C-a Down`, then
-`Enter` to attach or `Esc` to cancel), creating (`C-a c`), killing
-(`C-a k`), renaming (`C-a r`), and searching (`C-a s`) sessions;
-pressing `C-a` alone lists them in the bottom bar. See `boo help ui`.
+`Enter` to attach or `Esc` to cancel), resizing the sidebar
+(`C-a Left`/`C-a Right`, then `Enter` to keep or `Esc` to cancel),
+creating (`C-a c`), killing (`C-a k`), renaming (`C-a r`), and
+searching (`C-a s`) sessions; pressing `C-a` alone lists them in
+the bottom bar. See `boo help ui`.
 
 ## Automation
 

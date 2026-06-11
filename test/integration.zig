@@ -1573,26 +1573,27 @@ test "ui: the keybind bar overlays the bottom row and C-a r renames" {
 
     try h.startDetached("oldname", &.{"cat"});
 
-    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 120);
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 132);
     defer ui.deinit();
     try ui.waitFor("oldname");
 
     // The keybind hint sits in the sidebar's bottom row and the
     // separator runs through the last row: no reserved status bar.
-    try waitLastRow(alloc, &ui, 24, 120, &.{ "Keybinds: Ctrl+A", "\u{2502}" }, &.{});
+    try waitLastRow(alloc, &ui, 24, 132, &.{ "Keybinds: Ctrl+A", "\u{2502}" }, &.{});
 
     // Arming the prefix overlays the keybind list across the whole
     // bottom row, covering the sidebar hint and the separator.
     try ui.send("\x01");
     try ui.waitFor("r rename");
     try ui.waitFor("up/dn browse");
+    try ui.waitFor("lt/rt resize");
     try ui.waitFor("esc cancel");
-    try waitLastRow(alloc, &ui, 24, 120, &.{"r rename"}, &.{"\u{2502}"});
+    try waitLastRow(alloc, &ui, 24, 132, &.{"r rename"}, &.{"\u{2502}"});
 
     // Esc backs out: the overlay reverts to the hint, the separator,
     // and whatever the viewport had underneath.
     try ui.send("\x1b");
-    try waitLastRow(alloc, &ui, 24, 120, &.{ "Keybinds: Ctrl+A", "\u{2502}" }, &.{"r rename"});
+    try waitLastRow(alloc, &ui, 24, 132, &.{ "Keybinds: Ctrl+A", "\u{2502}" }, &.{"r rename"});
 
     // C-a r opens the prompt pre-filled with the old name; erase it
     // and type a new one.
@@ -1771,6 +1772,76 @@ test "ui: enter attaches the selection when nothing is focused" {
     const peeked = try h.waitPeekContains("one", "ONE-TYPED-MARK");
     defer alloc.free(peeked);
     try std.testing.expect(std.mem.indexOf(u8, holder2.output.items, "attached elsewhere") == null);
+}
+
+test "ui: C-a side arrows resize the sidebar" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("resized", &.{"cat"});
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("resized");
+
+    // Focusing the session sizes its pty to the viewport: 100
+    // columns minus the 24-column sidebar and the separator.
+    try waitPeekSize(&h, "resized", 24, 75);
+
+    // C-a Right grows the sidebar one column (shrinking the
+    // viewport) and shows the resize hint on the bottom row.
+    try ui.send("\x01\x1b[C");
+    try ui.waitFor("left/right resize");
+    try waitPeekSize(&h, "resized", 24, 74);
+
+    // Bare side arrows keep adjusting while the resize is active.
+    ui.clearOutput();
+    try ui.send("\x1b[C\x1b[C");
+    try ui.waitFor("left/right resize");
+    try waitPeekSize(&h, "resized", 24, 72);
+
+    // Esc restores the width from before the resize; the sidebar
+    // hint returning proves the overlay cleared.
+    ui.clearOutput();
+    try ui.send("\x1b");
+    try ui.waitFor("Keybinds: Ctrl+A");
+    try waitPeekSize(&h, "resized", 24, 75);
+
+    // C-a Left shrinks the sidebar; Enter keeps the width and ends
+    // the resize.
+    ui.clearOutput();
+    try ui.send("\x01\x1b[D");
+    try ui.waitFor("left/right resize");
+    try waitPeekSize(&h, "resized", 24, 76);
+    ui.clearOutput();
+    try ui.send("\r");
+    try ui.waitFor("Keybinds: Ctrl+A");
+
+    // The resize ended: a bare side arrow forwards to the focused
+    // application instead of adjusting. The echoed marker proves the
+    // arrow was processed, so the unchanged size is settled.
+    try ui.send("\x1b[C");
+    try ui.send("AFTER-MARK\r");
+    try ui.waitFor("AFTER-MARK");
+    const peeked = try h.waitPeekContains("resized", "AFTER-MARK");
+    alloc.free(peeked);
+    try waitPeekSize(&h, "resized", 24, 76);
+}
+
+/// Pump `peek --json` until the session reports the given pty size.
+fn waitPeekSize(h: *Harness, name: []const u8, rows: u16, cols: u16) !void {
+    var buf: [64]u8 = undefined;
+    const needle = try std.fmt.bufPrint(&buf, "\"rows\":{d},\"cols\":{d}", .{ rows, cols });
+    var deadline = Deadline.init(default_timeout_ms);
+    while (true) {
+        const result = try h.run(&.{ "peek", name, "--json" });
+        defer h.alloc.free(result.stdout);
+        defer h.alloc.free(result.stderr);
+        if (result.term == .Exited and result.term.Exited == 0 and
+            std.mem.indexOf(u8, result.stdout, needle) != null) return;
+        try deadline.tick("session pty size never matched");
+    }
 }
 
 test "ui: session titles render in the sidebar" {
