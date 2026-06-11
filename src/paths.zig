@@ -21,29 +21,59 @@ pub fn validateName(name: []const u8) NameError!void {
 /// $BOO_DIR, else $XDG_RUNTIME_DIR/boo, else /tmp/boo-<uid>.
 /// The directory is created with mode 0700.
 pub fn socketDir(alloc: std.mem.Allocator) ![]u8 {
-    const dir = dir: {
-        if (std.posix.getenv("BOO_DIR")) |d| {
-            if (d.len > 0) break :dir try alloc.dupe(u8, d);
-        }
-        if (std.posix.getenv("XDG_RUNTIME_DIR")) |d| {
-            if (d.len > 0) break :dir try std.fs.path.join(alloc, &.{ d, "boo" });
-        }
-        break :dir try std.fmt.allocPrint(
-            alloc,
-            "/tmp/boo-{d}",
-            .{std.c.getuid()},
-        );
-    };
-    errdefer alloc.free(dir);
+    return socketDirFrom(
+        alloc,
+        std.posix.getenv("BOO_DIR"),
+        std.posix.getenv("XDG_RUNTIME_DIR"),
+    );
+}
 
+/// The XDG runtime directory is created by the login session, never by
+/// applications. When $XDG_RUNTIME_DIR names a directory that does not
+/// exist (common on macOS, where dotfiles shared with Linux export a
+/// /run/user/<uid> path), creating it would mean writing to system
+/// directories: mkdir /run on the sealed macOS system volume fails with
+/// error.ReadOnlyFileSystem. Honor the variable only when the directory
+/// exists and the boo subdirectory is creatable inside it; otherwise
+/// fall back to /tmp/boo-<uid>. $BOO_DIR is an explicit override, so
+/// errors there stay fatal rather than being silently redirected.
+fn socketDirFrom(
+    alloc: std.mem.Allocator,
+    boo_dir: ?[]const u8,
+    runtime_dir: ?[]const u8,
+) ![]u8 {
+    if (boo_dir) |d| {
+        if (d.len > 0) {
+            const dir = try alloc.dupe(u8, d);
+            errdefer alloc.free(dir);
+            try ensureDir(dir);
+            return dir;
+        }
+    }
+    if (runtime_dir) |d| usable: {
+        if (d.len == 0) break :usable;
+        var parent = std.fs.cwd().openDir(d, .{}) catch break :usable;
+        parent.close();
+        const dir = try std.fs.path.join(alloc, &.{ d, "boo" });
+        ensureDir(dir) catch {
+            alloc.free(dir);
+            break :usable;
+        };
+        return dir;
+    }
+    const dir = try std.fmt.allocPrint(alloc, "/tmp/boo-{d}", .{std.c.getuid()});
+    errdefer alloc.free(dir);
+    try ensureDir(dir);
+    return dir;
+}
+
+fn ensureDir(dir: []const u8) !void {
     std.fs.cwd().makePath(dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
     // Best effort: sockets must not be reachable by other users.
     std.posix.fchmodat(std.posix.AT.FDCWD, dir, 0o700, 0) catch {};
-
-    return dir;
 }
 
 pub fn socketPath(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) ![]u8 {
@@ -148,4 +178,73 @@ test "socketPath" {
     const p = try socketPath(alloc, "/run/gs", "work");
     defer alloc.free(p);
     try std.testing.expectEqualStrings("/run/gs/work.sock", p);
+}
+
+test "socketDirFrom prefers BOO_DIR and creates it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const want = try std.fs.path.join(alloc, &.{ base, "override", "boo" });
+    defer alloc.free(want);
+
+    const dir = try socketDirFrom(alloc, want, null);
+    defer alloc.free(dir);
+    try std.testing.expectEqualStrings(want, dir);
+    var d = try std.fs.cwd().openDir(dir, .{});
+    d.close();
+}
+
+test "socketDirFrom uses an existing runtime dir" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const runtime = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(runtime);
+
+    const dir = try socketDirFrom(alloc, null, runtime);
+    defer alloc.free(dir);
+
+    const want = try std.fs.path.join(alloc, &.{ runtime, "boo" });
+    defer alloc.free(want);
+    try std.testing.expectEqualStrings(want, dir);
+    var d = try std.fs.cwd().openDir(dir, .{});
+    d.close();
+}
+
+test "socketDirFrom falls back when the runtime dir is unusable" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const fallback = try std.fmt.allocPrint(alloc, "/tmp/boo-{d}", .{std.c.getuid()});
+    defer alloc.free(fallback);
+
+    // Missing directory, like /run/user/<uid> on macOS. The fallback
+    // must not attempt to create the runtime dir or its parents.
+    const missing = try std.fs.path.join(alloc, &.{ base, "run", "user", "501" });
+    defer alloc.free(missing);
+    {
+        const dir = try socketDirFrom(alloc, null, missing);
+        defer alloc.free(dir);
+        try std.testing.expectEqualStrings(fallback, dir);
+        try std.testing.expectError(
+            error.FileNotFound,
+            std.fs.cwd().access(missing, .{}),
+        );
+    }
+
+    // A runtime dir that is not a directory at all.
+    try tmp.dir.writeFile(.{ .sub_path = "not-a-dir", .data = "" });
+    const file_path = try std.fs.path.join(alloc, &.{ base, "not-a-dir" });
+    defer alloc.free(file_path);
+    {
+        const dir = try socketDirFrom(alloc, null, file_path);
+        defer alloc.free(dir);
+        try std.testing.expectEqualStrings(fallback, dir);
+    }
 }
