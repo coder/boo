@@ -550,7 +550,8 @@ pub const Entry = struct {
     name: []u8,
     attached: bool,
     idle_ms: i64,
-    /// Owned by the list; sanitized to printable ASCII.
+    /// Owned by the list; control bytes are stripped by the daemon
+    /// but the title may contain any UTF-8 text.
     title: []u8,
 };
 
@@ -568,9 +569,101 @@ const sgr_reset = "\x1b[0m";
 const style_selected = "\x1b[7m";
 const style_dim = "\x1b[2m";
 
-/// Append `text` clipped to `width` columns, then pad with spaces to
-/// exactly `width`. Only printable ASCII reaches the writer, so byte
-/// count equals column count.
+/// Display width in terminal columns of one codepoint: 0 for
+/// combining and other zero-width marks, 2 for East Asian wide and
+/// fullwidth characters, 1 otherwise. A compact wcwidth-style
+/// approximation of the width table ghostty applies to session
+/// content; that table lives in ghostty's src/unicode, is generated
+/// at build time, and is not exported through the ghostty-vt
+/// module, so chrome text approximates it locally. Only sidebar and
+/// status chrome is measured here, session content renders through
+/// libghostty's formatter and never passes through this table.
+fn codepointWidth(cp: u21) u2 {
+    return switch (cp) {
+        // Zero width: combining marks, joiners, and variation
+        // selectors attach to the preceding glyph.
+        0x0300...0x036F,
+        0x1AB0...0x1AFF,
+        0x1DC0...0x1DFF,
+        0x200B...0x200F,
+        0x2060,
+        0x20D0...0x20FF,
+        0xFE00...0xFE0F,
+        0xFE20...0xFE2F,
+        0xFEFF,
+        => 0,
+        // Wide and fullwidth East Asian blocks, plus the emoji
+        // blocks terminals render wide. 0x303F (ideographic half
+        // fill space) inside the CJK range stays narrow.
+        0x1100...0x115F,
+        0x2329...0x232A,
+        0x2E80...0x303E,
+        0x3040...0xA4CF,
+        0xA960...0xA97F,
+        0xAC00...0xD7A3,
+        0xF900...0xFAFF,
+        0xFE10...0xFE19,
+        0xFE30...0xFE6F,
+        0xFF00...0xFF60,
+        0xFFE0...0xFFE6,
+        0x1F300...0x1F64F,
+        0x1F680...0x1F6FF,
+        0x1F900...0x1FAFF,
+        0x20000...0x2FFFD,
+        0x30000...0x3FFFD,
+        => 2,
+        else => 1,
+    };
+}
+
+/// Iterator yielding `text` as terminal display units: each valid
+/// printable UTF-8 sequence intact with its column width, and each
+/// control or invalid byte as a one-column '?' so damaged input
+/// stays visible without corrupting the layout.
+const DisplayUnits = struct {
+    text: []const u8,
+    i: usize = 0,
+
+    const Unit = struct {
+        bytes: []const u8,
+        width: u2,
+    };
+
+    const replaced: Unit = .{ .bytes = "?", .width = 1 };
+
+    fn next(self: *DisplayUnits) ?Unit {
+        if (self.i >= self.text.len) return null;
+        const rest = self.text[self.i..];
+        const len = std.unicode.utf8ByteSequenceLength(rest[0]) catch {
+            self.i += 1;
+            return replaced;
+        };
+        if (len > rest.len) {
+            self.i += 1;
+            return replaced;
+        }
+        const cp = std.unicode.utf8Decode(rest[0..len]) catch {
+            // Advance one byte, not the whole sequence: a valid
+            // sequence may start at the next byte.
+            self.i += 1;
+            return replaced;
+        };
+        // C0, DEL, and C1 controls never reach the writer raw; they
+        // could corrupt the row the sidebar is composing.
+        if (cp < 0x20 or cp == 0x7f or (cp >= 0x80 and cp <= 0x9f)) {
+            self.i += len;
+            return replaced;
+        }
+        self.i += len;
+        return .{ .bytes = rest[0..len], .width = codepointWidth(cp) };
+    }
+};
+
+/// Append `text` clipped to `width` display columns, then pad with
+/// spaces to exactly `width`. Valid UTF-8 passes through intact so
+/// non-ASCII titles render; control bytes and invalid sequences
+/// become '?'. A wide character that would straddle the clip
+/// boundary is dropped and its columns are padded instead.
 fn appendClipped(
     alloc: std.mem.Allocator,
     out: *std.ArrayList(u8),
@@ -578,10 +671,11 @@ fn appendClipped(
     width: usize,
 ) !void {
     var used: usize = 0;
-    for (text) |byte| {
-        if (used >= width) break;
-        try out.append(alloc, if (byte >= 0x20 and byte < 0x7f) byte else '?');
-        used += 1;
+    var units: DisplayUnits = .{ .text = text };
+    while (units.next()) |unit| {
+        if (used + unit.width > width) break;
+        try out.appendSlice(alloc, unit.bytes);
+        used += unit.width;
     }
     while (used < width) : (used += 1) try out.append(alloc, ' ');
 }
@@ -3075,6 +3169,71 @@ test "sidebar title row renders the title dim under the name" {
     const blank = out.items[style_dim.len .. out.items.len - sgr_reset.len];
     try std.testing.expectEqual(@as(usize, 24), blank.len);
     try std.testing.expectEqual(@as(usize, 0), std.mem.trim(u8, blank, " ").len);
+}
+
+test "appendClipped passes UTF-8 through and clips by display columns" {
+    const alloc = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    // Two wide characters: four columns, padded to six.
+    try appendClipped(alloc, &out, "你好", 6);
+    try std.testing.expectEqualStrings("你好  ", out.items);
+
+    // A wide character that would straddle the clip boundary is
+    // dropped and its columns padded, keeping the row exact.
+    out.clearRetainingCapacity();
+    try appendClipped(alloc, &out, "你好", 3);
+    try std.testing.expectEqualStrings("你 ", out.items);
+
+    // A combining mark is zero width: it rides along with its base
+    // character and does not consume a column.
+    out.clearRetainingCapacity();
+    try appendClipped(alloc, &out, "e\u{301}x", 2);
+    try std.testing.expectEqualStrings("e\u{301}x", out.items);
+
+    // Control bytes and invalid UTF-8 still surface as '?'.
+    out.clearRetainingCapacity();
+    try appendClipped(alloc, &out, "a\x01b\xffc", 8);
+    try std.testing.expectEqualStrings("a?b?c   ", out.items);
+}
+
+test "sidebar title row renders a Mandarin title readably" {
+    const alloc = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    var name_buf: [4]u8 = "work".*;
+    var title_buf: [12]u8 = "你好世界".*;
+    const entry: Entry = .{
+        .name = &name_buf,
+        .attached = false,
+        .idle_ms = 0,
+        .title = &title_buf,
+    };
+
+    try appendSessionTitleRow(alloc, &out, entry, 24, false);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "你好世界") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "?") == null);
+    // "  " indent + four wide chars: ten columns, padded to 24.
+    const text = out.items[style_dim.len .. out.items.len - sgr_reset.len];
+    try std.testing.expect(std.mem.endsWith(u8, text, " " ** 14));
+}
+
+test "appendTermRow preserves multi-byte UTF-8 session content" {
+    const alloc = std.testing.allocator;
+
+    var term = try vt.Terminal.init(alloc, .{ .cols = 20, .rows = 4 });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    stream.nextSlice("你好, world");
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try appendTermRow(alloc, &term, 0, &out);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "你好") != null);
 }
 
 test "appendTermRow renders styled content for one row only" {
