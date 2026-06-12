@@ -55,12 +55,16 @@ const wheel_lines = 3;
 /// status content (prompts, the keybind list, messages) overlays the
 /// last row full-width and the row repaints from session state when
 /// it clears. The viewport always reaches the right edge, so
-/// erase-to-end-of-line stays inside it.
+/// erase-to-end-of-line stays inside it. While the sidebar is hidden
+/// the viewport takes every column; sidebar_w is kept so the sidebar
+/// returns at its old width.
 pub const Layout = struct {
     rows: u16,
     cols: u16,
     /// Sidebar text columns, excluding the separator column.
     sidebar_w: u16,
+    /// The sidebar (and its separator) is not shown: C-a s.
+    hidden: bool = false,
 
     /// Each session occupies two sidebar rows: name and title.
     pub const entry_rows: u16 = 2;
@@ -74,6 +78,7 @@ pub const Layout = struct {
     }
 
     pub fn viewportCols(self: Layout) u16 {
+        if (self.hidden) return self.cols;
         return self.cols -| (self.sidebar_w + 1);
     }
 
@@ -85,6 +90,7 @@ pub const Layout = struct {
 
     /// First viewport column, 0-based.
     pub fn viewportX(self: Layout) u16 {
+        if (self.hidden) return 0;
         return self.sidebar_w + 1;
     }
 
@@ -112,6 +118,7 @@ pub const Layout = struct {
     pub fn hit(self: Layout, x: u16, y: u16) Hit {
         if (y >= self.rows or x >= self.cols) return .none;
         if (x >= self.viewportX()) {
+            // A hidden sidebar puts every cell here: viewportX is 0.
             return .{ .viewport = .{ .x = x - self.viewportX(), .y = y } };
         }
         if (x >= self.sidebar_w) return .none; // separator column
@@ -880,20 +887,13 @@ const Ui = struct {
 
     fn relayout(self: *Ui) void {
         const ws = ptypkg.getSize(self.tty) catch return;
+        const hidden = self.layout.hidden;
         self.layout = .init(ws.row, ws.col);
+        self.layout.hidden = hidden;
         if (self.sidebar_pref) |w| {
             self.layout.sidebar_w = self.clampSidebarWidth(w);
         }
-        if (self.view) |v| {
-            v.resize(self.layout.viewportRows(), self.layout.viewportCols()) catch |err| {
-                log.warn("viewport resize failed: {}", .{err});
-            };
-        }
-        // Cell coordinates shift with the layout, so any in-progress
-        // selection no longer points at the text the user dragged over.
-        self.select_anchor = null;
-        self.full_render = true;
-        self.need_render = true;
+        self.viewportChanged();
     }
 
     // -- Terminal input ------------------------------------------------------
@@ -1154,6 +1154,7 @@ const Ui = struct {
             'd', 0x04, 'q' => self.quitting = true,
             'n', 0x0e => self.focusOffset(1),
             'p', 0x10 => self.focusOffset(-1),
+            's', 0x13 => self.toggleSidebar(),
             keys.escape_byte => self.focusLast(),
             'l', 0x0c => {
                 // Re-seed the local terminal from daemon state and
@@ -1750,6 +1751,9 @@ const Ui = struct {
     fn browseMove(self: *Ui, dir: i2) void {
         const len = self.sessions.items.len;
         if (len == 0) return;
+        // A hidden sidebar would make the selection invisible: bring
+        // it back so the browse can be seen.
+        if (self.layout.hidden) self.toggleSidebar();
         self.browsing = true;
         // The browse hint renders on the bottom row; a stale
         // transient message would cover it up.
@@ -1833,6 +1837,9 @@ const Ui = struct {
     /// resize instead of selecting.
     fn resizeMove(self: *Ui, dir: i2) void {
         if (self.browsing) self.cancelBrowse();
+        // Resizing a hidden sidebar would be invisible: bring it
+        // back and let the arrows adjust it from there.
+        if (self.layout.hidden) self.toggleSidebar();
         if (!self.resizing) {
             self.resizing = true;
             self.resize_origin = self.layout.sidebar_w;
@@ -1894,13 +1901,30 @@ const Ui = struct {
         self.need_render = true;
         if (w == self.layout.sidebar_w) return;
         self.layout.sidebar_w = w;
+        self.viewportChanged();
+    }
+
+    /// Show or hide the sidebar: C-a s. The viewport takes the full
+    /// width while hidden; the width and selection are kept for when
+    /// it returns. Hiding cancels an active browse, whose selection
+    /// would be invisible.
+    fn toggleSidebar(self: *Ui) void {
+        if (!self.layout.hidden and self.browsing) self.cancelBrowse();
+        self.layout.hidden = !self.layout.hidden;
+        self.viewportChanged();
+    }
+
+    /// The viewport geometry changed: resize the live view (and the
+    /// session pty behind it) and repaint every row. Cell coordinates
+    /// shift with the layout, so any in-progress selection no longer
+    /// points at the text the user dragged over.
+    fn viewportChanged(self: *Ui) void {
+        self.need_render = true;
         if (self.view) |v| {
             v.resize(self.layout.viewportRows(), self.layout.viewportCols()) catch |err| {
                 log.warn("viewport resize failed: {}", .{err});
             };
         }
-        // Cell coordinates shift with the layout, so any in-progress
-        // selection no longer points at the text the user dragged over.
         self.select_anchor = null;
         self.full_render = true;
     }
@@ -2293,6 +2317,7 @@ const Ui = struct {
     /// sidebar_w columns so the row never bleeds into the viewport.
     /// While status content is active it overlays the last row full
     /// width; the row repaints from cached state when it clears.
+    /// A hidden sidebar leaves the whole row to the viewport.
     fn composeRow(self: *Ui, y: u16, out: *std.ArrayList(u8)) !void {
         const alloc = self.alloc;
 
@@ -2301,15 +2326,17 @@ const Ui = struct {
             try self.composeStatusRow(out);
             return;
         }
-        try self.composeSidebarCell(y, out);
-        try out.appendSlice(alloc, style_dim);
-        try out.appendSlice(alloc, "\u{2502}");
-        try out.appendSlice(alloc, sgr_reset);
+        if (!self.layout.hidden) {
+            try self.composeSidebarCell(y, out);
+            try out.appendSlice(alloc, style_dim);
+            try out.appendSlice(alloc, "\u{2502}");
+            try out.appendSlice(alloc, sgr_reset);
+        }
         try self.composeViewportCell(y, out);
     }
 
     const keybind_bar =
-        " c new  k kill  r rename  g goto  n/p switch  up/dn browse  lt/rt resize  d quit  C-a last  a literal  l redraw  esc cancel";
+        " c new  k kill  r rename  g goto  n/p switch  up/dn browse  lt/rt resize  s sidebar  d quit  C-a last  a literal  l redraw  esc cancel";
 
     /// Status content overlaid full-width on the last screen row
     /// while present: rename prompt, kill confirmation, the keybind
@@ -2907,6 +2934,81 @@ test "ui: sidebar resize clamps to the layout bounds" {
     // Tiny terminals collapse the range to the floor.
     ui.layout.cols = 15;
     try std.testing.expectEqual(@as(u16, 8), ui.clampSidebarWidth(999));
+}
+
+test "layout: hidden sidebar gives the viewport every column" {
+    var l = Layout.init(24, 100);
+    l.hidden = true;
+    try std.testing.expectEqual(@as(u16, 100), l.viewportCols());
+    try std.testing.expectEqual(@as(u16, 0), l.viewportX());
+    try std.testing.expectEqual(@as(u16, 24), l.viewportRows());
+
+    // Every cell is the viewport: the old sidebar area, the
+    // separator column, and the keybind hint row included.
+    const top = l.hit(0, 0);
+    try std.testing.expectEqual(@as(u16, 0), top.viewport.x);
+    try std.testing.expectEqual(@as(u16, 0), top.viewport.y);
+    const sep = l.hit(24, 5);
+    try std.testing.expectEqual(@as(u16, 24), sep.viewport.x);
+    const hint = l.hit(3, 23);
+    try std.testing.expectEqual(@as(u16, 3), hint.viewport.x);
+    try std.testing.expectEqual(@as(u16, 23), hint.viewport.y);
+    try std.testing.expectEqual(Layout.Hit.none, l.hit(100, 5));
+
+    // The width survives the hide for when the sidebar returns.
+    l.hidden = false;
+    try std.testing.expectEqual(@as(u16, 75), l.viewportCols());
+    try std.testing.expectEqual(@as(u16, 25), l.viewportX());
+}
+
+test "ui: sidebar toggle hides and restores, cancelling a browse" {
+    var ui: Ui = .{
+        .alloc = std.testing.allocator,
+        .dir = "",
+        .tty = -1,
+    };
+    ui.layout = .{ .rows = 24, .cols = 100, .sidebar_w = 30 };
+
+    // Hiding cancels an active browse and keeps the width.
+    ui.browsing = true;
+    ui.toggleSidebar();
+    try std.testing.expect(ui.layout.hidden);
+    try std.testing.expect(!ui.browsing);
+    try std.testing.expectEqual(@as(u16, 100), ui.layout.viewportCols());
+
+    // Showing restores the old width.
+    ui.toggleSidebar();
+    try std.testing.expect(!ui.layout.hidden);
+    try std.testing.expectEqual(@as(u16, 30), ui.layout.sidebar_w);
+    try std.testing.expectEqual(@as(u16, 69), ui.layout.viewportCols());
+}
+
+test "ui: sidebar arrows reveal a hidden sidebar" {
+    const alloc = std.testing.allocator;
+    var ui: Ui = .{ .alloc = alloc, .dir = "", .tty = -1 };
+    defer ui.sessions.deinit(alloc);
+    ui.layout = .{ .rows = 24, .cols = 100, .sidebar_w = 24, .hidden = true };
+
+    // An arrow resize un-hides the sidebar before adjusting it.
+    ui.resizeMove(1);
+    try std.testing.expect(!ui.layout.hidden);
+    try std.testing.expect(ui.resizing);
+    try std.testing.expectEqual(@as(u16, 25), ui.layout.sidebar_w);
+
+    // An arrow browse un-hides it so the selection is visible.
+    ui.resizing = false;
+    ui.layout.hidden = true;
+    var name = "work".*;
+    var no_title = "".*;
+    try ui.sessions.append(alloc, .{
+        .name = &name,
+        .attached = false,
+        .idle_ms = 0,
+        .title = &no_title,
+    });
+    ui.browseMove(1);
+    try std.testing.expect(!ui.layout.hidden);
+    try std.testing.expect(ui.browsing);
 }
 
 test "layout: narrow terminals shrink the sidebar" {

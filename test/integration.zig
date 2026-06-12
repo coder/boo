@@ -1746,6 +1746,38 @@ fn waitLastRow(
     }
 }
 
+/// Pump output until the rendered screen contains every `present`
+/// needle and none of the `absent` ones.
+fn waitScreen(
+    alloc: std.mem.Allocator,
+    ui: *PtyClient,
+    rows: u16,
+    cols: u16,
+    present: []const []const u8,
+    absent: []const []const u8,
+) !void {
+    var deadline = Deadline.init(default_timeout_ms);
+    while (true) {
+        const screen = try renderScreen(alloc, ui.output.items, rows, cols);
+        defer alloc.free(screen);
+
+        var ok = true;
+        for (present) |needle| {
+            if (std.mem.indexOf(u8, screen, needle) == null) ok = false;
+        }
+        for (absent) |needle| {
+            if (std.mem.indexOf(u8, screen, needle) != null) ok = false;
+        }
+        if (ok) return;
+
+        _ = try ui.pump(100);
+        deadline.tick("waiting for the screen") catch |err| {
+            std.debug.print("--- screen ---\n{s}\n", .{screen});
+            return err;
+        };
+    }
+}
+
 test "ui: the focused session exiting hands focus to the next one" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
@@ -1788,13 +1820,13 @@ test "ui: the keybind bar overlays the bottom row and C-a r renames" {
 
     try h.startDetached("oldname", &.{"cat"});
 
-    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 132);
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 140);
     defer ui.deinit();
     try ui.waitFor("oldname");
 
     // The keybind hint sits in the sidebar's bottom row and the
     // separator runs through the last row: no reserved status bar.
-    try waitLastRow(alloc, &ui, 24, 132, &.{ "Keybinds: Ctrl+A", "\u{2502}" }, &.{});
+    try waitLastRow(alloc, &ui, 24, 140, &.{ "Keybinds: Ctrl+A", "\u{2502}" }, &.{});
 
     // Arming the prefix overlays the keybind list across the whole
     // bottom row, covering the sidebar hint and the separator.
@@ -1803,12 +1835,12 @@ test "ui: the keybind bar overlays the bottom row and C-a r renames" {
     try ui.waitFor("up/dn browse");
     try ui.waitFor("lt/rt resize");
     try ui.waitFor("esc cancel");
-    try waitLastRow(alloc, &ui, 24, 132, &.{"r rename"}, &.{"\u{2502}"});
+    try waitLastRow(alloc, &ui, 24, 140, &.{"r rename"}, &.{"\u{2502}"});
 
     // Esc backs out: the overlay reverts to the hint, the separator,
     // and whatever the viewport had underneath.
     try ui.send("\x1b");
-    try waitLastRow(alloc, &ui, 24, 132, &.{ "Keybinds: Ctrl+A", "\u{2502}" }, &.{"r rename"});
+    try waitLastRow(alloc, &ui, 24, 140, &.{ "Keybinds: Ctrl+A", "\u{2502}" }, &.{"r rename"});
 
     // C-a r opens the prompt pre-filled with the old name; erase it
     // and type a new one.
@@ -2042,6 +2074,40 @@ test "ui: C-a side arrows resize the sidebar" {
     const peeked = try h.waitPeekContains("resized", "AFTER-MARK");
     alloc.free(peeked);
     try waitPeekSize(&h, "resized", 24, 76);
+}
+
+test "ui: C-a s hides the sidebar and brings it back" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("tucked", &.{"cat"});
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("tucked");
+    try ui.waitFor("Keybinds: Ctrl+A");
+    try waitPeekSize(&h, "tucked", 24, 75);
+
+    // C-a s hides the sidebar: the session list, the keybind hint,
+    // and the separator all leave the screen, and the viewport (with
+    // the session pty behind it) takes the full terminal width.
+    try ui.send("\x01s");
+    try waitPeekSize(&h, "tucked", 24, 100);
+    try waitScreen(alloc, &ui, 24, 100, &.{}, &.{
+        "tucked", "Keybinds: Ctrl+A", "\u{2502}",
+    });
+
+    // Typed input still reaches the focused session while hidden.
+    try ui.send("HIDDEN-MARK\r");
+    try ui.waitFor("HIDDEN-MARK");
+
+    // C-a s again brings the sidebar back at its old width.
+    try ui.send("\x01s");
+    try waitPeekSize(&h, "tucked", 24, 75);
+    try waitScreen(alloc, &ui, 24, 100, &.{
+        "tucked", "Keybinds: Ctrl+A", "\u{2502}",
+    }, &.{});
 }
 
 /// Pump `peek --json` until the session reports the given pty size.

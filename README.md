@@ -81,7 +81,7 @@ Bindings follow GNU screen's defaults, including the `C-x` variants
 | `C-a l`, `C-a C-l` | redraw                     |
 | `C-a a`   | send a literal `C-a`                |
 
-`boo ui` adds additional keybinds for switching, resizing, creating sessions, and killing them.
+`boo ui` adds additional keybinds for switching, resizing and hiding the sidebar, creating sessions, and killing them.
 
 ### Automation
 

@@ -139,6 +139,8 @@ pub const commands = [_]Entry{
         \\  C-a Left, C-a Right
         \\          resize the sidebar: Left/Right adjust the width,
         \\          Enter keeps it, Esc restores the previous width
+        \\  C-a s   show or hide the sidebar; the viewport takes the
+        \\          full width while it is hidden
         \\  C-a C-a focus the previously focused session
         \\  C-a d   quit the UI (sessions keep running)
         \\  C-a l   redraw
