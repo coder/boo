@@ -269,11 +269,14 @@ pub const Daemon = struct {
                         try h.daemon.handleKeyCommand(h.conn, cmd);
                     }
                 };
-                // When the window runs the kitty keyboard protocol,
-                // the client's terminal mirrors it and sends the
-                // prefix key CSI-u encoded.
-                const kitty = if (self.liveWindow()) |w| w.kittyKeysActive() else false;
-                try self.key_parser.feed(msg.payload, kitty, Handler{ .daemon = self, .conn = conn });
+                // When the window runs the kitty keyboard protocol
+                // or modifyOtherKeys, the client's terminal mirrors
+                // it and sends the prefix key encoded.
+                const prot: keys.Protocols = if (self.liveWindow()) |w| .{
+                    .kitty = w.kittyKeysActive(),
+                    .modify = w.modifyKeysActive(),
+                } else .{};
+                try self.key_parser.feed(msg.payload, prot, Handler{ .daemon = self, .conn = conn });
             },
 
             .resize => {

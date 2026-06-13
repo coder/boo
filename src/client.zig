@@ -77,8 +77,8 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
     try posix.tcsetattr(tty, .FLUSH, raw);
     // Set by the outcome paths below when a held C-d may still be
     // repeating; read by the deferred restore.
-    var drain_guard_ms: i64 = drain_guard_short_ms;
-    defer restoreTty(tty, saved, drain_guard_ms);
+    var eof_guard = false;
+    defer restoreTty(tty, saved, restore_sequence, eof_guard);
     try protocol.writeAll(1, enter_sequence);
 
     // Handshake with our current size.
@@ -156,7 +156,7 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
                     .detached => {
                         if (std.mem.eql(u8, msg.payload, "stolen")) return .stolen;
                         if (std.mem.eql(u8, msg.payload, "detached-eof")) {
-                            drain_guard_ms = drain_guard_eof_ms;
+                            eof_guard = true;
                         }
                         return .detached;
                     },
@@ -164,7 +164,7 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
                         // Sessions often end because the user typed
                         // C-d at the session's shell; treat the tail
                         // as EOF-dangerous.
-                        drain_guard_ms = drain_guard_eof_ms;
+                        eof_guard = true;
                         return .ended;
                     },
                     else => {},
@@ -245,15 +245,23 @@ const drain_guard_eof_ms = 800;
 const drain_tail_ms = 100;
 const drain_cap_ms = 1500;
 
-fn restoreTty(tty: posix.fd_t, saved: posix.termios, guard_ms: i64) void {
+/// Restore a raw client terminal: screen restore, input drain, then
+/// the mode switch. Shared with boo ui, whose quit has the same held
+/// command key and kitty release tail to absorb.
+pub fn restoreTty(
+    tty: posix.fd_t,
+    saved: posix.termios,
+    restore: []const u8,
+    eof_guard: bool,
+) void {
     // Screen restore first: the user sees the detach immediately, and
     // a kitty-mode terminal stops CSI-u key reporting as soon as the
     // reset reaches it, so a still-held key repeats in legacy bytes
     // that the drain below absorbs. Only then hand the tty back; the
     // FLUSH discards anything that slips in between the last drained
     // read and the mode switch.
-    protocol.writeAll(1, restore_sequence) catch {};
-    drainInput(tty, guard_ms);
+    protocol.writeAll(1, restore) catch {};
+    drainInput(tty, if (eof_guard) drain_guard_eof_ms else drain_guard_short_ms);
     posix.tcsetattr(tty, .FLUSH, saved) catch {};
 }
 

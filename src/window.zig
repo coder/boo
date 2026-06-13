@@ -205,6 +205,14 @@ pub const Window = struct {
         return self.term.screens.active.kitty_keyboard.current().int() != 0;
     }
 
+    /// Whether the application has xterm modifyOtherKeys mode 2 set.
+    /// While attached, the user's terminal mirrors this state (the
+    /// repaint's keyboard extra replays CSI > 4 ; 2 m), so the C-a
+    /// prefix may arrive as CSI 27;5;97~ on xterm-faithful terminals.
+    pub fn modifyKeysActive(self: *Window) bool {
+        return self.term.flags.modify_other_keys_2;
+    }
+
     /// Whether the application is on the alternate screen. The
     /// passthrough strips screen toggles, so clients cannot tell
     /// from the byte stream.

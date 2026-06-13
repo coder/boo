@@ -1175,6 +1175,50 @@ test "kitty keyboard apps: auto-repeated C-a still detaches" {
     try std.testing.expect(std.mem.indexOf(u8, peek.stdout, "97;5u") == null);
 }
 
+test "modifyOtherKeys apps: encoded C-a still detaches" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    var client = try PtyClient.spawn(&h, &.{ "new", "mok", "--", "bash", "--norc" }, 24, 80);
+    defer client.deinit();
+    try h.waitSessionUp("mok");
+    try client.waitFor("\x1b[H\x1b[2J"); // attach repaint
+
+    // The app enables xterm modifyOtherKeys mode 2, like vim. The
+    // passthrough mirrors it onto the client's terminal, which (on
+    // xterm-faithful terminals) then encodes Ctrl+A as CSI 27;5;97~
+    // instead of 0x01. The marker is assembled from two printf
+    // arguments so the echoed command line cannot satisfy the wait.
+    try client.send("printf '\\033[>4;2mMODIFY-%s\\n' APP; read x\r");
+    try client.waitFor("MODIFY-APP");
+    try client.waitFor("\x1b[>4;2m");
+
+    // Press C-a d the way such a terminal sends it.
+    client.clearOutput();
+    try client.send("\x1b[27;5;97~");
+    try client.send("d");
+    try client.waitFor("detached from mok");
+    try std.testing.expectEqual(@as(u32, 0), try client.waitExit());
+
+    // The keys were intercepted, not leaked into the window.
+    const peek = try h.run(&.{ "peek", "mok" });
+    defer alloc.free(peek.stdout);
+    defer alloc.free(peek.stderr);
+    try std.testing.expect(peek.term.Exited == 0);
+    try std.testing.expect(std.mem.indexOf(u8, peek.stdout, "27;5;97") == null);
+
+    // The session survives; a reattach repaint replays the mode, and
+    // the fully encoded C-a C-d variant detaches as well.
+    var second = try PtyClient.spawn(&h, &.{ "attach", "mok" }, 24, 80);
+    defer second.deinit();
+    try second.waitFor("MODIFY-APP");
+    try second.waitFor("\x1b[>4;2m");
+    try second.send("\x1b[27;5;97~\x1b[27;5;100~");
+    try second.waitFor("detached from mok");
+    try std.testing.expectEqual(@as(u32, 0), try second.waitExit());
+}
+
 test "agent loop: new, send, wait, peek, kill" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
@@ -1878,6 +1922,201 @@ test "ui: a single esc cancels the rename prompt" {
     // of waiting for the next keypress.
     try ui.send("\x1b");
     try ui.waitFor("rename cancelled");
+}
+
+test "ui: kitty keyboard state mirrors to the client terminal" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // The app enables kitty disambiguation, pops it after one byte of
+    // input, and echoes everything else visibly via cat -v.
+    try h.startDetached("kty", &.{
+        "sh", "-c",
+        "stty -echo -icanon; printf '\\033[>1u'; echo KITTY-ON; " ++
+            "head -c 1 >/dev/null; printf '\\033[<u'; echo KITTY-OFF; exec cat -v",
+    });
+    const seeded = try h.waitPeekContains("kty", "KITTY-ON");
+    alloc.free(seeded);
+
+    // The UI mirrors the focused view's kitty flags onto the real
+    // terminal, the way a plain attach's repaint does.
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("KITTY-ON");
+    try ui.waitFor("\x1b[=1;1u");
+
+    // The app popping its flags un-mirrors the terminal. The startup
+    // sequence also carries an =0 reset, so only output after the
+    // mirror counts.
+    ui.clearOutput();
+    try ui.send("x");
+    try ui.waitFor("KITTY-OFF");
+    try ui.waitFor("\x1b[=0;1u");
+}
+
+test "ui: kitty-encoded keys reach the application verbatim" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("ktf", &.{
+        "sh", "-c",
+        "stty -echo -icanon; printf '\\033[>1u'; " ++
+            "echo KITTY-ON; exec cat -v",
+    });
+    const seeded = try h.waitPeekContains("ktf", "KITTY-ON");
+    alloc.free(seeded);
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("\x1b[=1;1u");
+
+    // Shift+Enter, as a kitty-mode terminal encodes it, is the
+    // application's input and must arrive untouched (the original
+    // failure mode downgraded it to a plain Enter).
+    try ui.send("\x1b[13;2u");
+    const enter = try h.waitPeekContains("ktf", "^[[13;2u");
+    alloc.free(enter);
+
+    // The Esc key, kitty-encoded, arrives immediately; nothing eats
+    // it waiting for a second press.
+    try ui.send("\x1b[27u");
+    const esc = try h.waitPeekContains("ktf", "^[[27u");
+    alloc.free(esc);
+}
+
+test "ui: kitty-encoded C-a is the prefix, not session input" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("ktp", &.{
+        "sh", "-c",
+        "stty -echo -icanon; printf '\\033[>1u'; " ++
+            "echo KITTY-ON; exec cat -v",
+    });
+    const seeded = try h.waitPeekContains("ktp", "KITTY-ON");
+    alloc.free(seeded);
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("\x1b[=1;1u");
+
+    // C-a d the way a kitty-mode terminal sends it quits the UI.
+    try ui.send("\x1b[97;5u");
+    try ui.send("d");
+    try ui.waitFor("[boo ui closed]");
+    try std.testing.expectEqual(@as(u32, 0), try ui.waitExit());
+
+    // The keys were intercepted, not leaked into the session.
+    const peek = try h.run(&.{ "peek", "ktp" });
+    defer alloc.free(peek.stdout);
+    defer alloc.free(peek.stderr);
+    try std.testing.expect(peek.term.Exited == 0);
+    try std.testing.expect(std.mem.indexOf(u8, peek.stdout, "97;5u") == null);
+}
+
+test "ui: prompts suspend the mirrored kitty flags" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("ktg", &.{
+        "sh", "-c",
+        "stty -echo -icanon; printf '\\033[>1u'; " ++
+            "echo KITTY-ON; exec cat -v",
+    });
+    const seeded = try h.waitPeekContains("ktg", "KITTY-ON");
+    alloc.free(seeded);
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("\x1b[=1;1u");
+
+    // Opening the goto prompt drops the mirrored flags, so prompt
+    // input keeps its legacy byte encodings.
+    ui.clearOutput();
+    try ui.send("\x1b[97;5u");
+    try ui.send("g");
+    try ui.waitFor(" goto: ");
+    try ui.waitFor("\x1b[=0;1u");
+
+    // A lone ESC cancels the prompt and the mirror returns.
+    try ui.send("\x1b");
+    try ui.waitFor("goto cancelled");
+    try ui.waitFor("\x1b[=1;1u");
+}
+
+test "ui: modifyOtherKeys state mirrors to the client terminal" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // The app sets modifyOtherKeys mode 2 (vim-style), drops it after
+    // one byte of input, and echoes everything else via cat -v.
+    try h.startDetached("mdm", &.{
+        "sh", "-c",
+        "stty -echo -icanon; printf '\\033[>4;2m'; echo MODIFY-ON; " ++
+            "head -c 1 >/dev/null; printf '\\033[>4;0m'; echo MODIFY-OFF; exec cat -v",
+    });
+    const seeded = try h.waitPeekContains("mdm", "MODIFY-ON");
+    alloc.free(seeded);
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("MODIFY-ON");
+    try ui.waitFor("\x1b[>4;2m");
+
+    // A prompt suspends the mirror like it does kitty flags; the
+    // modify-encoded prefix opens it, proving the decode works while
+    // mirrored. Cancelling restores the mode.
+    ui.clearOutput();
+    try ui.send("\x1b[27;5;97~");
+    try ui.send("g");
+    try ui.waitFor(" goto: ");
+    try ui.waitFor("\x1b[>4;0m");
+    try ui.send("\x1b");
+    try ui.waitFor("goto cancelled");
+    try ui.waitFor("\x1b[>4;2m");
+
+    // The app dropping the mode un-mirrors the terminal.
+    ui.clearOutput();
+    try ui.send("x");
+    try ui.waitFor("MODIFY-OFF");
+    try ui.waitFor("\x1b[>4;0m");
+}
+
+test "ui: modify-encoded C-a is the prefix, not session input" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("mdp", &.{
+        "sh", "-c",
+        "stty -echo -icanon; printf '\\033[>4;2m'; " ++
+            "echo MODIFY-ON; exec cat -v",
+    });
+    const seeded = try h.waitPeekContains("mdp", "MODIFY-ON");
+    alloc.free(seeded);
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("\x1b[>4;2m");
+
+    // C-a d the way an xterm-faithful modifyOtherKeys terminal sends
+    // it quits the UI.
+    try ui.send("\x1b[27;5;97~");
+    try ui.send("d");
+    try ui.waitFor("[boo ui closed]");
+    try std.testing.expectEqual(@as(u32, 0), try ui.waitExit());
+
+    // The keys were intercepted, not leaked into the session.
+    const peek = try h.run(&.{ "peek", "mdp" });
+    defer alloc.free(peek.stdout);
+    defer alloc.free(peek.stderr);
+    try std.testing.expect(peek.term.Exited == 0);
+    try std.testing.expect(std.mem.indexOf(u8, peek.stdout, "27;5;97") == null);
 }
 
 test "ui: C-a g goes to a session by name" {
