@@ -68,4 +68,25 @@ pub fn build(b: *std.Build) void {
 
     test_all_step.dependOn(test_step);
     test_all_step.dependOn(integration_step);
+
+    // Benchmark: the viewport render hot path (no TTY required).
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/render.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    if (b.lazyDependency("ghostty", .{
+        .target = target,
+        .optimize = optimize,
+    })) |dep| {
+        bench_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
+    }
+    const bench_exe = b.addExecutable(.{
+        .name = "boo-bench",
+        .root_module = bench_mod,
+    });
+    const bench_run = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench", "Run the render microbenchmark");
+    bench_step.dependOn(&bench_run.step);
 }

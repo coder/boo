@@ -1444,6 +1444,44 @@ test "ui: a row touching the viewport's right edge keeps its last cell" {
     try std.testing.expect(std.mem.indexOf(u8, first, "edge") != null);
 }
 
+test "ui: scrolling output keeps the viewport in sync with the session" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("scroll", &.{"sh"});
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("scroll");
+
+    // Print far more lines than the viewport is tall so the active
+    // screen scrolls many times. Each scroll moves every visible row
+    // onto a different libghostty row, so the viewport cache must key
+    // on row identity and not reuse a stale serialization.
+    try h.sendLine("scroll", "i=1; while [ $i -le 200 ]; do echo LINE-$i; i=$((i+1)); done; echo DONE-MARK");
+    try ui.waitFor("DONE-MARK");
+
+    const screen = try renderScreen(alloc, ui.output.items, 24, 100);
+    defer alloc.free(screen);
+
+    // Every LINE-N still on screen must appear in strictly increasing
+    // order, and the newest line must have rendered. A stale reused row
+    // would put an older number out of sequence or duplicate one.
+    var prev: i64 = -1;
+    var idx: usize = 0;
+    while (std.mem.indexOfPos(u8, screen, idx, "LINE-")) |pos| {
+        var end = pos + "LINE-".len;
+        while (end < screen.len and std.ascii.isDigit(screen[end])) end += 1;
+        idx = pos + "LINE-".len;
+        if (end == idx) continue; // "LINE-$i" from the echoed command
+        const n = std.fmt.parseInt(i64, screen[idx..end], 10) catch continue;
+        try std.testing.expect(n > prev);
+        prev = n;
+    }
+    try std.testing.expectEqual(@as(i64, 200), prev);
+}
+
 test "ui: the empty state shows the ghost and the keybind hint" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);

@@ -1044,6 +1044,40 @@ pub fn run(alloc: std.mem.Allocator, dir: []const u8) !void {
     try ui.loop(pipe_fds[0]);
 }
 
+/// Cached serialization of one viewport (terminal) row, keyed on the
+/// libghostty row identity so a row that scrolls to a new position is
+/// re-serialized even when its own contents did not change.
+const ViewportRow = struct {
+    /// The bytes `appendTermRow` produced for this row last time.
+    bytes: std.ArrayList(u8) = .empty,
+    /// The page node the cached row lived in, compared by pointer
+    /// identity. Null until first serialized.
+    node: ?*const anyopaque = null,
+    /// The row offset within `node`.
+    offset: u16 = 0,
+    /// Whether `bytes`/`node`/`offset` hold a serialized row.
+    valid: bool = false,
+
+    fn deinit(self: *ViewportRow, alloc: std.mem.Allocator) void {
+        self.bytes.deinit(alloc);
+    }
+};
+
+/// Whether `entry` may be reused for the row currently at `pin` instead
+/// of re-serializing it. Reuse is safe only when a full repaint is not
+/// forced, the entry holds a serialized row, the libghostty row identity
+/// (page node and offset within it) is unchanged, and the row is not
+/// dirty. Scrolling the active screen relocates a visual row onto a
+/// different identity even while its own bytes stay clean, so the
+/// identity comparison is required and the dirty bit alone is not
+/// enough.
+fn viewportRowReusable(entry: *const ViewportRow, pin: vt.Pin, full_render: bool) bool {
+    if (full_render or !entry.valid) return false;
+    if (entry.node != @as(*const anyopaque, @ptrCast(pin.node))) return false;
+    if (entry.offset != pin.y) return false;
+    return !pin.isDirty();
+}
+
 const Ui = struct {
     alloc: std.mem.Allocator,
     dir: []const u8,
@@ -1106,6 +1140,9 @@ const Ui = struct {
     /// Per-screen-row cache of the last emitted bytes; rows that did
     /// not change are not re-sent.
     row_cache: std.ArrayList(std.ArrayList(u8)) = .empty,
+    /// Per-screen-row cache of the serialized viewport row bytes,
+    /// reused across frames when libghostty reports the row unchanged.
+    viewport_cache: std.ArrayList(ViewportRow) = .empty,
     need_render: bool = true,
     /// Force every row out on the next render (resize, C-a l).
     full_render: bool = true,
@@ -1145,6 +1182,8 @@ const Ui = struct {
         self.message.deinit(self.alloc);
         for (self.row_cache.items) |*row| row.deinit(self.alloc);
         self.row_cache.deinit(self.alloc);
+        for (self.viewport_cache.items) |*row| row.deinit(self.alloc);
+        self.viewport_cache.deinit(self.alloc);
     }
 
     // -- Main loop ---------------------------------------------------------
@@ -2617,6 +2656,15 @@ const Ui = struct {
             row.deinit(alloc);
         }
 
+        // The viewport cache tracks the same rows as the row cache.
+        while (self.viewport_cache.items.len < l.rows) {
+            try self.viewport_cache.append(alloc, .{});
+        }
+        while (self.viewport_cache.items.len > l.rows) {
+            var row = self.viewport_cache.pop() orelse break;
+            row.deinit(alloc);
+        }
+
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(alloc);
 
@@ -2637,6 +2685,10 @@ const Ui = struct {
         }
 
         const cursor = self.cursorSequence();
+
+        // The frame consumed this round's dirty bits; clear them so the
+        // next frame's viewport cache reuse reflects only new changes.
+        if (self.liveView()) |v| v.term.screens.active.pages.clearDirty();
 
         if (body.items.len == 0 and !self.full_render) {
             // Row content unchanged; the cursor may still have moved.
@@ -2828,6 +2880,41 @@ const Ui = struct {
         try appendClipped(alloc, out, "", w);
     }
 
+    /// Append the serialized bytes for viewport row `y`, reusing the
+    /// cached serialization when libghostty reports the row unchanged.
+    ///
+    /// A row is reused only when its libghostty identity (the page node
+    /// and the offset within it) is unchanged and its dirty bit is
+    /// clear. Scrolling the active screen moves a visual row onto a
+    /// different page row, changing the identity and forcing a fresh
+    /// serialization; an in-place edit sets the dirty bit. `composeFrame`
+    /// clears the dirty bits once per frame, so a clear bit means
+    /// "unchanged since the last serialization".
+    fn appendViewportRow(self: *Ui, v: *View, y: u16, out: *std.ArrayList(u8)) !void {
+        const alloc = self.alloc;
+        const screen = v.term.screens.active;
+        const pin = screen.pages.pin(.{ .viewport = .{ .x = 0, .y = y } }) orelse {
+            if (y < self.viewport_cache.items.len) {
+                self.viewport_cache.items[y].valid = false;
+            }
+            return;
+        };
+        const entry = &self.viewport_cache.items[y];
+        const node: *const anyopaque = @ptrCast(pin.node);
+
+        if (viewportRowReusable(entry, pin, self.full_render)) {
+            try out.appendSlice(alloc, entry.bytes.items);
+            return;
+        }
+
+        entry.bytes.clearRetainingCapacity();
+        try appendTermRow(alloc, &v.term, y, &entry.bytes);
+        entry.node = node;
+        entry.offset = pin.y;
+        entry.valid = true;
+        try out.appendSlice(alloc, entry.bytes.items);
+    }
+
     fn composeViewportCell(self: *Ui, y: u16, out: *std.ArrayList(u8)) !void {
         const alloc = self.alloc;
 
@@ -2864,7 +2951,7 @@ const Ui = struct {
         }
 
         if (y < v.term.rows) {
-            try appendTermRow(alloc, &v.term, y, out);
+            try self.appendViewportRow(v, y, out);
         }
         try out.appendSlice(alloc, sgr_reset);
 
@@ -2972,15 +3059,17 @@ pub fn appendTermRow(
     var formatter: vt.formatter.ScreenFormatter = .init(screen, .vt);
     formatter.content = .{ .selection = vt.Selection.init(start, end, true) };
 
-    var aw: std.Io.Writer.Allocating = .init(alloc);
-    defer aw.deinit();
-    aw.writer.print("{f}", .{formatter}) catch return error.OutOfMemory;
-
-    const bytes = aw.writer.buffered();
-    try out.appendSlice(alloc, bytes);
+    // Format straight into `out`, reusing its capacity, so a repaint
+    // does not allocate a fresh writer for every row.
+    const begin = out.items.len;
+    {
+        var aw: std.Io.Writer.Allocating = .fromArrayList(alloc, out);
+        defer out.* = aw.toArrayList();
+        aw.writer.print("{f}", .{formatter}) catch return error.OutOfMemory;
+    }
     // A row that opened a hyperlink must not leak it into the next
     // row or the sidebar.
-    if (std.mem.indexOf(u8, bytes, "\x1b]8;") != null) {
+    if (std.mem.indexOf(u8, out.items[begin..], "\x1b]8;") != null) {
         try out.appendSlice(alloc, "\x1b]8;;\x1b\\");
     }
 }
@@ -3988,4 +4077,56 @@ test "appendTermRow renders styled content for one row only" {
     out.clearRetainingCapacity();
     try appendTermRow(alloc, &term, 3, &out);
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "viewportRowReusable re-serializes a clean row that scrolled away" {
+    const alloc = std.testing.allocator;
+
+    var term = try vt.Terminal.init(alloc, .{ .cols = 20, .rows = 4 });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    stream.nextSlice("\x1b[HAAA\r\nBBB\r\nCCC\r\nDDD");
+    const screen = term.screens.active;
+
+    // Mimic a settled frame: one cache entry per viewport row, tagged
+    // with that row's libghostty identity, then clear the dirty bits.
+    var entries: [4]ViewportRow = .{ .{}, .{}, .{}, .{} };
+    defer for (&entries) |*e| e.deinit(alloc);
+    for (0..4) |y| {
+        const pin = screen.pages.pin(.{ .viewport = .{ .x = 0, .y = @intCast(y) } }).?;
+        try appendTermRow(alloc, &term, @intCast(y), &entries[y].bytes);
+        entries[y].node = @ptrCast(pin.node);
+        entries[y].offset = pin.y;
+        entries[y].valid = true;
+    }
+    screen.pages.clearDirty();
+
+    // Nothing changed: every settled row is reusable.
+    for (0..4) |y| {
+        const pin = screen.pages.pin(.{ .viewport = .{ .x = 0, .y = @intCast(y) } }).?;
+        try std.testing.expect(viewportRowReusable(&entries[y], pin, false));
+    }
+
+    // Scroll one line. The rows that moved up are not marked dirty, but
+    // they now show different content, so their stale cache entries must
+    // not be reused: clean-but-moved is exactly what the dirty bit
+    // misses and the identity check catches.
+    stream.nextSlice("\r\nEEE");
+    var clean_moved: usize = 0;
+    for (0..4) |y| {
+        const pin = screen.pages.pin(.{ .viewport = .{ .x = 0, .y = @intCast(y) } }).?;
+        if (!pin.isDirty()) {
+            clean_moved += 1;
+            try std.testing.expect(!viewportRowReusable(&entries[y], pin, false));
+        }
+    }
+    // The scroll must have produced a clean-but-moved row, or this test
+    // would not exercise the identity check at all.
+    try std.testing.expect(clean_moved > 0);
+
+    // A forced full repaint never reuses, even an unchanged row.
+    const pin0 = screen.pages.pin(.{ .viewport = .{ .x = 0, .y = 0 } }).?;
+    try std.testing.expect(!viewportRowReusable(&entries[0], pin0, true));
 }
