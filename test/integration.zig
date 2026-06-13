@@ -1458,9 +1458,11 @@ test "ui: scrolling output keeps the viewport in sync with the session" {
     // Print far more lines than the viewport is tall so the active
     // screen scrolls many times. Each scroll moves every visible row
     // onto a different libghostty row, so the viewport cache must key
-    // on row identity and not reuse a stale serialization.
-    try h.sendLine("scroll", "i=1; while [ $i -le 200 ]; do echo LINE-$i; i=$((i+1)); done; echo DONE-MARK");
-    try ui.waitFor("DONE-MARK");
+    // on row identity and not reuse a stale serialization. Wait on
+    // "LINE-200" (which the echoed command does not contain literally)
+    // so the wait cannot race the command echo.
+    try h.sendLine("scroll", "i=1; while [ $i -le 200 ]; do echo LINE-$i; i=$((i+1)); done");
+    try ui.waitFor("LINE-200");
 
     const screen = try renderScreen(alloc, ui.output.items, 24, 100);
     defer alloc.free(screen);
