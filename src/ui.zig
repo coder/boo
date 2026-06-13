@@ -173,8 +173,27 @@ pub const InputEvent = union(enum) {
     pub const Arrow = struct {
         dir: Dir,
         prefixed: bool,
+        /// The original bytes, forwarded verbatim when the arrow is
+        /// not intercepted for browse/resize, so a modified arrow or
+        /// the report-events encoding the terminal used reaches the
+        /// application intact. Empty for arrows constructed without a
+        /// source sequence; `bytes()` then falls back to the legacy
+        /// form.
+        seq: []const u8 = &.{},
 
         pub const Dir = enum { up, down, left, right };
+
+        /// Bytes to forward to the application: the original sequence
+        /// when present, else the legacy encoding of the direction.
+        pub fn bytes(self: Arrow) []const u8 {
+            if (self.seq.len > 0) return self.seq;
+            return switch (self.dir) {
+                .up => "\x1b[A",
+                .down => "\x1b[B",
+                .right => "\x1b[C",
+                .left => "\x1b[D",
+            };
+        }
     };
 };
 
@@ -292,8 +311,9 @@ pub const InputParser = struct {
     }
 
     /// Whether `byte` keeps the held bytes a candidate for a sequence
-    /// this parser handles as a unit: plain arrows (ESC [ A/B/C/D),
-    /// CSI mouse (ESC [ < ... M/m), focus (ESC [ I, ESC [ O), and
+    /// this parser handles as a unit: plain and functional arrows
+    /// (ESC [ A/B/C/D and ESC [ 1 ; mods [: event] A/B/C/D), CSI
+    /// mouse (ESC [ < ... M/m), focus (ESC [ I, ESC [ O), and
     /// parameterized keys (ESC [ <digits...> [;:] ... ~/u): paste
     /// markers, kitty CSI-u keys, modifyOtherKeys, and legacy keys
     /// that share the grammar (F5 is ESC [ 15 ~). Holding never
@@ -313,7 +333,10 @@ pub const InputParser = struct {
                 else => false,
             },
             '0'...'9' => switch (byte) {
-                '0'...'9', ';', ':', '~', 'u' => true,
+                // A/B/C/D close the functional cursor-key form
+                // (ESC [ 1 ; mods [: event] A); ~/u close paste,
+                // kitty, and modifyOtherKeys keys.
+                '0'...'9', ';', ':', '~', 'u', 'A', 'B', 'C', 'D' => true,
                 else => false,
             },
             else => false,
@@ -334,21 +357,29 @@ pub const InputParser = struct {
         const prefixed = self.prefix_held;
         self.prefix_held = false;
 
-        // Plain arrows. heldAccepts admits the final only directly
-        // after the bracket, so the body is always empty; modified
-        // arrows (ESC [ 1;5 A) diverge earlier and are replayed.
+        // Arrows. A bare ESC [ A/B/C/D directly after the bracket is
+        // an unmodified cursor key; the functional form
+        // ESC [ 1 ; mods [: event] A/B/C/D carries modifiers and, when
+        // the terminal reports event types, even an unmodified press.
+        // Only an unmodified press or repeat drives browse/resize;
+        // modified arrows (Ctrl+Left word motion) and release events
+        // are the application's input and replay verbatim.
         switch (final) {
             'A', 'B', 'C', 'D' => {
-                self.held_len = 0;
-                return handler.event(.{ .arrow = .{
-                    .dir = switch (final) {
-                        'A' => .up,
-                        'B' => .down,
-                        'C' => .right,
-                        else => .left,
-                    },
-                    .prefixed = prefixed,
-                } });
+                if (body.len == 0 or arrowNavigates(body)) {
+                    self.held_len = 0;
+                    return handler.event(.{ .arrow = .{
+                        .dir = switch (final) {
+                            'A' => .up,
+                            'B' => .down,
+                            'C' => .right,
+                            else => .left,
+                        },
+                        .prefixed = prefixed,
+                        .seq = seq,
+                    } });
+                }
+                return self.flushHeld(handler);
             },
             else => {},
         }
@@ -523,6 +554,32 @@ pub const InputParser = struct {
     fn parseField(field: ?[]const u8) ?u16 {
         const text = field orelse return null;
         return std.fmt.parseInt(u16, text, 10) catch null;
+    }
+
+    /// Whether the body of a functional cursor key
+    /// (ESC [ 1 ; mods [: event] A/B/C/D) is an unmodified press or
+    /// repeat, the only forms that drive browse/resize. A modified
+    /// arrow (mods other than none, ignoring lock bits) or a release
+    /// event belongs to the application and replays verbatim. The
+    /// leading parameter is always `1` for these keys.
+    fn arrowNavigates(body: []const u8) bool {
+        var sections = std.mem.splitScalar(u8, body, ';');
+        const first = sections.next() orelse return false;
+        if (!std.mem.eql(u8, first, "1")) return false;
+        const mods_section = sections.next() orelse return false;
+        if (sections.next() != null) return false;
+        var fields = std.mem.splitScalar(u8, mods_section, ':');
+        const mods_text = fields.next() orelse return false;
+        const mods = std.fmt.parseInt(u32, mods_text, 10) catch return false;
+        // Lock bits (caps/num) do not count as a real modifier.
+        if ((mods -| 1) & 0x3f != 0) return false;
+        if (fields.next()) |event_text| {
+            const event = std.fmt.parseInt(u32, event_text, 10) catch return false;
+            // 1 press, 2 repeat navigate; 3 release does not.
+            if (event != 1 and event != 2) return false;
+        }
+        if (fields.next() != null) return false;
+        return true;
     }
 
     /// Replay held bytes as session input: the sequence is some other
@@ -1344,8 +1401,7 @@ const Ui = struct {
                     }
                     const v = self.liveView() orelse return;
                     self.snapViewBottom();
-                    v.sendInput(if (a.dir == .left) "\x1b[D" else "\x1b[C") catch
-                        self.markViewLost();
+                    v.sendInput(a.bytes()) catch self.markViewLost();
                 },
                 .up, .down => {
                     // An active resize keeps its width before the
@@ -1360,8 +1416,7 @@ const Ui = struct {
                     }
                     const v = self.liveView() orelse return;
                     self.snapViewBottom();
-                    v.sendInput(if (a.dir == .up) "\x1b[A" else "\x1b[B") catch
-                        self.markViewLost();
+                    v.sendInput(a.bytes()) catch self.markViewLost();
                 },
             },
             .mouse => |m| {
@@ -2966,11 +3021,15 @@ const TestHandler = struct {
     /// Esc-event payload bytes, copied out (they alias the parser's
     /// hold buffer).
     escs: std.ArrayList(u8) = .empty,
+    /// Bytes of the most recent arrow event, copied out (they alias
+    /// the parser's hold buffer).
+    last_arrow_seq: std.ArrayList(u8) = .empty,
 
     fn deinit(self: *TestHandler) void {
         self.events.deinit(self.alloc);
         self.forwarded.deinit(self.alloc);
         self.escs.deinit(self.alloc);
+        self.last_arrow_seq.deinit(self.alloc);
     }
 
     fn event(self: *TestHandler, ev: InputEvent) !void {
@@ -2980,6 +3039,15 @@ const TestHandler = struct {
                 try self.forwarded.appendSlice(self.alloc, bytes);
             },
             .esc => |bytes| try self.escs.appendSlice(self.alloc, bytes),
+            .arrow => |a| {
+                // Copy the seq before storing; the slice aliases the
+                // hold buffer and is only valid during this call.
+                self.last_arrow_seq.clearRetainingCapacity();
+                try self.last_arrow_seq.appendSlice(self.alloc, a.seq);
+                var rec = a;
+                rec.seq = &.{};
+                try self.events.append(self.alloc, .{ .arrow = rec });
+            },
             else => try self.events.append(self.alloc, ev),
         }
     }
@@ -3156,6 +3224,64 @@ test "parser: arrow split across feeds" {
         h.events.items[0],
     );
     try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+}
+
+test "parser: report-events functional arrows still navigate" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    // A report-events terminal encodes even an unmodified arrow press
+    // as ESC [ 1;1:1 A. After the kitty-encoded prefix it must still
+    // drive browse/resize, the way the legacy ESC [ A did before the
+    // keyboard mirror existed.
+    try p.feed("\x1b[97;5u\x1b[1;1:1A", .{ .kitty = true }, &h);
+    try std.testing.expectEqual(@as(usize, 1), h.events.items.len);
+    try std.testing.expectEqual(
+        InputEvent{ .arrow = .{ .dir = .up, .prefixed = true } },
+        h.events.items[0],
+    );
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+    // The forms without an event subfield (ESC [ 1;1 A) and the
+    // repeat event navigate too, unprefixed.
+    try p.feed("\x1b[1;1B\x1b[1;1:2C", .{ .kitty = true }, &h);
+    try std.testing.expectEqual(@as(usize, 3), h.events.items.len);
+    try std.testing.expectEqual(
+        InputEvent{ .arrow = .{ .dir = .down, .prefixed = false } },
+        h.events.items[1],
+    );
+    try std.testing.expectEqual(
+        InputEvent{ .arrow = .{ .dir = .right, .prefixed = false } },
+        h.events.items[2],
+    );
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+}
+
+test "parser: functional arrows forward the original bytes" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    // An unprefixed functional arrow is an arrow event carrying its
+    // original bytes, so the focused application receives the exact
+    // report-events encoding rather than a downgraded legacy arrow.
+    try p.feed("\x1b[1;1:1A", .{ .kitty = true }, &h);
+    try std.testing.expectEqual(@as(usize, 1), h.events.items.len);
+    try std.testing.expectEqualStrings("\x1b[1;1:1A", h.last_arrow_seq.items);
+}
+
+test "parser: modified arrows and releases are application input" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    // Ctrl+Left (word motion) and an arrow release are the
+    // application's, not browse/resize: forwarded verbatim, never an
+    // arrow event, even right after the prefix.
+    try p.feed("\x1b[1;5D", .{ .kitty = true }, &h);
+    try std.testing.expectEqualStrings("\x1b[1;5D", h.forwarded.items);
+    try std.testing.expectEqual(@as(usize, 0), h.events.items.len);
+    h.forwarded.clearRetainingCapacity();
+    try p.feed("\x1b[1;1:3A", .{ .kitty = true }, &h);
+    try std.testing.expectEqualStrings("\x1b[1;1:3A", h.forwarded.items);
+    try std.testing.expectEqual(@as(usize, 0), h.events.items.len);
 }
 
 test "parser: bracketed paste protects the prefix byte" {

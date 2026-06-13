@@ -2218,6 +2218,47 @@ test "ui: arrow browsing selects without attaching until enter" {
     try std.testing.expect(std.mem.indexOf(u8, bravo_peek.stdout, "STILL-ALPHA-MARK") == null);
 }
 
+test "ui: report-events arrows browse after the prefix" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // A focused app on the kitty keyboard protocol: the UI mirrors
+    // it, so a report-events terminal would encode the prefix CSI-u
+    // and arrows in the functional ESC [ 1 ; mods : event form. cat -v
+    // makes any leaked bytes visible.
+    try h.startDetached("kca", &.{
+        "sh", "-c",
+        "stty -echo -icanon; printf '\\033[>1u'; " ++
+            "echo KITTY-ON; exec cat -v",
+    });
+    const seeded = try h.waitPeekContains("kca", "KITTY-ON");
+    alloc.free(seeded);
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("KITTY-ON");
+    try ui.waitFor("\x1b[=1;1u");
+
+    // C-a then Down, exactly as a report-events terminal sends them:
+    // the prefix kitty-encoded, the arrow with an explicit press
+    // event subfield. This must arm browse mode (the sidebar hint),
+    // the regression that the legacy ESC [ B handled before the
+    // keyboard mirror started re-encoding arrows.
+    ui.clearOutput();
+    try ui.send("\x1b[97;5u");
+    try ui.send("\x1b[1;1:1B");
+    try ui.waitFor("enter attach");
+
+    // Neither the prefix nor the arrow leaked into the session.
+    const peek = try h.run(&.{ "peek", "kca" });
+    defer alloc.free(peek.stdout);
+    defer alloc.free(peek.stderr);
+    try std.testing.expect(peek.term.Exited == 0);
+    try std.testing.expect(std.mem.indexOf(u8, peek.stdout, "1;1:1B") == null);
+    try std.testing.expect(std.mem.indexOf(u8, peek.stdout, "97;5u") == null);
+}
+
 test "ui: enter attaches the selection when nothing is focused" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
