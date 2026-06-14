@@ -25,11 +25,10 @@ const Tio = switch (@import("builtin").os.tag) {
         const IOCSWINSZ: c_ulong = 0x80087467;
         const IOCSCTTY: c_ulong = 0x20007461;
     },
-    .linux => struct {
-        const IOCSWINSZ: c_ulong = std.os.linux.T.IOCSWINSZ;
-        const IOCSCTTY: c_ulong = std.os.linux.T.IOCSCTTY;
+    else => struct {
+        const IOCSWINSZ: c_ulong = std.c.T.IOCSWINSZ;
+        const IOCSCTTY: c_ulong = std.c.T.IOCSCTTY;
     },
-    else => @compileError("unsupported OS"),
 };
 
 /// Per-test environment: an isolated socket directory under /tmp (kept

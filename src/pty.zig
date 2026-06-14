@@ -18,12 +18,11 @@ pub const Tio = switch (builtin.os.tag) {
         pub const IOCSWINSZ: c_ulong = 0x80087467;
         pub const IOCSCTTY: c_ulong = 0x20007461;
     },
-    .linux => struct {
-        pub const IOCGWINSZ: c_ulong = std.os.linux.T.IOCGWINSZ;
-        pub const IOCSWINSZ: c_ulong = std.os.linux.T.IOCSWINSZ;
-        pub const IOCSCTTY: c_ulong = std.os.linux.T.IOCSCTTY;
+    else => struct {
+        pub const IOCGWINSZ: c_ulong = std.c.T.IOCGWINSZ;
+        pub const IOCSWINSZ: c_ulong = std.c.T.IOCSWINSZ;
+        pub const IOCSCTTY: c_ulong = std.c.T.IOCSCTTY;
     },
-    else => @compileError("unsupported OS"),
 };
 
 pub const Winsize = std.posix.winsize;
