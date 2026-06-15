@@ -23,17 +23,25 @@ pub const overview =
     \\  boo <command> [arguments]
     \\
     \\commands:
-    \\  new [name] [-d] [-- cmd...]  start a session (attach unless -d)
-    \\  attach, at, a <name>         attach a session (steals politely)
-    \\  ui, i                        manage sessions in a full-screen UI
-    \\  ls [--json]                  list sessions
-    \\  send <name> [flags]          type into a session
-    \\  peek <name>                  print the session's screen
-    \\  wait <name>                  block until output matches or settles
-    \\  kill <name | --all>          end a session, or all of them
-    \\  rename <name> <new-name>     rename a session
-    \\  version                      print the version
-    \\  help [page]                  this overview, or detailed help
+    \\
+    \\  Session Management
+    \\    new [name] [-d] [-- cmd...]  start a session (attach unless -d)
+    \\    attach, at, a <name>         attach a session (steals politely)
+    \\    ui, i                        manage sessions in a full-screen UI
+    \\    ls [--json]                  list sessions
+    \\
+    \\  Interaction
+    \\    send <name> [flags]          type into a session
+    \\    peek <name>                  print the session's screen
+    \\    wait <name>                  block until output matches or settles
+    \\
+    \\  Administration
+    \\    kill <name | --all>          end a session, or all of them
+    \\    rename <name> <new-name>     rename a session
+    \\
+    \\  Information
+    \\    version                      print the version
+    \\    help [page]                  this overview, or detailed help
     \\
     \\Run 'boo help <command>' for flags and examples, 'boo help keys'
     \\for the key bindings inside a session, 'boo help automation' for
