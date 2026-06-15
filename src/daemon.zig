@@ -505,6 +505,11 @@ pub const Daemon = struct {
         // repainted from terminal state.
         var out_buf: [32 * 1024 + 32]u8 = undefined;
         var writer = std.Io.Writer.fixed(&out_buf);
+        // The active screen before this chunk. A switch the filter does
+        // not see (a full reset, RIS, returns to the primary screen
+        // without a 47/1047/1049 toggle) still has to repaint so the
+        // client's `.screen` state stays authoritative.
+        const was_alt = win.onAltScreen();
         const result = win.alt_filter.feed(chunk, &writer) catch
             altscreen.Filter.Result{ .switched = true, .discard_start = 0 };
 
@@ -518,9 +523,12 @@ pub const Daemon = struct {
 
         const filtered = writer.buffered();
         if (filtered.len > 0) conn.send(.output, filtered);
-        if (result.switched) {
+        // Repaint when the filter stripped a toggle, or when the active
+        // screen changed by a path the filter cannot see (e.g. RIS), so
+        // a fresh repaint and `.screen` reach the client either way.
+        if (result.switched or win.onAltScreen() != was_alt) {
             self.repaintTo(conn) catch |err| {
-                log.warn("repaint after screen switch failed: {}", .{err});
+                log.warn("repaint after screen change failed: {}", .{err});
             };
         }
     }

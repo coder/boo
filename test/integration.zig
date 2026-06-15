@@ -2514,6 +2514,43 @@ test "ui: wheel sends arrows to alternate-screen applications" {
     alloc.free(peeked);
 }
 
+test "ui: wheel scrolls again after a session resets the terminal" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("rst", &.{"bash"});
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("rst");
+
+    // Enter the alternate screen while attached: the daemon strips the
+    // toggle, repaints, and sends `.screen` = alt, so the wheel would
+    // turn into arrow keys for the application.
+    try h.sendLine("rst", "printf '\\033[?1049hINALT'");
+    try ui.waitFor("INALT");
+
+    // A full reset (RIS, ESC c) returns the terminal to the primary
+    // screen without a 47/1047/1049 toggle, so the alt-screen filter
+    // never sees a switch. The daemon must still repaint and send
+    // `.screen` = primary, or the client keeps treating the session as
+    // alternate-screen and the wheel never pages local scrollback.
+    try h.sendLine("rst", "printf '\\033c'");
+    try h.sendLine("rst", "echo POSTRIS");
+    try ui.waitFor("POSTRIS");
+
+    // Fill the view's scrollback on the primary screen.
+    try h.sendLine("rst", "i=1; while [ $i -le 60 ]; do echo SCROLL-$i; i=$((i+1)); done");
+    try ui.waitFor("SCROLL-60");
+
+    // Wheel up pages local scrollback instead of sending arrows; the
+    // hint only renders while the viewport is scrolled off the bottom.
+    ui.clearOutput();
+    for (0..35) |_| try ui.send("\x1b[<64;50;10M");
+    try ui.waitFor(" scrollback");
+}
+
 test "ui: session titles render in the sidebar" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
