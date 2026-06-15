@@ -13,6 +13,27 @@ const ui = @import("ui.zig");
 
 pub const version = "0.5.18";
 
+/// Route std.log through a filter. libghostty's VT stream parser logs
+/// unimplemented sequences at info level under the `stream` scope (e.g.
+/// "OSC 1 (change icon) received and ignored"). In `boo ui` the parser runs
+/// in-process with stderr still attached to the user's terminal (unlike the
+/// daemon, which redirects stderr in startDaemon), so those lines paint over
+/// the rendered viewport and corrupt it. Drop info-and-below from `stream`;
+/// every other scope logs as before.
+pub const std_options: std.Options = .{
+    .logFn = filteredLog,
+};
+
+fn filteredLog(
+    comptime level: std.log.Level,
+    comptime scope: @TypeOf(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    if (scope == .stream and @intFromEnum(level) >= @intFromEnum(std.log.Level.info)) return;
+    std.log.defaultLog(level, scope, format, args);
+}
+
 /// Exit codes, documented in `boo help`.
 const exit_runtime: u8 = 1;
 const exit_usage: u8 = 2;
