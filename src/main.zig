@@ -11,7 +11,7 @@ const paths = @import("paths.zig");
 const protocol = @import("protocol.zig");
 const ui = @import("ui.zig");
 
-pub const version = "0.5.19";
+pub const version = "0.5.20";
 
 /// Route std.log through a filter. libghostty's VT stream parser logs
 /// unimplemented sequences at info level under the `stream` scope (e.g.
