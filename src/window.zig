@@ -280,6 +280,46 @@ pub const Window = struct {
         return alloc.dupe(u8, out.writer.buffered());
     }
 
+    /// VT bytes that reproduce this window's scrollback HISTORY (the rows
+    /// above the visible screen) as a styled, scrolling stream. A fresh
+    /// ui-view terminal that feeds historyReplay() and then repaint() ends
+    /// up holding the same scrollback, so a wheel-up pages real history
+    /// instead of an empty buffer. Returns null when there is no history.
+    ///
+    /// Only ui views request this. A plain `boo attach` is raw passthrough
+    /// to the user's real terminal, where replaying history would dump the
+    /// whole buffer onto their screen.
+    pub fn historyReplay(self: *Window, alloc: std.mem.Allocator) !?[]u8 {
+        const pages = &self.term.screens.active.pages;
+        const br = pages.getBottomRight(.history) orelse return null; // no history
+        const tl = pages.getTopLeft(.history);
+        const sel = vt.Selection.init(tl, br, false);
+
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+
+        // Content only (per-cell SGR is part of content emission); no
+        // cursor, modes, or other terminal state — the repaint that
+        // follows re-establishes all of that.
+        var formatter: vt.formatter.TerminalFormatter = .init(&self.term, .{ .emit = .vt });
+        formatter.content = .{ .selection = sel };
+        formatter.extra = .none;
+        try out.writer.print("{f}", .{formatter});
+
+        // The history selection reproduces as a stream that fills the
+        // canvas's visible screen with its last rows; the repaint that
+        // follows opens with ED (erase display), which would drop those
+        // still-visible rows. Reset SGR, then scroll a full screen so
+        // every history row lands in scrollback before the erase. The
+        // blank rows this leaves are in the visible area, so ED discards
+        // them rather than committing them to scrollback.
+        try out.writer.writeAll("\x1b[0m");
+        for (0..self.term.rows) |_| try out.writer.writeAll("\r\n");
+
+        const bytes = try alloc.dupe(u8, out.writer.buffered());
+        return bytes;
+    }
+
     /// Selection spanning the visible screen of the active terminal
     /// screen, so a repaint excludes scrollback history. Null (the
     /// formatter's dump-everything default) only if the pins cannot
@@ -432,6 +472,85 @@ test "repaint reproduces the screen once output has scrolled" {
     const got_cursor = canvas.screens.active.cursor;
     try std.testing.expectEqual(want_cursor.y, got_cursor.y);
     try std.testing.expectEqual(want_cursor.x, got_cursor.x);
+}
+
+test "historyReplay reconstructs scrollback for a ui view canvas" {
+    // A switched-to ui view starts with an empty terminal; feeding
+    // historyReplay() then repaint() must leave it holding the same
+    // scrollback the daemon window has, so a wheel-up pages real history.
+    const alloc = std.testing.allocator;
+
+    var win: Window = .{
+        .alloc = alloc,
+        .pty_fd = -1,
+        .child_pid = -1,
+        .command_title = "test",
+        .last_output_ms = 0,
+        .term = try vt.Terminal.init(alloc, .{
+            .cols = 20,
+            .rows = 5,
+            .max_scrollback = 512 * 1024,
+        }),
+        .stream = undefined,
+    };
+    defer win.term.deinit(alloc);
+    var stream = win.term.vtStream();
+    defer stream.deinit();
+
+    // Ten lines on a five-row screen: five scroll into history, five
+    // stay visible. The first row carries color, to prove styling
+    // survives the round trip.
+    stream.nextSlice("\x1b[31mL1\x1b[0m\r\nL2\r\nL3\r\nL4\r\nL5\r\nL6\r\nL7\r\nL8\r\nL9\r\nL10");
+
+    const history = (try win.historyReplay(alloc)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(history);
+    // The colored history row keeps its SGR.
+    try std.testing.expect(std.mem.indexOf(u8, history, "\x1b[") != null);
+
+    const repaint = try win.repaint(alloc);
+    defer alloc.free(repaint);
+
+    // A fresh canvas, standing in for a ui view's terminal.
+    var canvas = try vt.Terminal.init(alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 512 * 1024 });
+    defer canvas.deinit(alloc);
+    var canvas_stream = canvas.vtStream();
+    defer canvas_stream.deinit();
+    canvas_stream.nextSlice(history);
+    canvas_stream.nextSlice(repaint);
+
+    // Full dump (history + visible) matches: the canvas holds the same
+    // scrollback as the window, with no blank gap.
+    const want_full = try win.term.screens.active.dumpStringAlloc(alloc, .{ .screen = .{} });
+    defer alloc.free(want_full);
+    const got_full = try canvas.screens.active.dumpStringAlloc(alloc, .{ .screen = .{} });
+    defer alloc.free(got_full);
+    try std.testing.expectEqualStrings(want_full, got_full);
+
+    // The viewport still sits at the live bottom.
+    const want_screen = try win.term.plainString(alloc);
+    defer alloc.free(want_screen);
+    const got_screen = try canvas.plainString(alloc);
+    defer alloc.free(got_screen);
+    try std.testing.expectEqualStrings(want_screen, got_screen);
+}
+
+test "historyReplay returns null without scrollback" {
+    const alloc = std.testing.allocator;
+    var win: Window = .{
+        .alloc = alloc,
+        .pty_fd = -1,
+        .child_pid = -1,
+        .command_title = "test",
+        .last_output_ms = 0,
+        .term = try vt.Terminal.init(alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 512 * 1024 }),
+        .stream = undefined,
+    };
+    defer win.term.deinit(alloc);
+    var stream = win.term.vtStream();
+    defer stream.deinit();
+    // Two lines, nothing scrolled off: no history.
+    stream.nextSlice("hello\r\nworld");
+    try std.testing.expect((try win.historyReplay(alloc)) == null);
 }
 
 test "title set via OSC is tracked and emitted sanitized" {

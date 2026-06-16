@@ -681,9 +681,12 @@ pub const View = struct {
         self.stream = .initAlloc(alloc, handler);
         errdefer self.stream.deinit();
 
-        try protocol.writeMsg(sock, .attach, &(protocol.SizePayload{
+        try protocol.writeMsg(sock, .attach, &(protocol.AttachPayload{
             .rows = @max(rows, 1),
             .cols = @max(cols, 1),
+            // A ui view renders from terminal state, so it can take a
+            // scrollback-history replay and page it on a wheel-up.
+            .ui = true,
         }).encode());
 
         return self;

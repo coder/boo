@@ -83,9 +83,12 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
 
     // Handshake with our current size.
     const ws = ptypkg.getSize(tty) catch ptypkg.makeWinsize(24, 80);
-    try protocol.writeMsg(sock, .attach, &(protocol.SizePayload{
+    try protocol.writeMsg(sock, .attach, &(protocol.AttachPayload{
         .rows = ws.row,
         .cols = ws.col,
+        // A plain attach is raw passthrough; replaying scrollback here
+        // would dump the buffer onto the user's real terminal.
+        .ui = false,
     }).encode());
 
     var decoder: protocol.Decoder = .init(alloc);

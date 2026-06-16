@@ -32,6 +32,9 @@ const Conn = struct {
     fd: posix.fd_t,
     decoder: protocol.Decoder,
     attached: bool = false,
+    /// A ui view (vs a plain attach): gets its scrollback history
+    /// replayed on attach so a wheel-up can page it.
+    ui: bool = false,
     closed: bool = false,
 
     fn send(self: *Conn, msg_type: protocol.MsgType, payload: []const u8) void {
@@ -244,7 +247,7 @@ pub const Daemon = struct {
     fn handleMsg(self: *Daemon, conn: *Conn, msg: protocol.Msg) !void {
         switch (msg.type) {
             .attach => {
-                const size = try protocol.SizePayload.decode(msg.payload);
+                const a = try protocol.AttachPayload.decode(msg.payload);
                 // Steal from any previously attached client.
                 for (self.conns.items) |other| {
                     if (other != conn and other.attached) {
@@ -253,9 +256,15 @@ pub const Daemon = struct {
                     }
                 }
                 conn.attached = true;
+                conn.ui = a.ui;
                 self.key_parser = .{};
-                self.resizeWindow(size.rows, size.cols);
+                self.resizeWindow(a.rows, a.cols);
                 self.updatePassthrough();
+                // A ui view starts with an empty terminal; seed its
+                // scrollback with the window's history (sized to the
+                // client) before the repaint puts the live screen at
+                // the bottom. Best effort: failure just means no history.
+                if (conn.ui) self.historyTo(conn) catch {};
                 try self.repaintTo(conn);
             },
 
@@ -596,6 +605,23 @@ pub const Daemon = struct {
             w.resize(rows, cols) catch |err| {
                 log.warn("resize window failed: {}", .{err});
             };
+        }
+    }
+
+    /// Send the window's scrollback history to a ui view as a stream of
+    /// `output` frames, to be fed before the repaint. The replay can be
+    /// larger than one frame, so it is split across messages; the client
+    /// feeds them in order into its terminal, so an escape sequence split
+    /// across the boundary still parses.
+    fn historyTo(self: *Daemon, conn: *Conn) !void {
+        const win = self.liveWindow() orelse return;
+        const bytes = (try win.historyReplay(self.alloc)) orelse return;
+        defer self.alloc.free(bytes);
+        var i: usize = 0;
+        while (i < bytes.len) {
+            const end = @min(i + protocol.max_payload, bytes.len);
+            conn.send(.output, bytes[i..end]);
+            i = end;
         }
     }
 
