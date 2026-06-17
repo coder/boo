@@ -1199,6 +1199,12 @@ const Ui = struct {
     need_render: bool = true,
     /// Force every row out on the next render (resize, C-a l).
     full_render: bool = true,
+    /// A freshly focused view is seeded by the daemon with a scrollback
+    /// history replay followed by a repaint that ends in a `.screen`
+    /// message. Until that marker arrives the viewport is painted blank
+    /// rather than from the half-applied stream, so a large history
+    /// replay never flashes partial scrollback before the live screen.
+    awaiting_attach_repaint: bool = false,
     last_render_ms: i64 = 0,
     next_refresh_ms: i64 = 0,
 
@@ -2023,6 +2029,30 @@ const Ui = struct {
                 },
                 .screen => {
                     v.app_alt = std.mem.eql(u8, msg.payload, "alt");
+                    // The attach replay (history, then repaint) ends
+                    // with this marker; release the hold and reveal the
+                    // live screen. The seeded viewport rows streamed in
+                    // while they were painted blank, and composeFrame
+                    // clears libghostty's dirty bits every one of those
+                    // frames, so the rows are no longer flagged dirty:
+                    // invalidate the viewport cache so the reveal
+                    // re-serializes them from the now-complete screen
+                    // rather than reusing stale bytes. This stops short
+                    // of a full repaint on purpose. The row-level diff
+                    // still skips rows whose bytes are unchanged (the
+                    // sidebar, blank gaps), so the reveal writes only the
+                    // live rows, exactly as a plain attach's first
+                    // repaint does. A full-screen rewrite here would
+                    // instead emit every row at once, and a ui whose
+                    // terminal is momentarily undrained blocks on that
+                    // larger write (macOS PTY buffering, see restoreTty)
+                    // and wedges the loop before it reads the next key
+                    // or SIGWINCH.
+                    if (self.awaiting_attach_repaint) {
+                        self.awaiting_attach_repaint = false;
+                        for (self.viewport_cache.items) |*row| row.valid = false;
+                        self.need_render = true;
+                    }
                 },
                 .exit => {
                     v.state = .ended;
@@ -2226,6 +2256,9 @@ const Ui = struct {
         self.view_gen += 1;
         self.full_render = true;
         self.need_render = true;
+        // The daemon streams this view's history then a repaint; hold
+        // the viewport blank until that repaint's `.screen` arrives.
+        self.awaiting_attach_repaint = true;
     }
 
     fn rememberLast(self: *Ui, idx: usize) void {
@@ -2798,6 +2831,9 @@ const Ui = struct {
         if (self.renameCursor()) |s| return s;
         if (self.gotoCursor()) |s| return s;
         const v = self.liveView() orelse return state;
+        // The viewport is blank while the view is being seeded; keep the
+        // cursor hidden until the attach repaint releases it.
+        if (self.awaiting_attach_repaint) return state;
         // While scrolled back the cursor coordinates belong to the
         // bottom of the screen, not the history rows on display, so
         // keep the cursor hidden until the viewport snaps back.
@@ -3032,7 +3068,11 @@ const Ui = struct {
             },
         }
 
-        if (y < v.term.rows) {
+        // While the view is still being seeded (history replay and
+        // repaint in flight) the viewport stays blank, so a large
+        // replay never flashes partial scrollback before snapping to
+        // the live screen; the repaint's `.screen` releases it.
+        if (!self.awaiting_attach_repaint and y < v.term.rows) {
             try self.appendViewportRow(v, y, out);
         }
         try out.appendSlice(alloc, sgr_reset);
