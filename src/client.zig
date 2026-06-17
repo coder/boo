@@ -7,6 +7,7 @@ const posix = std.posix;
 const protocol = @import("protocol.zig");
 const ptypkg = @import("pty.zig");
 const window = @import("window.zig");
+const keys = @import("keys.zig");
 
 const log = std.log.scoped(.client);
 
@@ -78,7 +79,7 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
     // Set by the outcome paths below when a held C-d may still be
     // repeating; read by the deferred restore.
     var eof_guard = false;
-    defer restoreTty(tty, saved, restore_sequence, eof_guard);
+    defer restoreTty(tty, saved, restore_sequence, eof_guard, 'd');
     try protocol.writeAll(1, enter_sequence);
 
     // Handshake with our current size.
@@ -215,12 +216,16 @@ pub fn rawMode(t: *posix.termios) void {
 /// auto-repeat (keyboard repeat delays reach ~660ms on common
 /// configurations, so EOF-dangerous detaches use the long guard),
 /// then each absorbed chunk extends the wait by a short tail until
-/// the input stays quiet, all capped at drain_cap_ms.
-fn drainInput(tty: posix.fd_t, guard_ms: i64) void {
+/// the input stays quiet, all capped at drain_cap_ms. On terminals
+/// that report key releases (the kitty protocol, which restoreTty
+/// enables for the drain), the triggering key's release ends the wait
+/// at once, so the timers are only a fallback.
+fn drainInput(tty: posix.fd_t, guard_ms: i64, trigger_cp: u32) void {
     const start = std.time.milliTimestamp();
     const cap = start + drain_cap_ms;
     var deadline = start + guard_ms;
     var buf: [256]u8 = undefined;
+    var scan: ReleaseScan = .{ .want_cp = trigger_cp };
     while (true) {
         const now = std.time.milliTimestamp();
         const until = @min(deadline, cap);
@@ -232,9 +237,59 @@ fn drainInput(tty: posix.fd_t, guard_ms: i64) void {
         if (ready == 0) return;
         const n = posix.read(tty, &buf) catch return;
         if (n == 0) return;
+        // The triggering key's kitty release means the user let go: no
+        // more auto-repeats can follow, so stop draining immediately.
+        if (scan.feed(buf[0..n])) return;
         deadline = @max(deadline, std.time.milliTimestamp() + drain_tail_ms);
     }
 }
+
+/// Scans drained input for a kitty key-release event of the key that
+/// triggered the detach. Carries CSI-parse state between calls so a
+/// sequence split across reads is still recognized.
+const ReleaseScan = struct {
+    /// CSI parse state: 0 idle, 1 after ESC, 2 inside the CSI body.
+    state: u8 = 0,
+    body: [40]u8 = undefined,
+    body_len: usize = 0,
+    /// Effective codepoint whose release ends the drain; 0 matches any
+    /// key release.
+    want_cp: u32,
+
+    fn feed(self: *ReleaseScan, bytes: []const u8) bool {
+        for (bytes) |b| {
+            switch (self.state) {
+                1 => {
+                    if (b == '[') {
+                        self.state = 2;
+                        self.body_len = 0;
+                    } else self.state = if (b == 0x1b) 1 else 0;
+                },
+                2 => {
+                    if (b == 'u') {
+                        if (self.isRelease()) return true;
+                        self.state = 0;
+                    } else if ((b >= '0' and b <= '9') or b == ';' or b == ':') {
+                        if (self.body_len < self.body.len) {
+                            self.body[self.body_len] = b;
+                            self.body_len += 1;
+                        } else self.state = 0;
+                    } else self.state = if (b == 0x1b) 1 else 0;
+                },
+                else => if (b == 0x1b) {
+                    self.state = 1;
+                },
+            }
+        }
+        return false;
+    }
+
+    fn isRelease(self: *const ReleaseScan) bool {
+        const key = keys.parseKitty(self.body[0..self.body_len]) orelse return false;
+        if (key.event != 3) return false;
+        return self.want_cp == 0 or keys.effectiveCp(key) == self.want_cp;
+    }
+};
 
 /// Guard for detaches with no reason to expect a held key.
 const drain_guard_short_ms = 300;
@@ -244,6 +299,11 @@ const drain_guard_short_ms = 300;
 const drain_guard_eof_ms = 800;
 const drain_tail_ms = 100;
 const drain_cap_ms = 1500;
+/// Kitty keyboard flags forced during the drain so a still-held key
+/// reports its release: disambiguate (1) + event types (2) + report
+/// all keys (8). Cleared again before the shell regains the terminal.
+const drain_kbd_enable = "\x1b[=11;1u";
+const drain_kbd_disable = "\x1b[=0;1u";
 
 /// Restore a raw client terminal: screen restore, input drain, then
 /// the mode switch. Shared with boo ui, whose quit has the same held
@@ -253,16 +313,49 @@ pub fn restoreTty(
     saved: posix.termios,
     restore: []const u8,
     eof_guard: bool,
+    trigger_cp: u32,
 ) void {
     // Screen restore first: the user sees the detach immediately, and
     // a kitty-mode terminal stops CSI-u key reporting as soon as the
     // reset reaches it, so a still-held key repeats in legacy bytes
-    // that the drain below absorbs. Only then hand the tty back; the
-    // FLUSH discards anything that slips in between the last drained
-    // read and the mode switch.
+    // that the drain below absorbs. Only then hand the tty back, after
+    // a final non-blocking input discard catches anything that slipped
+    // in between the last drained read and the mode switch.
     protocol.writeAll(1, restore) catch {};
-    drainInput(tty, if (eof_guard) drain_guard_eof_ms else drain_guard_short_ms);
-    posix.tcsetattr(tty, .FLUSH, saved) catch {};
+    // Re-enable kitty report-events so a still-held command key reports
+    // its release, ending the drain the instant the user lets go rather
+    // than waiting out the timed guard. Terminals without the kitty
+    // protocol ignore this and the guard still applies.
+    protocol.writeAll(1, drain_kbd_enable) catch {};
+    drainInput(tty, if (eof_guard) drain_guard_eof_ms else drain_guard_short_ms, trigger_cp);
+    // Clear keyboard reporting again before the shell regains the tty.
+    protocol.writeAll(1, drain_kbd_disable) catch {};
+    // Switch the mode back without TCSAFLUSH: on Darwin its output-drain
+    // half blocks until the PTY master has consumed the writes above, so
+    // a peer that briefly stopped reading (a detach test between reads, a
+    // stalled remote link) wedges the restore, and the input-flush half
+    // then discards whatever was typed in the meantime. Drain straggler
+    // input non-blockingly instead, then apply the saved mode at once.
+    flushPendingInput(tty);
+    posix.tcsetattr(tty, .NOW, saved) catch {};
+}
+
+/// The input-flush half of TCSAFLUSH on its own: poll with a zero
+/// timeout and read until the queue is empty, while the tty is still
+/// raw so canonical buffering cannot hide a partial line. Skipping the
+/// output-drain half is deliberate (see restoreTty): it would block on
+/// Darwin until the PTY master consumes our output.
+fn flushPendingInput(tty: posix.fd_t) void {
+    var buf: [256]u8 = undefined;
+    while (true) {
+        var fds = [_]posix.pollfd{
+            .{ .fd = tty, .events = posix.POLL.IN, .revents = 0 },
+        };
+        const ready = posix.poll(&fds, 0) catch return;
+        if (ready == 0) return;
+        const n = posix.read(tty, &buf) catch return;
+        if (n == 0) return;
+    }
 }
 
 pub const ControlResult = struct {
@@ -300,4 +393,41 @@ pub fn control(
             }
         }
     }
+}
+
+test "ReleaseScan: the triggering key's release ends the drain" {
+    var scan: ReleaseScan = .{ .want_cp = 'd' };
+    // Press and auto-repeat are not a release.
+    try std.testing.expect(!scan.feed("\x1b[100;1:1u"));
+    try std.testing.expect(!scan.feed("\x1b[100;1:2u"));
+    // The release of the 'd' key ends the drain.
+    try std.testing.expect(scan.feed("\x1b[100;1:3u"));
+}
+
+test "ReleaseScan: other keys' releases are ignored" {
+    var scan: ReleaseScan = .{ .want_cp = 'd' };
+    // A left-ctrl release from the C-a C-d chord is not the trigger.
+    try std.testing.expect(!scan.feed("\x1b[57442;5:3u"));
+    // C-d is the same physical 'd' key with ctrl held: its release ends
+    // the drain, matched through the effective codepoint.
+    try std.testing.expect(scan.feed("\x1b[100;5:3u"));
+}
+
+test "ReleaseScan: a sequence split across reads is still recognized" {
+    var scan: ReleaseScan = .{ .want_cp = 'd' };
+    try std.testing.expect(!scan.feed("\x1b[100;1"));
+    try std.testing.expect(scan.feed(":3u"));
+}
+
+test "ReleaseScan: want_cp 0 matches any key release" {
+    var scan: ReleaseScan = .{ .want_cp = 0 };
+    try std.testing.expect(scan.feed("\x1b[97;1:3u"));
+}
+
+test "ReleaseScan: non-release CSI and plain bytes never trigger" {
+    var scan: ReleaseScan = .{ .want_cp = 'd' };
+    // Auto-repeats, an arrow key, and plain held bytes are not a
+    // release of the trigger key.
+    try std.testing.expect(!scan.feed("dddd"));
+    try std.testing.expect(!scan.feed("\x1b[A\x1b[100;1:2u"));
 }

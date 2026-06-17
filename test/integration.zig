@@ -2056,6 +2056,33 @@ test "ui: kitty-encoded C-a is the prefix, not session input" {
     try std.testing.expect(std.mem.indexOf(u8, peek.stdout, "97;5u") == null);
 }
 
+test "ui: arming the prefix forces report-events, the release reverts it" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("armf", &.{"cat"});
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("armf");
+
+    // Arming the prefix forces kitty report-all + event-types on the
+    // real terminal, so the command key and its auto-repeats and
+    // release arrive as distinguishable CSI-u events the parser can
+    // swallow instead of leaking raw bytes into the focused session.
+    ui.clearOutput();
+    try ui.send("\x01");
+    try ui.waitFor("\x1b[=11;1u");
+
+    // The command key (create), then its auto-repeat and release the
+    // way a report-events terminal sends a held key. The create runs,
+    // and the release ends the swallow so the forced flags revert.
+    try ui.send("\x1b[99;1:1u\x1b[99;1:2u\x1b[99;1:3u");
+    try waitUiSessionCount(&h, 2);
+    try ui.waitFor("\x1b[=0;1u");
+}
+
 test "ui: prompts suspend the mirrored kitty flags" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
