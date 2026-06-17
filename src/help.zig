@@ -62,7 +62,7 @@ pub const commands = [_]Entry{
     .{
         .name = "new",
         .body =
-        \\usage: boo new [name] [-d|--detached] [-- cmd...]
+        \\usage: boo new [name] [-d|--detached] [--rows N] [--cols N] [-- cmd...]
         \\
         \\Start a session running cmd (default: $SHELL) and attach to
         \\it. The session keeps running after you detach (C-a d) or
@@ -76,6 +76,9 @@ pub const commands = [_]Entry{
         \\flags:
         \\  -d, --detached  start without attaching and print the
         \\                  session name on stdout
+        \\  --rows N        initial terminal height (default 24); the
+        \\                  next attach resizes to the real terminal
+        \\  --cols N        initial terminal width (default 80)
         \\
         \\examples:
         \\  boo new                      interactive shell, attach now

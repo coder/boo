@@ -498,6 +498,29 @@ test "window size: initial attach size and SIGWINCH resize reach the app" {
     }
 }
 
+test "new --rows/--cols births the session at that size" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // A detached session is never attached, so it keeps the size it was
+    // born with: --rows/--cols must reach the child PTY at creation,
+    // not wait for an attach handshake. boo ui relies on this so a new
+    // session is shown at the viewport size from its first frame.
+    const result = try h.run(&.{ "new", "sized", "-d", "--rows", "30", "--cols", "100", "--", "/bin/sh" });
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+    try std.testing.expect(result.term == .Exited and result.term.Exited == 0);
+    try h.waitSessionUp("sized");
+
+    const size_file = try std.fmt.allocPrint(alloc, "{s}/size.txt", .{h.dir});
+    defer alloc.free(size_file);
+    const cmd = try std.fmt.allocPrint(alloc, "stty size > {s}", .{size_file});
+    defer alloc.free(cmd);
+    try h.sendLine("sized", cmd);
+    try waitFileEquals(alloc, size_file, "30 100\n");
+}
+
 test "default session name comes from the working directory" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);

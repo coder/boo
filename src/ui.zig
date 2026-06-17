@@ -2398,7 +2398,12 @@ const Ui = struct {
         return @intCast(std.math.clamp(want, lo, hi));
     }
 
-    /// Create a session by re-running our own binary with `new -d`.
+    /// Create a session by re-running our own binary with `new -d`,
+    /// sized to the viewport so it is born at the geometry it will be
+    /// shown at. Otherwise the session starts at the daemon default and
+    /// is only corrected when the UI attaches, so its first prompt and
+    /// any early output land mis-sized until the next resize.
+    ///
     /// The exec drops every inherited descriptor (they are all
     /// CLOEXEC), so the daemon cannot pin the UI's sockets open, and
     /// naming falls back exactly like the CLI.
@@ -2409,9 +2414,15 @@ const Ui = struct {
         };
         defer self.alloc.free(exe);
 
+        // u16 is at most five digits; the buffers never overflow.
+        var rows_buf: [6]u8 = undefined;
+        var cols_buf: [6]u8 = undefined;
+        const rows = std.fmt.bufPrint(&rows_buf, "{d}", .{@max(self.layout.viewportRows(), 1)}) catch unreachable;
+        const cols = std.fmt.bufPrint(&cols_buf, "{d}", .{@max(self.layout.viewportCols(), 1)}) catch unreachable;
+
         const result = std.process.Child.run(.{
             .allocator = self.alloc,
-            .argv = &.{ exe, "new", "-d" },
+            .argv = &.{ exe, "new", "-d", "--rows", rows, "--cols", cols },
         }) catch {
             self.setMessage("create failed", .{});
             return;

@@ -123,6 +123,14 @@ fn flagValue(
     return null;
 }
 
+/// Parse a positive terminal dimension (rows or cols) for `boo new`.
+fn parseDimension(comptime flag: []const u8, value: []const u8) u16 {
+    const n = std.fmt.parseInt(u16, value, 10) catch
+        usageFail("new", flag ++ " expects a number from 1 to 65535", .{});
+    if (n == 0) usageFail("new", flag ++ " must be at least 1", .{});
+    return n;
+}
+
 fn printHelpPage(name: []const u8) !void {
     const entry = help.find(name) orelse unreachable;
     try stdoutWrite(entry.body);
@@ -238,6 +246,8 @@ fn mustControl(
 fn cmdNew(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     var name: ?[]const u8 = null;
     var detached = false;
+    var rows: ?u16 = null;
+    var cols: ?u16 = null;
     var cmd_argv: []const [:0]const u8 = &.{};
 
     var i: usize = 0;
@@ -250,6 +260,10 @@ fn cmdNew(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
             detached = true;
         } else if (isHelpFlag(arg)) {
             return printHelpPage("new");
+        } else if (flagValue("new", "--rows", args, &i)) |v| {
+            rows = parseDimension("--rows", v);
+        } else if (flagValue("new", "--cols", args, &i)) |v| {
+            cols = parseDimension("--cols", v);
         } else if (arg.len > 0 and arg[0] == '-') {
             usageFail("new", "unknown flag '{s}'", .{arg});
         } else if (name == null) {
@@ -261,7 +275,7 @@ fn cmdNew(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     const dir = try paths.socketDir(alloc);
     defer alloc.free(dir);
-    return createSession(alloc, dir, name, detached, @ptrCast(cmd_argv));
+    return createSession(alloc, dir, name, detached, @ptrCast(cmd_argv), rows, cols);
 }
 
 fn createSession(
@@ -270,6 +284,8 @@ fn createSession(
     name_opt: ?[]const u8,
     detached: bool,
     cmd_argv: []const []const u8,
+    rows: ?u16,
+    cols: ?u16,
 ) !void {
     var name_buf: [paths.max_name_len]u8 = undefined;
     const name = name_opt orelse paths.defaultName(&name_buf, dir);
@@ -293,17 +309,20 @@ fn createSession(
     // BOO_FOREGROUND=1 keeps the daemon in the foreground, which is
     // useful for debugging.
     if (posix.getenv("BOO_FOREGROUND") != null) {
-        try daemonpkg.Daemon.run(alloc, .{
+        var opts: daemonpkg.Options = .{
             .name = name,
             .socket_path = sock,
             .listen_fd = listen_fd,
             .argv = cmd_argv,
-        });
+        };
+        if (rows) |r| opts.rows = r;
+        if (cols) |c| opts.cols = c;
+        try daemonpkg.Daemon.run(alloc, opts);
         return;
     }
     const pid = try posix.fork();
     if (pid == 0) {
-        runDaemon(alloc, name, sock, listen_fd, cmd_argv);
+        runDaemon(alloc, name, sock, listen_fd, cmd_argv, rows, cols);
     }
     posix.close(listen_fd);
 
@@ -905,6 +924,8 @@ fn runDaemon(
     sock: []const u8,
     listen_fd: posix.fd_t,
     argv: []const []const u8,
+    rows: ?u16,
+    cols: ?u16,
 ) noreturn {
     _ = posix.setsid() catch {};
 
@@ -926,12 +947,15 @@ fn runDaemon(
     }
     if (devnull > 2) posix.close(devnull);
 
-    daemonpkg.Daemon.run(alloc, .{
+    var opts: daemonpkg.Options = .{
         .name = name,
         .socket_path = sock,
         .listen_fd = listen_fd,
         .argv = argv,
-    }) catch |err| {
+    };
+    if (rows) |r| opts.rows = r;
+    if (cols) |c| opts.cols = c;
+    daemonpkg.Daemon.run(alloc, opts) catch |err| {
         std.log.err("daemon failed: {}", .{err});
         posix.exit(1);
     };
