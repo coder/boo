@@ -13,6 +13,7 @@ const protocol = @import("protocol.zig");
 const keys = @import("keys.zig");
 const altscreen = @import("altscreen.zig");
 const paths = @import("paths.zig");
+const cwd = @import("cwd.zig");
 const windowpkg = @import("window.zig");
 const Window = windowpkg.Window;
 const main = @import("main.zig");
@@ -26,6 +27,9 @@ pub const Options = struct {
     argv: []const []const u8,
     rows: u16 = 24,
     cols: u16 = 80,
+    /// Working directory for the session command; null inherits the
+    /// daemon's own directory.
+    cwd: ?[]const u8 = null,
 };
 
 const Conn = struct {
@@ -115,7 +119,7 @@ pub const Daemon = struct {
             .flags = 0,
         }, null);
 
-        self.win = try createWindow(self.alloc, opts.name, opts.argv, self.rows, self.cols);
+        self.win = try createWindow(self.alloc, opts.name, opts.argv, self.rows, self.cols, opts.cwd);
 
         try self.loop();
     }
@@ -423,6 +427,15 @@ pub const Daemon = struct {
                 }
             }
             conn.send(.ok, out.items);
+        } else if (std.mem.eql(u8, cmd, "cwd")) {
+            // Report the session command's current working directory so
+            // a new session created from `boo ui` can be born there.
+            if (self.liveWindow()) |w| {
+                var buf: [std.fs.max_path_bytes]u8 = undefined;
+                if (cwd.ofPid(&buf, w.child_pid)) |dir| {
+                    conn.send(.ok, dir);
+                } else conn.send(.err, "working directory unavailable");
+            } else conn.send(.err, "no window");
         } else if (std.mem.eql(u8, cmd, "rename")) {
             if (argv.len != 2) {
                 conn.send(.err, "usage: rename <new-name>");
@@ -579,6 +592,7 @@ pub const Daemon = struct {
         argv: []const []const u8,
         rows: u16,
         cols: u16,
+        cwd_opt: ?[]const u8,
     ) !*Window {
         var env = try std.process.getEnvMap(alloc);
         defer env.deinit();
@@ -588,7 +602,7 @@ pub const Daemon = struct {
         var default_argv: [1][]const u8 = .{env.get("SHELL") orelse "/bin/sh"};
         const child_argv: []const []const u8 = if (argv.len > 0) argv else &default_argv;
 
-        return Window.create(alloc, child_argv, &env, rows, cols);
+        return Window.create(alloc, child_argv, &env, rows, cols, cwd_opt);
     }
 
     fn liveWindow(self: *Daemon) ?*Window {

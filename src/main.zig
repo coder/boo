@@ -11,28 +11,7 @@ const paths = @import("paths.zig");
 const protocol = @import("protocol.zig");
 const ui = @import("ui.zig");
 
-pub const version = "0.5.22";
-
-/// Route std.log through a filter. libghostty's VT stream parser logs
-/// unimplemented sequences at info level under the `stream` scope (e.g.
-/// "OSC 1 (change icon) received and ignored"). In `boo ui` the parser runs
-/// in-process with stderr still attached to the user's terminal (unlike the
-/// daemon, which redirects stderr in startDaemon), so those lines paint over
-/// the rendered viewport and corrupt it. Drop info-and-below from `stream`;
-/// every other scope logs as before.
-pub const std_options: std.Options = .{
-    .logFn = filteredLog,
-};
-
-fn filteredLog(
-    comptime level: std.log.Level,
-    comptime scope: @TypeOf(.enum_literal),
-    comptime format: []const u8,
-    args: anytype,
-) void {
-    if (scope == .stream and @intFromEnum(level) >= @intFromEnum(std.log.Level.info)) return;
-    std.log.defaultLog(level, scope, format, args);
-}
+pub const version = "0.5.24";
 
 /// Exit codes, documented in `boo help`.
 const exit_runtime: u8 = 1;
@@ -248,6 +227,7 @@ fn cmdNew(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     var detached = false;
     var rows: ?u16 = null;
     var cols: ?u16 = null;
+    var cwd: ?[]const u8 = null;
     var cmd_argv: []const [:0]const u8 = &.{};
 
     var i: usize = 0;
@@ -264,6 +244,8 @@ fn cmdNew(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
             rows = parseDimension("--rows", v);
         } else if (flagValue("new", "--cols", args, &i)) |v| {
             cols = parseDimension("--cols", v);
+        } else if (flagValue("new", "--cwd", args, &i)) |v| {
+            cwd = v;
         } else if (arg.len > 0 and arg[0] == '-') {
             usageFail("new", "unknown flag '{s}'", .{arg});
         } else if (name == null) {
@@ -275,7 +257,7 @@ fn cmdNew(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     const dir = try paths.socketDir(alloc);
     defer alloc.free(dir);
-    return createSession(alloc, dir, name, detached, @ptrCast(cmd_argv), rows, cols);
+    return createSession(alloc, dir, name, detached, @ptrCast(cmd_argv), rows, cols, cwd);
 }
 
 fn createSession(
@@ -286,11 +268,24 @@ fn createSession(
     cmd_argv: []const []const u8,
     rows: ?u16,
     cols: ?u16,
+    cwd_opt: ?[]const u8,
 ) !void {
     var name_buf: [paths.max_name_len]u8 = undefined;
     const name = name_opt orelse paths.defaultName(&name_buf, dir);
     paths.validateName(name) catch
         usageFail("new", "invalid session name '{s}'", .{name});
+
+    // Resolve --cwd to an absolute, openable directory up front: the
+    // child chdir's there before exec, so an invalid value should fail
+    // here with a clear message rather than killing the new session.
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd: ?[]const u8 = if (cwd_opt) |d| blk: {
+        var d_dir = std.fs.cwd().openDir(d, .{}) catch
+            fail(exit_runtime, "--cwd {s}: not an accessible directory", .{d});
+        defer d_dir.close();
+        break :blk d_dir.realpath(".", &cwd_buf) catch
+            fail(exit_runtime, "--cwd {s}: cannot resolve directory", .{d});
+    } else null;
 
     const sock = try paths.socketPath(alloc, dir, name);
     defer alloc.free(sock);
@@ -317,12 +312,13 @@ fn createSession(
         };
         if (rows) |r| opts.rows = r;
         if (cols) |c| opts.cols = c;
+        opts.cwd = cwd;
         try daemonpkg.Daemon.run(alloc, opts);
         return;
     }
     const pid = try posix.fork();
     if (pid == 0) {
-        runDaemon(alloc, name, sock, listen_fd, cmd_argv, rows, cols);
+        runDaemon(alloc, name, sock, listen_fd, cmd_argv, rows, cols, cwd);
     }
     posix.close(listen_fd);
 
@@ -382,7 +378,17 @@ fn cmdUi(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     const dir = try paths.socketDir(alloc);
     defer alloc.free(dir);
-    ui.run(alloc, dir) catch |err| switch (err) {
+
+    // boo ui feeds session output through an in-process libghostty stream
+    // whose VT logs would otherwise paint over the viewport: std.log writes
+    // to stderr, which is the user's terminal here, while the daemon
+    // redirects its own stderr in runDaemon. Point stderr at BOO_LOG, or
+    // /dev/null, while the UI owns the screen, then restore it so the
+    // closing notice is visible.
+    const saved_stderr = redirectStderr();
+    const result = ui.run(alloc, dir);
+    restoreStderr(saved_stderr);
+    result catch |err| switch (err) {
         error.NotATty => fail(exit_runtime, "ui requires a terminal", .{}),
         else => return err,
     };
@@ -918,6 +924,48 @@ fn fmtIdle(buf: []u8, ms: i64) []const u8 {
 
 // -- Daemon plumbing ------------------------------------------------------
 
+/// Open the destination for std.log and std.debug output: $BOO_LOG
+/// (created, appended) when set, otherwise /dev/null. Both the session
+/// daemon and `boo ui` run with a terminal on stderr, where libghostty's
+/// in-process VT logging would paint over the display, so they route
+/// stderr here. Returns null when the target cannot be opened.
+fn openLogSink() ?posix.fd_t {
+    if (posix.getenv("BOO_LOG")) |log_path| {
+        return posix.open(log_path, .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .APPEND = true,
+        }, 0o600) catch null;
+    }
+    return posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0) catch null;
+}
+
+/// Redirect stderr to the log sink for the lifetime of a foreground command
+/// that owns the terminal (boo ui). Returns a saved dup of the original
+/// stderr for restoreStderr, or -1 when stderr was left untouched.
+fn redirectStderr() posix.fd_t {
+    const sink = openLogSink() orelse return -1;
+    defer posix.close(sink);
+    // Mark the saved terminal stderr close-on-exec so it is not inherited
+    // by the session daemons boo ui spawns: createSession runs `boo new`,
+    // which forks the daemon, and a leaked dup would hold the pty open
+    // after the UI exits.
+    const saved = posix.dup(posix.STDERR_FILENO) catch return -1;
+    _ = posix.fcntl(saved, posix.F.SETFD, posix.FD_CLOEXEC) catch {};
+    posix.dup2(sink, posix.STDERR_FILENO) catch {
+        posix.close(saved);
+        return -1;
+    };
+    return saved;
+}
+
+/// Restore stderr from a redirectStderr handle. A no-op for -1.
+fn restoreStderr(saved: posix.fd_t) void {
+    if (saved < 0) return;
+    posix.dup2(saved, posix.STDERR_FILENO) catch {};
+    posix.close(saved);
+}
+
 fn runDaemon(
     alloc: std.mem.Allocator,
     name: []const u8,
@@ -926,22 +974,19 @@ fn runDaemon(
     argv: []const []const u8,
     rows: ?u16,
     cols: ?u16,
+    cwd: ?[]const u8,
 ) noreturn {
     _ = posix.setsid() catch {};
 
-    // Detach stdio. Keep stderr pointed at BOO_LOG if set so std.log
-    // output is preserved for debugging.
+    // Detach stdio: stdin and stdout go to /dev/null, stderr to the log
+    // sink (BOO_LOG when set, else /dev/null) so std.log output is
+    // preserved for debugging.
     const devnull = posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch posix.exit(1);
     posix.dup2(devnull, 0) catch {};
     posix.dup2(devnull, 1) catch {};
-    if (posix.getenv("BOO_LOG")) |log_path| blk: {
-        const fd = posix.open(log_path, .{
-            .ACCMODE = .WRONLY,
-            .CREAT = true,
-            .APPEND = true,
-        }, 0o600) catch break :blk;
-        posix.dup2(fd, 2) catch {};
-        posix.close(fd);
+    if (openLogSink()) |sink| {
+        posix.dup2(sink, 2) catch {};
+        posix.close(sink);
     } else {
         posix.dup2(devnull, 2) catch {};
     }
@@ -955,6 +1000,7 @@ fn runDaemon(
     };
     if (rows) |r| opts.rows = r;
     if (cols) |c| opts.cols = c;
+    opts.cwd = cwd;
     daemonpkg.Daemon.run(alloc, opts) catch |err| {
         std.log.err("daemon failed: {}", .{err});
         posix.exit(1);
@@ -1045,6 +1091,7 @@ test "fmtIdle" {
 test {
     _ = @import("protocol.zig");
     _ = @import("paths.zig");
+    _ = @import("cwd.zig");
     _ = @import("keys.zig");
     _ = @import("pty.zig");
     _ = @import("altscreen.zig");

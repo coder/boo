@@ -55,6 +55,7 @@ pub const Window = struct {
         env: *std.process.EnvMap,
         rows: u16,
         cols: u16,
+        cwd: ?[]const u8,
     ) !*Window {
         const self = try alloc.create(Window);
         errdefer alloc.destroy(self);
@@ -63,6 +64,7 @@ pub const Window = struct {
             .argv = argv,
             .env = env,
             .size = ptypkg.makeWinsize(rows, cols),
+            .cwd = cwd,
         });
         errdefer posix.close(spawned.master);
 

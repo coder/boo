@@ -2529,6 +2529,11 @@ const Ui = struct {
     /// is only corrected when the UI attaches, so its first prompt and
     /// any early output land mis-sized until the next resize.
     ///
+    /// The new session inherits the focused session's working directory
+    /// (like Ghostty's new windows) so it opens where the user is. When
+    /// that directory cannot be resolved or used, creation falls back to
+    /// a plain `new` in boo's own directory so the keybind still works.
+    ///
     /// The exec drops every inherited descriptor (they are all
     /// CLOEXEC), so the daemon cannot pin the UI's sockets open, and
     /// naming falls back exactly like the CLI.
@@ -2545,31 +2550,80 @@ const Ui = struct {
         const rows = std.fmt.bufPrint(&rows_buf, "{d}", .{@max(self.layout.viewportRows(), 1)}) catch unreachable;
         const cols = std.fmt.bufPrint(&cols_buf, "{d}", .{@max(self.layout.viewportCols(), 1)}) catch unreachable;
 
-        const result = std.process.Child.run(.{
-            .allocator = self.alloc,
-            .argv = &.{ exe, "new", "-d", "--rows", rows, "--cols", cols },
-        }) catch {
-            self.setMessage("create failed", .{});
+        const cwd = self.focusedCwd();
+        defer if (cwd) |c| self.alloc.free(c);
+
+        var reason: ?[]u8 = null;
+        defer if (reason) |r| self.alloc.free(r);
+
+        // Inherit the focused session's directory first; if that create
+        // fails (e.g. the directory vanished) retry without it so the
+        // keybind still produces a session.
+        var name: ?[]u8 = null;
+        if (cwd) |dir| {
+            name = self.runNew(&.{ exe, "new", "-d", "--rows", rows, "--cols", cols, "--cwd", dir }, &reason);
+        }
+        if (name == null) {
+            if (reason) |r| {
+                self.alloc.free(r);
+                reason = null;
+            }
+            name = self.runNew(&.{ exe, "new", "-d", "--rows", rows, "--cols", cols }, &reason);
+        }
+
+        const created = name orelse {
+            if (reason) |r|
+                self.setMessage("create failed: {s}", .{r})
+            else
+                self.setMessage("create failed", .{});
             return;
         };
-        defer self.alloc.free(result.stdout);
-        defer self.alloc.free(result.stderr);
-
-        if (result.term != .Exited or result.term.Exited != 0) {
-            const reason = std.mem.trim(u8, result.stderr, " \n");
-            self.setMessage("create failed: {s}", .{reason});
-            return;
-        }
-        const name = std.mem.trimRight(u8, result.stdout, "\n");
-        self.setMessage("created {s}", .{name});
+        defer self.alloc.free(created);
+        self.setMessage("created {s}", .{created});
 
         self.refreshSessions() catch return;
         for (self.sessions.items, 0..) |entry, i| {
-            if (std.mem.eql(u8, entry.name, name)) {
+            if (std.mem.eql(u8, entry.name, created)) {
                 self.focusIndex(i);
                 break;
             }
         }
+    }
+
+    /// Run `boo new` with argv and return the created session name
+    /// (owned) on success. On failure returns null and, when the binary
+    /// ran, stores its trimmed stderr in `reason` (owned) for the
+    /// caller's status message.
+    fn runNew(self: *Ui, argv: []const []const u8, reason: *?[]u8) ?[]u8 {
+        const result = std.process.Child.run(.{
+            .allocator = self.alloc,
+            .argv = argv,
+        }) catch return null;
+        defer self.alloc.free(result.stdout);
+        defer self.alloc.free(result.stderr);
+        if (result.term != .Exited or result.term.Exited != 0) {
+            const trimmed = std.mem.trim(u8, result.stderr, " \n");
+            reason.* = self.alloc.dupe(u8, trimmed) catch null;
+            return null;
+        }
+        const name = std.mem.trimRight(u8, result.stdout, "\n");
+        return self.alloc.dupe(u8, name) catch null;
+    }
+
+    /// The working directory of the focused session, asked of its
+    /// daemon, so a new session can inherit it. Null when nothing is
+    /// focused or the daemon cannot report a directory. Caller frees.
+    fn focusedCwd(self: *Ui) ?[]u8 {
+        const idx = self.selected orelse return null;
+        if (idx >= self.sessions.items.len) return null;
+        const sock = paths.socketPath(self.alloc, self.dir, self.sessions.items[idx].name) catch return null;
+        defer self.alloc.free(sock);
+        const result = client.control(self.alloc, sock, &.{"cwd"}) catch return null;
+        if (!result.ok or result.text.len == 0) {
+            self.alloc.free(result.text);
+            return null;
+        }
+        return result.text;
     }
 
     fn confirmKill(self: *Ui) void {

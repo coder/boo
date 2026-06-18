@@ -1,6 +1,6 @@
 .{
     .name = .boo,
-    .version = "0.5.22",
+    .version = "0.5.24",
     .fingerprint = 0x8b7acdfd255f0e34,
     .minimum_zig_version = "0.15.2",
     .dependencies = .{

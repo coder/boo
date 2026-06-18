@@ -205,18 +205,20 @@ const PtyClient = struct {
         rows: u16,
         cols: u16,
     ) !PtyClient {
-        return spawnProgram(harness, exe_path, argv, rows, cols);
+        return spawnProgram(harness, exe_path, argv, rows, cols, &.{});
     }
 
     /// Like spawn, but runs an arbitrary program instead of the boo
     /// binary, e.g. a shell wrapping an attach the way a login shell
-    /// does for a user.
+    /// does for a user. `env_extra` overrides or adds environment
+    /// variables for the child.
     fn spawnProgram(
         harness: *Harness,
         program: []const u8,
         argv: []const []const u8,
         rows: u16,
         cols: u16,
+        env_extra: []const [2][]const u8,
     ) !PtyClient {
         const alloc = harness.alloc;
 
@@ -259,6 +261,7 @@ const PtyClient = struct {
 
         var env = try std.process.getEnvMap(arena);
         try env.put("BOO_DIR", harness.dir);
+        for (env_extra) |pair| try env.put(pair[0], pair[1]);
         const envp = try std.process.createEnvironFromMap(arena, &env, .{});
 
         const pid = try posix.fork();
@@ -557,6 +560,48 @@ test "default session name comes from the working directory" {
     try std.testing.expect(std.mem.indexOf(u8, ls.stdout, pid_name) != null);
 }
 
+test "new --cwd starts the command in that directory" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    const proj = try std.fs.path.join(alloc, &.{ h.dir, "wd-proj" });
+    defer alloc.free(proj);
+    try std.fs.cwd().makePath(proj);
+    // Resolve symlinks so the comparison holds where /tmp is itself a
+    // link (e.g. /private/tmp on macOS).
+    const proj_real = try std.fs.cwd().realpathAlloc(alloc, proj);
+    defer alloc.free(proj_real);
+
+    // The session is created from h.dir, so a child that lands in proj
+    // proves --cwd overrode the inherited directory. `pwd -P` reports
+    // the real cwd rather than a possibly-stale $PWD.
+    try h.runOk(&.{ "new", "wd", "-d", "--cwd", proj, "--", "sh", "-c", "pwd -P > cwd.txt; exec cat" });
+    try h.waitSessionUp("wd");
+
+    const out_file = try std.fs.path.join(alloc, &.{ proj, "cwd.txt" });
+    defer alloc.free(out_file);
+    const expected = try std.fmt.allocPrint(alloc, "{s}\n", .{proj_real});
+    defer alloc.free(expected);
+    try waitFileEquals(alloc, out_file, expected);
+}
+
+test "new --cwd rejects a missing directory" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    const missing = try std.fs.path.join(alloc, &.{ h.dir, "does-not-exist" });
+    defer alloc.free(missing);
+    // An unusable --cwd is a runtime error (exit 1) and creates nothing.
+    try h.runExit(&.{ "new", "bad", "--cwd", missing, "--", "cat" }, 1);
+
+    const ls = try h.run(&.{"ls"});
+    defer alloc.free(ls.stdout);
+    defer alloc.free(ls.stderr);
+    try std.testing.expect(std.mem.indexOf(u8, ls.stdout, "bad") == null);
+}
+
 test "session listing shows attach state" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
@@ -716,7 +761,7 @@ fn expectNoDetachKeyLeak(
     );
     defer alloc.free(script);
 
-    var client = try PtyClient.spawnProgram(h, "/bin/sh", &.{ "-c", script }, 24, 80);
+    var client = try PtyClient.spawnProgram(h, "/bin/sh", &.{ "-c", script }, 24, 80, &.{});
     defer client.deinit();
     try client.waitFor("\x1b[?1049h");
 
@@ -1583,6 +1628,50 @@ test "ui: create and kill sessions from the ui" {
     defer alloc.free(ls.stderr);
     try std.testing.expect(std.mem.indexOf(u8, ls.stdout, "keep1") != null);
     try std.testing.expect(std.mem.indexOf(u8, ls.stdout, "keep2") != null);
+}
+
+test "ui: a created session inherits the focused session's directory" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // The focused session lives in proj; the UI process itself runs in
+    // h.dir. A session created with C-a c must land in proj, proving it
+    // inherits the focused session's directory and not the UI's.
+    const proj = try std.fs.path.join(alloc, &.{ h.dir, "ui-proj" });
+    defer alloc.free(proj);
+    try std.fs.cwd().makePath(proj);
+    const proj_real = try std.fs.cwd().realpathAlloc(alloc, proj);
+    defer alloc.free(proj_real);
+
+    const base = try h.runIn(proj, &.{ "new", "base", "-d", "--", "cat" });
+    defer alloc.free(base.stdout);
+    defer alloc.free(base.stderr);
+    try std.testing.expect(base.term.Exited == 0);
+    try h.waitSessionUp("base");
+
+    // A recorder shell writes its working directory and stays alive, so
+    // a created session that uses it as $SHELL reveals where it started.
+    const out_file = try std.fs.path.join(alloc, &.{ h.dir, "ui-cwd.txt" });
+    defer alloc.free(out_file);
+    const recorder = try std.fs.path.join(alloc, &.{ h.dir, "recorder.sh" });
+    defer alloc.free(recorder);
+    const body = try std.fmt.allocPrint(alloc, "#!/bin/sh\npwd -P > {s}\nexec cat\n", .{out_file});
+    defer alloc.free(body);
+    try std.fs.cwd().writeFile(.{ .sub_path = recorder, .data = body });
+    try std.posix.fchmodat(std.posix.AT.FDCWD, recorder, 0o755, 0);
+
+    var ui = try PtyClient.spawnProgram(&h, exe_path, &.{"ui"}, 24, 100, &.{.{ "SHELL", recorder }});
+    defer ui.deinit();
+    try ui.waitFor("base");
+
+    // C-a c creates a session in the focused session's directory.
+    try ui.send("\x01c");
+    try waitUiSessionCount(&h, 2);
+
+    const expected = try std.fmt.allocPrint(alloc, "{s}\n", .{proj_real});
+    defer alloc.free(expected);
+    try waitFileEquals(alloc, out_file, expected);
 }
 
 test "ui: clicking the kill target asks for confirmation" {
