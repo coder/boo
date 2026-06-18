@@ -141,18 +141,23 @@ pub const commands = [_]Entry{
         \\keys (prefix C-a, control variants match GNU screen):
         \\  C-a c   create a session and focus it; it starts in the
         \\          focused session's working directory
+        \\  C-a |   split the focused pane left and right, opening a
+        \\          new session in the new pane
+        \\  C-a -   split the focused pane top and bottom, opening a
+        \\          new session in the new pane
+        \\  C-a o   focus the next pane
+        \\  C-a x   close the focused pane (its session keeps running)
         \\  C-a k   kill the focused session (asks y/n)
         \\  C-a r   rename the focused session
         \\  C-a g   go to a session by name (best match)
         \\  C-a n   focus the next session
         \\  C-a p   focus the previous session
-        \\  C-a Up, C-a Down
-        \\          browse the session list without attaching:
-        \\          Up/Down move the selection, Enter attaches it,
-        \\          Esc returns to the focused session
-        \\  C-a Left, C-a Right
-        \\          resize the sidebar: Left/Right adjust the width,
-        \\          Enter keeps it, Esc restores the previous width
+        \\  C-a Up, C-a Down, C-a Left, C-a Right
+        \\          with more than one pane, move focus to the pane in
+        \\          that direction. With a single pane, Up/Down browse
+        \\          the session list (Enter attaches, Esc returns) and
+        \\          Left/Right resize the sidebar (Enter keeps it, Esc
+        \\          restores the previous width)
         \\  C-a s   show or hide the sidebar; the viewport takes the
         \\          full width while it is hidden
         \\  C-a C-a focus the previously focused session

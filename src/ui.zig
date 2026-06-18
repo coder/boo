@@ -1091,6 +1091,7 @@ pub fn run(alloc: std.mem.Allocator, dir: []const u8) !void {
     // this UI, or its output would feed back into itself forever.
     ui.host_name = posix.getenv("BOO");
 
+    try ui.initPanes();
     try ui.refreshSessions();
     if (ui.selected == null) ui.selectInitial();
 
@@ -1131,6 +1132,67 @@ fn viewportRowReusable(entry: *const ViewportRow, pin: vt.Pin, full_render: bool
     return !pin.isDirty();
 }
 
+// -- Split panes --------------------------------------------------------------
+
+/// A rectangle in absolute screen coordinates (0-based): the viewport
+/// region and each pane within it.
+const Rect = struct { x: u16 = 0, y: u16 = 0, w: u16 = 0, h: u16 = 0 };
+
+/// How a split divides its space. A vertical split puts its two
+/// children side by side with a vertical divider (C-a |); a horizontal
+/// split stacks them with a horizontal divider (C-a -).
+const Orientation = enum { vertical, horizontal };
+
+/// A leaf of the pane tree: one session connection rendered into a
+/// rectangle of the viewport. This is the old single-view state, now
+/// one instance per pane.
+const Pane = struct {
+    /// The session connection shown in this pane.
+    view: ?*View = null,
+    /// Name of the session `view` is attached to; outlives a transient
+    /// listing failure, like the old Ui.view_name.
+    view_name: ?[]u8 = null,
+    /// Where the pane sits on screen, recomputed by relayoutPanes.
+    rect: Rect = .{},
+    /// Bumped on every (re)attach; detects a view swap between poll and
+    /// the socket read, like the old Ui.view_gen.
+    gen: u64 = 0,
+    /// Hold the pane blank until the attach replay's `.screen` arrives,
+    /// like the old Ui.awaiting_attach_repaint.
+    awaiting_attach_repaint: bool = false,
+    /// Per-pane serialized viewport rows, indexed by the pane's local
+    /// row, reused across frames when libghostty reports a row unchanged.
+    viewport_cache: std.ArrayList(ViewportRow) = .empty,
+};
+
+/// An internal node: a split of two child nodes along one orientation.
+const Split = struct {
+    orientation: Orientation,
+    a: *Node,
+    b: *Node,
+};
+
+/// A node of the pane tree: either a leaf pane or a split.
+const Node = struct {
+    parent: ?*Node = null,
+    data: union(enum) {
+        leaf: Pane,
+        split: Split,
+    },
+
+    fn isLeaf(self: *const Node) bool {
+        return self.data == .leaf;
+    }
+};
+
+/// A vertical divider column between two side-by-side panes.
+const VBorder = struct { col: u16, y0: u16, y1: u16, focus: bool = false };
+/// A horizontal divider row between two stacked panes.
+const HBorder = struct { row: u16, x0: u16, x1: u16, focus: bool = false };
+
+/// Most panes a single ui can host at once; bounds the poll fd array.
+const max_panes = 16;
+
 const Ui = struct {
     alloc: std.mem.Allocator,
     dir: []const u8,
@@ -1144,12 +1206,22 @@ const Ui = struct {
     host_name: ?[]const u8 = null,
     /// Name of the previously focused session for C-a C-a toggling.
     last_name: ?[]u8 = null,
-    /// Session name the current view is attached to; outlives a
-    /// transient disappearance from the listing, unlike `selected`.
-    view_name: ?[]u8 = null,
     /// First visible session row when the list overflows.
     scroll: usize = 0,
-    view: ?*View = null,
+
+    /// Root of the pane split tree and the currently focused leaf. Both
+    /// are null until initPanes runs; a few unit tests drive a bare Ui
+    /// without panes.
+    root: ?*Node = null,
+    focused: ?*Node = null,
+    /// Leaf panes in render order (left-to-right, top-to-bottom) and the
+    /// dividers between them, both recomputed by relayoutPanes.
+    panes: std.ArrayList(*Node) = .empty,
+    vborders: std.ArrayList(VBorder) = .empty,
+    hborders: std.ArrayList(HBorder) = .empty,
+    /// Bumped whenever a view socket is opened or closed, so a poll
+    /// snapshot can tell its fd set went stale before the reads run.
+    poll_gen: u64 = 0,
 
     parser: InputParser = .{},
     /// When nonzero, the parser holds a lone ESC that is flushed as
@@ -1193,18 +1265,9 @@ const Ui = struct {
     /// Per-screen-row cache of the last emitted bytes; rows that did
     /// not change are not re-sent.
     row_cache: std.ArrayList(std.ArrayList(u8)) = .empty,
-    /// Per-screen-row cache of the serialized viewport row bytes,
-    /// reused across frames when libghostty reports the row unchanged.
-    viewport_cache: std.ArrayList(ViewportRow) = .empty,
     need_render: bool = true,
     /// Force every row out on the next render (resize, C-a l).
     full_render: bool = true,
-    /// A freshly focused view is seeded by the daemon with a scrollback
-    /// history replay followed by a repaint that ends in a `.screen`
-    /// message. Until that marker arrives the viewport is painted blank
-    /// rather than from the half-applied stream, so a large history
-    /// replay never flashes partial scrollback before the live screen.
-    awaiting_attach_repaint: bool = false,
     last_render_ms: i64 = 0,
     next_refresh_ms: i64 = 0,
 
@@ -1219,10 +1282,6 @@ const Ui = struct {
     select_anchor: ?CellPos = null,
     select_head: CellPos = .{ .x = 0, .y = 0 },
 
-    /// Incremented on every attach; detects view switches that happen
-    /// between poll() and the socket read.
-    view_gen: u64 = 0,
-
     quitting: bool = false,
     /// The quit command key was C-d; the deferred terminal restore
     /// uses the longer EOF drain guard, since a still-held C-d
@@ -1232,17 +1291,350 @@ const Ui = struct {
     const CellPos = struct { x: u16, y: u16 };
 
     fn deinit(self: *Ui) void {
-        if (self.view) |v| v.destroy();
+        self.deinitPanes();
         freeEntries(self.alloc, &self.sessions);
         if (self.last_name) |n| self.alloc.free(n);
-        if (self.view_name) |n| self.alloc.free(n);
         if (self.rename_input) |*input| input.deinit(self.alloc);
         if (self.goto_input) |*input| input.deinit(self.alloc);
         self.message.deinit(self.alloc);
         for (self.row_cache.items) |*row| row.deinit(self.alloc);
         self.row_cache.deinit(self.alloc);
-        for (self.viewport_cache.items) |*row| row.deinit(self.alloc);
-        self.viewport_cache.deinit(self.alloc);
+    }
+
+    // -- Pane tree ---------------------------------------------------------
+
+    /// Start with a single empty pane filling the viewport. Called once
+    /// before the loop; later splits grow the tree from here.
+    fn initPanes(self: *Ui) !void {
+        const node = try self.alloc.create(Node);
+        node.* = .{ .parent = null, .data = .{ .leaf = .{} } };
+        self.root = node;
+        self.focused = node;
+        try self.relayoutPanes();
+    }
+
+    fn deinitPanes(self: *Ui) void {
+        if (self.root) |root| self.freeNode(root);
+        self.root = null;
+        self.focused = null;
+        self.panes.deinit(self.alloc);
+        self.vborders.deinit(self.alloc);
+        self.hborders.deinit(self.alloc);
+    }
+
+    /// Recursively destroy a subtree: every view, cache, and node.
+    fn freeNode(self: *Ui, node: *Node) void {
+        switch (node.data) {
+            .leaf => |*pane| {
+                if (pane.view) |v| v.destroy();
+                if (pane.view_name) |n| self.alloc.free(n);
+                for (pane.viewport_cache.items) |*row| row.deinit(self.alloc);
+                pane.viewport_cache.deinit(self.alloc);
+            },
+            .split => |sp| {
+                self.freeNode(sp.a);
+                self.freeNode(sp.b);
+            },
+        }
+        self.alloc.destroy(node);
+    }
+
+    fn focusedPane(self: *Ui) ?*Pane {
+        const node = self.focused orelse return null;
+        return &node.data.leaf;
+    }
+
+    /// The focused pane's view regardless of state (live/ended/...).
+    fn focusedView(self: *Ui) ?*View {
+        const pane = self.focusedPane() orelse return null;
+        return pane.view;
+    }
+
+    fn paneCount(self: *Ui) usize {
+        return self.panes.items.len;
+    }
+
+    /// The first leaf reachable from `node`, descending the `a` side.
+    fn firstLeaf(node: *Node) *Node {
+        var n = node;
+        while (!n.isLeaf()) n = n.data.split.a;
+        return n;
+    }
+
+    /// Recompute every pane's rectangle from the tree, rebuild the leaf
+    /// and divider lists, and resize each pane's view (and the session
+    /// behind it) to fit. The single chokepoint for any geometry change.
+    fn relayoutPanes(self: *Ui) !void {
+        const root = self.root orelse return;
+        self.panes.clearRetainingCapacity();
+        self.vborders.clearRetainingCapacity();
+        self.hborders.clearRetainingCapacity();
+        const region: Rect = .{
+            .x = self.layout.viewportX(),
+            .y = 0,
+            .w = self.layout.viewportCols(),
+            .h = self.layout.viewportRows(),
+        };
+        try self.placeNode(root, region);
+    }
+
+    /// Assign `rect` to a node: store it on a leaf (and resize its view),
+    /// or divide it between a split's two children, recording the divider.
+    fn placeNode(self: *Ui, node: *Node, rect: Rect) !void {
+        switch (node.data) {
+            .leaf => |*pane| {
+                pane.rect = rect;
+                try self.panes.append(self.alloc, node);
+                while (pane.viewport_cache.items.len < rect.h) {
+                    try pane.viewport_cache.append(self.alloc, .{});
+                }
+                while (pane.viewport_cache.items.len > rect.h) {
+                    var row = pane.viewport_cache.pop() orelse break;
+                    row.deinit(self.alloc);
+                }
+                if (pane.view) |v| {
+                    v.resize(@max(rect.h, 1), @max(rect.w, 1)) catch |err| {
+                        log.warn("pane resize failed: {}", .{err});
+                    };
+                }
+            },
+            .split => |sp| {
+                const focus = self.focused == node.data.split.a or
+                    self.focused == node.data.split.b;
+                switch (sp.orientation) {
+                    .vertical => {
+                        // Side by side: a | b, one divider column.
+                        const avail = rect.w -| 1;
+                        const aw = avail / 2;
+                        const bw = avail -| aw;
+                        try self.placeNode(sp.a, .{ .x = rect.x, .y = rect.y, .w = aw, .h = rect.h });
+                        if (rect.w > 0) try self.vborders.append(self.alloc, .{
+                            .col = rect.x + aw,
+                            .y0 = rect.y,
+                            .y1 = rect.y + rect.h -| 1,
+                            .focus = focus,
+                        });
+                        try self.placeNode(sp.b, .{ .x = rect.x + aw + 1, .y = rect.y, .w = bw, .h = rect.h });
+                    },
+                    .horizontal => {
+                        // Stacked: a over b, one divider row.
+                        const avail = rect.h -| 1;
+                        const ah = avail / 2;
+                        const bh = avail -| ah;
+                        try self.placeNode(sp.a, .{ .x = rect.x, .y = rect.y, .w = rect.w, .h = ah });
+                        if (rect.h > 0) try self.hborders.append(self.alloc, .{
+                            .row = rect.y + ah,
+                            .x0 = rect.x,
+                            .x1 = rect.x + rect.w -| 1,
+                            .focus = focus,
+                        });
+                        try self.placeNode(sp.b, .{ .x = rect.x, .y = rect.y + ah + 1, .w = rect.w, .h = bh });
+                    },
+                }
+            },
+        }
+    }
+
+    /// Split the focused pane, opening a new session in the new half and
+    /// focusing it.
+    fn splitFocused(self: *Ui, orientation: Orientation) void {
+        if (!self.splitFocusedNode(orientation)) return;
+        // Born at the new pane's size so its first prompt is not mis-sized.
+        self.spawnSessionInFocused();
+        self.full_render = true;
+        self.need_render = true;
+    }
+
+    /// Tree surgery for a split: convert the focused leaf into a split
+    /// of itself and a fresh empty pane, focus the new pane, and
+    /// recompute the layout. Returns false (with a message) when the
+    /// pane cap is reached or allocation fails. Kept separate from the
+    /// session spawn so the geometry is unit-testable.
+    fn splitFocusedNode(self: *Ui, orientation: Orientation) bool {
+        if (self.paneCount() >= max_panes) {
+            self.setMessage("too many panes", .{});
+            return false;
+        }
+        const node = self.focused orelse return false;
+        std.debug.assert(node.isLeaf());
+
+        const moved = self.alloc.create(Node) catch {
+            self.setMessage("split failed", .{});
+            return false;
+        };
+        const sibling = self.alloc.create(Node) catch {
+            self.alloc.destroy(moved);
+            self.setMessage("split failed", .{});
+            return false;
+        };
+        // Move the focused pane into its own node, then convert the
+        // focused node in place into the split that holds both halves.
+        moved.* = .{ .parent = node, .data = node.data };
+        sibling.* = .{ .parent = node, .data = .{ .leaf = .{} } };
+        node.data = .{ .split = .{ .orientation = orientation, .a = moved, .b = sibling } };
+
+        self.focused = sibling;
+        self.relayoutPanes() catch {};
+        return true;
+    }
+
+    /// Remove a leaf node from the tree, giving its space to its sibling.
+    /// The only pane is kept (its view dropped) instead. Returns the leaf
+    /// node that should receive focus afterwards. The sibling node keeps
+    /// its allocation, so pointers into it (including self.focused) stay
+    /// valid; only the removed leaf and its parent split are freed.
+    fn collapseNode(self: *Ui, node: *Node) *Node {
+        std.debug.assert(node.isLeaf());
+        const parent = node.parent orelse {
+            // The only pane: drop its view and leave an empty pane.
+            self.dropPaneView(&node.data.leaf);
+            return node;
+        };
+        const sp = parent.data.split;
+        const sibling = if (sp.a == node) sp.b else sp.a;
+        const grand = parent.parent;
+
+        // Lift the sibling into the parent's place in the grandparent
+        // (or the root), keeping the sibling allocation intact.
+        sibling.parent = grand;
+        if (grand) |g| {
+            if (g.data.split.a == parent) {
+                g.data.split.a = sibling;
+            } else {
+                g.data.split.b = sibling;
+            }
+        } else {
+            self.root = sibling;
+        }
+        self.alloc.destroy(parent);
+
+        self.dropPaneView(&node.data.leaf);
+        for (node.data.leaf.viewport_cache.items) |*row| row.deinit(self.alloc);
+        node.data.leaf.viewport_cache.deinit(self.alloc);
+        self.alloc.destroy(node);
+
+        return firstLeaf(sibling);
+    }
+
+    /// Close a pane's session connection, leaving the pane empty.
+    fn dropPaneView(self: *Ui, pane: *Pane) void {
+        if (pane.view) |v| {
+            v.destroy();
+            pane.view = null;
+            self.poll_gen +%= 1;
+        }
+        if (pane.view_name) |n| self.alloc.free(n);
+        pane.view_name = null;
+        pane.awaiting_attach_repaint = false;
+    }
+
+    /// Find the leaf pane in `dir` from the focused pane, using a probe
+    /// point just past the focused pane's edge at its midpoint.
+    fn paneNeighbor(self: *Ui, dir: InputEvent.Arrow.Dir) ?*Node {
+        const cur = self.focused orelse return null;
+        if (!cur.isLeaf()) return null;
+        const r = cur.data.leaf.rect;
+        const cx = r.x + r.w / 2;
+        const cy = r.y + r.h / 2;
+        // Signed probe coordinates: a point one cell beyond the divider.
+        const px: i32 = switch (dir) {
+            .left => @as(i32, r.x) - 2,
+            .right => @as(i32, r.x) + r.w + 1,
+            else => cx,
+        };
+        const py: i32 = switch (dir) {
+            .up => @as(i32, r.y) - 2,
+            .down => @as(i32, r.y) + r.h + 1,
+            else => cy,
+        };
+        if (px < 0 or py < 0) return null;
+        const tx: u16 = @intCast(px);
+        const ty: u16 = @intCast(py);
+        for (self.panes.items) |node| {
+            if (node == cur) continue;
+            const pr = node.data.leaf.rect;
+            if (tx >= pr.x and tx < pr.x + pr.w and ty >= pr.y and ty < pr.y + pr.h) {
+                return node;
+            }
+        }
+        return null;
+    }
+
+    /// Move keyboard focus to an adjacent pane and follow it in the
+    /// sidebar. No session is attached or detached: panes keep their
+    /// own connections.
+    fn navigatePane(self: *Ui, dir: InputEvent.Arrow.Dir) void {
+        const target = self.paneNeighbor(dir) orelse return;
+        self.focused = target;
+        self.select_anchor = null;
+        self.syncSelectedToFocus();
+        // The focused-pane highlight moved; redraw the dividers.
+        self.relayoutPanes() catch {};
+        self.full_render = true;
+        self.need_render = true;
+    }
+
+    /// Cycle keyboard focus to the next pane in render order: C-a o.
+    fn focusNextPane(self: *Ui) void {
+        if (self.paneCount() <= 1) return;
+        var idx: usize = 0;
+        for (self.panes.items, 0..) |node, i| {
+            if (node == self.focused) {
+                idx = i;
+                break;
+            }
+        }
+        const next = self.panes.items[(idx + 1) % self.panes.items.len];
+        self.focused = next;
+        self.select_anchor = null;
+        self.syncSelectedToFocus();
+        self.relayoutPanes() catch {};
+        self.full_render = true;
+        self.need_render = true;
+    }
+
+    /// Close the focused pane, detaching its session (it keeps running)
+    /// and giving the space to a sibling: C-a x. The last pane is left
+    /// in place; quit the ui instead.
+    fn closeFocusedPane(self: *Ui) void {
+        if (self.paneCount() <= 1) {
+            self.setMessage("last pane: C-a d quits", .{});
+            return;
+        }
+        const node = self.focused orelse return;
+        const new_focus = self.collapseNode(node);
+        self.focused = new_focus;
+        self.select_anchor = null;
+        self.relayoutPanes() catch {};
+        self.syncSelectedToFocus();
+        self.full_render = true;
+        self.need_render = true;
+    }
+
+    /// Point the sidebar selection at the focused pane's session.
+    fn syncSelectedToFocus(self: *Ui) void {
+        const pane = self.focusedPane() orelse return;
+        const want = pane.view_name orelse return;
+        for (self.sessions.items, 0..) |entry, i| {
+            if (std.mem.eql(u8, entry.name, want)) {
+                self.selected = i;
+                self.scrollSelectedIntoView();
+                return;
+            }
+        }
+    }
+
+    /// Whether any pane already shows session `name` with a live view.
+    fn paneShowing(self: *Ui, name: []const u8) ?*Node {
+        for (self.panes.items) |node| {
+            const pane = node.data.leaf;
+            if (pane.view) |v| {
+                if (v.state != .live) continue;
+                const vn = pane.view_name orelse continue;
+                if (std.mem.eql(u8, vn, name)) return node;
+            }
+        }
+        return null;
     }
 
     // -- Main loop ---------------------------------------------------------
@@ -1253,17 +1645,26 @@ const Ui = struct {
         while (!self.quitting) {
             try self.renderIfNeeded();
 
-            var fds = [_]posix.pollfd{
-                .{ .fd = self.tty, .events = posix.POLL.IN, .revents = 0 },
-                .{ .fd = sig_read, .events = posix.POLL.IN, .revents = 0 },
-                .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 },
-            };
-            // Only a live view's socket is polled: a dead one stays
-            // readable (EOF) forever and would spin the loop.
-            if (self.liveView()) |v| fds[2].fd = v.sock;
-            const polled_gen = self.view_gen;
+            // The TTY and signal pipe, then one slot per live pane socket.
+            var fds: [2 + max_panes]posix.pollfd = undefined;
+            fds[0] = .{ .fd = self.tty, .events = posix.POLL.IN, .revents = 0 };
+            fds[1] = .{ .fd = sig_read, .events = posix.POLL.IN, .revents = 0 };
+            var watched: [max_panes]*Node = undefined;
+            var nwatch: usize = 0;
+            for (self.panes.items) |node| {
+                if (nwatch >= max_panes) break;
+                const pane = node.data.leaf;
+                const v = pane.view orelse continue;
+                // A dead view stays readable (EOF) forever and would spin
+                // the loop, so only live sockets are polled.
+                if (v.state != .live) continue;
+                fds[2 + nwatch] = .{ .fd = v.sock, .events = posix.POLL.IN, .revents = 0 };
+                watched[nwatch] = node;
+                nwatch += 1;
+            }
+            const polled_gen = self.poll_gen;
 
-            _ = try posix.poll(&fds, self.pollTimeout());
+            _ = try posix.poll(fds[0 .. 2 + nwatch], self.pollTimeout());
 
             if (fds[1].revents != 0) self.drainSignals(sig_read, &buf);
             if (self.quitting) break;
@@ -1277,12 +1678,18 @@ const Ui = struct {
             // for view-driven changes.)
             self.syncKeyboard();
 
-            // Input handling may have switched the focused session;
-            // the poll result then describes the old socket, and
-            // reading the new (still quiet) one would block the UI.
-            if (fds[2].revents != 0 and self.view_gen == polled_gen) {
-                try self.readView(&buf);
+            // Input handling may have opened, closed, or swapped a pane's
+            // view; the poll result then describes a stale fd set, so the
+            // reads wait for the next iteration.
+            if (self.poll_gen == polled_gen) {
+                for (0..nwatch) |i| {
+                    if (fds[2 + i].revents == 0) continue;
+                    try self.readView(&watched[i].data.leaf, &buf);
+                    if (self.poll_gen != polled_gen) break;
+                }
             }
+            // Collapse any pane whose session ended or socket broke.
+            self.reapDeadPanes();
 
             const now = std.time.milliTimestamp();
             if (now >= self.next_refresh_ms) {
@@ -1295,16 +1702,22 @@ const Ui = struct {
                 self.message_deadline = 0;
                 self.need_render = true;
             }
-            if (self.view) |v| {
+            // Forward any pane's bell; a title change refreshes the
+            // sidebar. refreshSessions can destroy a view, so the title
+            // pass runs last and stops at the first change.
+            for (self.panes.items) |node| {
+                const v = node.data.leaf.view orelse continue;
                 if (v.bell) {
                     v.bell = false;
                     protocol.writeAll(1, "\x07") catch {};
                 }
-                // Last: refreshSessions can destroy the view, so `v`
-                // must not be touched after it runs.
+            }
+            for (self.panes.items) |node| {
+                const v = node.data.leaf.view orelse continue;
                 if (v.title_changed) {
                     v.title_changed = false;
                     self.refreshSessions() catch {};
+                    break;
                 }
             }
             self.syncKeyboard();
@@ -1499,41 +1912,51 @@ const Ui = struct {
                 // force the flags back on when the mode ends.
                 if (self.uiOwnsKeyboard()) self.parser.swallow_cp = null;
             },
-            .arrow => |a| switch (a.dir) {
-                .left, .right => {
-                    // A prefixed side arrow always resizes the
-                    // sidebar; a bare one resizes only while the
-                    // resize is active, and belongs to the
-                    // application otherwise.
-                    if (a.prefixed or self.resizing) {
-                        self.resizeMove(if (a.dir == .left) -1 else 1);
-                        return;
-                    }
-                    if (self.browsing) {
-                        // Like any other key, a bare side arrow
-                        // ends the browse and flows onward.
-                        self.browsing = false;
-                        self.need_render = true;
-                    }
-                    const v = self.liveView() orelse return;
-                    self.snapViewBottom();
-                    v.sendInput(a.bytes()) catch self.markViewLost();
-                },
-                .up, .down => {
-                    // An active resize keeps its width before the
-                    // arrow browses or forwards.
-                    if (self.resizing) self.commitResize();
-                    // A prefixed arrow always browses; a bare one browses
-                    // only while the browse is active or nothing live is
-                    // focused, and belongs to the application otherwise.
-                    if (a.prefixed or self.browsing or self.liveView() == null) {
-                        self.browseMove(if (a.dir == .up) -1 else 1);
-                        return;
-                    }
-                    const v = self.liveView() orelse return;
-                    self.snapViewBottom();
-                    v.sendInput(a.bytes()) catch self.markViewLost();
-                },
+            .arrow => |a| {
+                // With more than one pane, a prefixed arrow moves
+                // keyboard focus between panes instead of resizing the
+                // sidebar or browsing the session list.
+                if (a.prefixed and self.paneCount() > 1) {
+                    self.navigatePane(a.dir);
+                    return;
+                }
+                switch (a.dir) {
+                    .left, .right => {
+                        // A prefixed side arrow always resizes the
+                        // sidebar; a bare one resizes only while the
+                        // resize is active, and belongs to the
+                        // application otherwise.
+                        if (a.prefixed or self.resizing) {
+                            self.resizeMove(if (a.dir == .left) -1 else 1);
+                            return;
+                        }
+                        if (self.browsing) {
+                            // Like any other key, a bare side arrow
+                            // ends the browse and flows onward.
+                            self.browsing = false;
+                            self.need_render = true;
+                        }
+                        const v = self.liveView() orelse return;
+                        self.snapViewBottom();
+                        v.sendInput(a.bytes()) catch self.markViewLost();
+                    },
+                    .up, .down => {
+                        // An active resize keeps its width before the
+                        // arrow browses or forwards.
+                        if (self.resizing) self.commitResize();
+                        // A prefixed arrow always browses; a bare one
+                        // browses only while the browse is active or
+                        // nothing live is focused, and belongs to the
+                        // application otherwise.
+                        if (a.prefixed or self.browsing or self.liveView() == null) {
+                            self.browseMove(if (a.dir == .up) -1 else 1);
+                            return;
+                        }
+                        const v = self.liveView() orelse return;
+                        self.snapViewBottom();
+                        v.sendInput(a.bytes()) catch self.markViewLost();
+                    },
+                }
             },
             .mouse => |m| {
                 // Mouse actions may refocus or reorder everything
@@ -1692,6 +2115,10 @@ const Ui = struct {
             'n', 0x0e => self.focusOffset(1),
             'p', 0x10 => self.focusOffset(-1),
             's', 0x13 => self.toggleSidebar(),
+            '-' => self.splitFocused(.horizontal),
+            '|' => self.splitFocused(.vertical),
+            'o', 0x0f => self.focusNextPane(),
+            'x', 0x18 => self.closeFocusedPane(),
             keys.escape_byte => self.focusLast(),
             'l', 0x0c => {
                 // Re-seed the local terminal from daemon state and
@@ -1719,6 +2146,30 @@ const Ui = struct {
         }
     }
 
+    /// The leaf pane whose rectangle contains the absolute screen cell,
+    /// or null for a divider or non-viewport cell.
+    fn paneAt(self: *Ui, x: u16, y: u16) ?*Node {
+        for (self.panes.items) |node| {
+            const r = node.data.leaf.rect;
+            if (x >= r.x and x < r.x + r.w and y >= r.y and y < r.y + r.h) {
+                return node;
+            }
+        }
+        return null;
+    }
+
+    /// Move keyboard focus to a pane the pointer landed in, following it
+    /// in the sidebar. No session is attached or detached.
+    fn focusPaneNode(self: *Ui, node: *Node) void {
+        if (node == self.focused) return;
+        self.focused = node;
+        self.select_anchor = null;
+        self.syncSelectedToFocus();
+        self.relayoutPanes() catch {};
+        self.full_render = true;
+        self.need_render = true;
+    }
+
     fn handleMouse(self: *Ui, m: Mouse) !void {
         if (m.x == 0 or m.y == 0) return;
         const x: u16 = m.x - 1;
@@ -1732,14 +2183,20 @@ const Ui = struct {
         }
 
         // An in-progress viewport selection captures the drag and the
-        // release wherever the pointer wanders.
+        // release wherever the pointer wanders, in the focused pane's
+        // local coordinates.
         if (self.select_anchor != null and !m.isWheel() and (m.isMotion() or m.release)) {
-            return self.dragSelection(m, x -| self.layout.viewportX(), y);
+            const fr = if (self.focusedPane()) |p| p.rect else Rect{};
+            return self.dragSelection(m, x -| fr.x, y -| fr.y);
         }
 
         if (m.isWheel() and !m.release) {
             switch (self.layout.hit(x, y)) {
-                .viewport => return self.wheelViewport(m),
+                .viewport => {
+                    // Scroll the pane under the pointer.
+                    if (self.paneAt(x, y)) |node| self.focusPaneNode(node);
+                    return self.wheelViewport(m);
+                },
                 else => {
                     // Wheel over the sidebar scrolls the session list.
                     const down = m.code & 1 != 0;
@@ -1756,15 +2213,20 @@ const Ui = struct {
         }
 
         switch (self.layout.hit(x, y)) {
-            .viewport => |cell| {
+            .viewport => {
+                // Resolve the click to a pane and focus it; a click on a
+                // divider hits no pane and is ignored.
+                const node = self.paneAt(x, y) orelse return;
+                self.focusPaneNode(node);
+                const pane = &node.data.leaf;
                 // Applications that asked for mouse reporting get the
                 // events; otherwise a left press starts a selection.
                 const v = self.liveView() orelse return;
                 if (v.term.flags.mouse_event != .none) return self.forwardMouse(m);
                 if (m.release or m.isMotion() or m.code & 3 != 0) return;
                 self.select_anchor = .{
-                    .x = @min(cell.x, v.term.cols -| 1),
-                    .y = @min(cell.y, v.term.rows -| 1),
+                    .x = @min(x -| pane.rect.x, v.term.cols -| 1),
+                    .y = @min(y -| pane.rect.y, v.term.rows -| 1),
                 };
                 self.select_head = self.select_anchor.?;
                 self.need_render = true;
@@ -1824,7 +2286,7 @@ const Ui = struct {
 
     /// Whether the focused view's viewport is scrolled into history.
     fn viewScrolled(self: *Ui) bool {
-        const v = self.view orelse return false;
+        const v = self.focusedView() orelse return false;
         if (v.state != .live) return false;
         return !v.term.screens.active.viewportIsBottom();
     }
@@ -1833,7 +2295,7 @@ const Ui = struct {
     /// the user can see it.
     fn snapViewBottom(self: *Ui) void {
         if (!self.viewScrolled()) return;
-        if (self.view) |v| v.term.scrollViewport(.{ .bottom = {} });
+        if (self.focusedView()) |v| v.term.scrollViewport(.{ .bottom = {} });
         self.full_render = true;
         self.need_render = true;
     }
@@ -1865,8 +2327,9 @@ const Ui = struct {
 
         if (v.term.flags.mouse_event == .none) return;
 
-        const cell_x: u16 = (m.x - 1) -| self.layout.viewportX();
-        const cell_y: u16 = m.y - 1;
+        const pane_rect = if (self.focusedPane()) |p| p.rect else Rect{};
+        const cell_x: u16 = (m.x - 1) -| pane_rect.x;
+        const cell_y: u16 = (m.y - 1) -| pane_rect.y;
 
         const SizeType = @FieldType(vt.input.MouseEncodeOptions, "size");
         const size: SizeType = .{
@@ -1995,26 +2458,24 @@ const Ui = struct {
 
     // -- Daemon output -------------------------------------------------------
 
-    fn readView(self: *Ui, buf: []u8) !void {
-        const v = self.view orelse return;
+    /// Drain a pane's daemon socket. Only the pane's own view state is
+    /// touched; collapsing a dead pane is deferred to reapDeadPanes so
+    /// the caller's poll set is never freed mid-iteration.
+    fn readView(self: *Ui, pane: *Pane, buf: []u8) !void {
+        const v = pane.view orelse return;
         if (v.state != .live) return;
         const n = posix.read(v.sock, buf) catch 0;
         if (n == 0) {
-            self.markViewLost();
+            self.markPaneLost(pane);
             return;
         }
         v.decoder.feed(buf[0..n]) catch {
-            self.markViewLost();
+            self.markPaneLost(pane);
             return;
         };
-        // refreshSessions can destroy the view (it collects dead
-        // views and attaches replacement sessions), which would leave
-        // `v` dangling, so an exit defers the refresh until the
-        // message loop is done with the pointer.
-        var ended = false;
         while (true) {
             const msg = v.decoder.next() catch {
-                self.markViewLost();
+                self.markPaneLost(pane);
                 return;
             } orelse break;
             switch (msg.type) {
@@ -2035,7 +2496,7 @@ const Ui = struct {
                     // while they were painted blank, and composeFrame
                     // clears libghostty's dirty bits every one of those
                     // frames, so the rows are no longer flagged dirty:
-                    // invalidate the viewport cache so the reveal
+                    // invalidate this pane's viewport cache so the reveal
                     // re-serializes them from the now-complete screen
                     // rather than reusing stale bytes. This stops short
                     // of a full repaint on purpose. The row-level diff
@@ -2048,15 +2509,14 @@ const Ui = struct {
                     // larger write (macOS PTY buffering, see restoreTty)
                     // and wedges the loop before it reads the next key
                     // or SIGWINCH.
-                    if (self.awaiting_attach_repaint) {
-                        self.awaiting_attach_repaint = false;
-                        for (self.viewport_cache.items) |*row| row.valid = false;
+                    if (pane.awaiting_attach_repaint) {
+                        pane.awaiting_attach_repaint = false;
+                        for (pane.viewport_cache.items) |*row| row.valid = false;
                         self.need_render = true;
                     }
                 },
                 .exit => {
                     v.state = .ended;
-                    ended = true;
                     self.setMessage("session ended", .{});
                     self.need_render = true;
                 },
@@ -2064,19 +2524,56 @@ const Ui = struct {
             }
             if (v.state != .live) break;
         }
-        if (ended) self.refreshSessions() catch {};
+    }
+
+    /// Collapse panes whose session ended or whose socket broke, giving
+    /// their space to a sibling. The last remaining pane is kept (it
+    /// shows the placard or splash and is reclaimed by refreshSessions),
+    /// matching the single-pane behavior.
+    fn reapDeadPanes(self: *Ui) void {
+        var changed = false;
+        while (true) {
+            var dead: ?*Node = null;
+            for (self.panes.items) |node| {
+                if (node.parent == null) continue; // the last pane stays
+                const st = if (node.data.leaf.view) |v| v.state else continue;
+                if (st == .ended or st == .lost) {
+                    dead = node;
+                    break;
+                }
+            }
+            const node = dead orelse break;
+            const was_focused = self.focused == node;
+            const new_focus = self.collapseNode(node);
+            if (was_focused) self.focused = new_focus;
+            self.relayoutPanes() catch {};
+            changed = true;
+        }
+        if (changed) {
+            self.syncSelectedToFocus();
+            self.full_render = true;
+            self.need_render = true;
+            self.refreshSessions() catch {};
+        }
     }
 
     fn liveView(self: *Ui) ?*View {
-        const v = self.view orelse return null;
+        const pane = self.focusedPane() orelse return null;
+        const v = pane.view orelse return null;
         if (v.state != .live) return null;
         return v;
     }
 
-    fn markViewLost(self: *Ui) void {
-        if (self.view) |v| {
+    fn markPaneLost(self: *Ui, pane: *Pane) void {
+        if (pane.view) |v| {
             if (v.state == .live) v.state = .lost;
         }
+        self.need_render = true;
+    }
+
+    /// Mark the focused pane's view lost: a write to it failed.
+    fn markViewLost(self: *Ui) void {
+        if (self.focusedPane()) |pane| self.markPaneLost(pane);
         self.refreshSessions() catch {};
         self.need_render = true;
     }
@@ -2127,9 +2624,10 @@ const Ui = struct {
         freeEntries(self.alloc, &self.sessions);
         self.sessions = fresh;
 
-        // Restore selection by name; the focused view's session counts
+        // Restore selection by name; the focused pane's session counts
         // even when the sidebar selection was already empty.
-        const want_name: ?[]const u8 = selected_name orelse self.view_name;
+        const focused_name: ?[]const u8 = if (self.focusedPane()) |p| p.view_name else null;
+        const want_name: ?[]const u8 = selected_name orelse focused_name;
         self.selected = null;
         if (want_name) |want| {
             for (self.sessions.items, 0..) |entry, i| {
@@ -2155,15 +2653,12 @@ const Ui = struct {
             // the empty state, and selecting (without attaching) the
             // most recent session keeps a focus target around, the
             // same fallback startup uses.
-            if (self.view) |v| {
-                if (v.state != .live) {
-                    v.destroy();
-                    self.view = null;
-                    if (self.view_name) |n| self.alloc.free(n);
-                    self.view_name = null;
+            if (self.focusedPane()) |pane| {
+                if (pane.view) |v| {
+                    if (v.state != .live) self.dropPaneView(pane);
                 }
             }
-            if (self.view == null and !self.browsing) {
+            if (self.focusedView() == null and !self.browsing) {
                 self.selectInitial();
                 self.scrollSelectedIntoView();
             }
@@ -2186,7 +2681,10 @@ const Ui = struct {
     fn maybeReclaim(self: *Ui, idx: usize) void {
         if (self.browsing) return;
         if (self.sessions.items[idx].attached) return;
-        const broken = if (self.view) |v|
+        // A session already shown live in some pane is not reclaimed
+        // into the focused pane; it stays where it is.
+        if (self.paneShowing(self.sessions.items[idx].name)) |_| return;
+        const broken = if (self.focusedView()) |v|
             v.state == .stolen or v.state == .lost
         else
             true;
@@ -2226,39 +2724,38 @@ const Ui = struct {
         self.selected = best;
     }
 
+    /// Attach the selected session into the focused pane, replacing
+    /// whatever it showed before.
     fn attachSelected(self: *Ui) void {
         const idx = self.selected orelse return;
+        const pane = self.focusedPane() orelse return;
         const name = self.sessions.items[idx].name;
 
-        if (self.view) |v| {
-            v.destroy();
-            self.view = null;
-        }
-        if (self.view_name) |n| self.alloc.free(n);
-        self.view_name = null;
+        self.dropPaneView(pane);
 
         const sock = paths.socketPath(self.alloc, self.dir, name) catch return;
         defer self.alloc.free(sock);
-        self.view = View.create(
+        pane.view = View.create(
             self.alloc,
             sock,
-            self.layout.viewportRows(),
-            self.layout.viewportCols(),
+            @max(pane.rect.h, 1),
+            @max(pane.rect.w, 1),
         ) catch |err| {
             self.setMessage("attach {s} failed: {s}", .{ name, @errorName(err) });
             return;
         };
-        self.view_name = self.alloc.dupe(u8, name) catch null;
+        self.poll_gen +%= 1;
+        pane.view_name = self.alloc.dupe(u8, name) catch null;
         self.select_anchor = null;
         // Any attach ends an in-progress browse: the selection and
         // the focused session are one again.
         self.browsing = false;
-        self.view_gen += 1;
+        pane.gen +%= 1;
         self.full_render = true;
         self.need_render = true;
         // The daemon streams this view's history then a repaint; hold
-        // the viewport blank until that repaint's `.screen` arrives.
-        self.awaiting_attach_repaint = true;
+        // the pane blank until that repaint's `.screen` arrives.
+        pane.awaiting_attach_repaint = true;
     }
 
     fn rememberLast(self: *Ui, idx: usize) void {
@@ -2271,6 +2768,21 @@ const Ui = struct {
         if (idx >= self.sessions.items.len) return;
         if (self.isHost(idx)) {
             self.setMessage("{s} hosts this ui", .{self.sessions.items[idx].name});
+            return;
+        }
+        // The session may already be live in another pane: move keyboard
+        // focus there instead of stealing it into the focused pane.
+        if (self.paneShowing(self.sessions.items[idx].name)) |node| {
+            if (node != self.focused) {
+                self.focused = node;
+                self.select_anchor = null;
+                self.relayoutPanes() catch {};
+                self.full_render = true;
+                self.need_render = true;
+            }
+            self.browsing = false;
+            self.selected = idx;
+            self.scrollSelectedIntoView();
             return;
         }
         if (self.selected) |cur| {
@@ -2372,8 +2884,10 @@ const Ui = struct {
         self.need_render = true;
         const idx = self.selected orelse return;
         if (self.liveView() != null and idx < self.sessions.items.len) {
-            if (self.view_name) |focused| {
-                if (std.mem.eql(u8, self.sessions.items[idx].name, focused)) return;
+            if (self.focusedPane()) |pane| {
+                if (pane.view_name) |focused| {
+                    if (std.mem.eql(u8, self.sessions.items[idx].name, focused)) return;
+                }
             }
         }
         self.focusIndex(idx);
@@ -2383,12 +2897,14 @@ const Ui = struct {
     /// session, mirroring how a cancelled goto restores its origin.
     fn cancelBrowse(self: *Ui) void {
         self.browsing = false;
-        if (self.view_name) |want| {
-            for (self.sessions.items, 0..) |entry, i| {
-                if (std.mem.eql(u8, entry.name, want)) {
-                    self.selected = i;
-                    self.scrollSelectedIntoView();
-                    break;
+        if (self.focusedPane()) |pane| {
+            if (pane.view_name) |want| {
+                for (self.sessions.items, 0..) |entry, i| {
+                    if (std.mem.eql(u8, entry.name, want)) {
+                        self.selected = i;
+                        self.scrollSelectedIntoView();
+                        break;
+                    }
                 }
             }
         }
@@ -2478,17 +2994,15 @@ const Ui = struct {
         self.viewportChanged();
     }
 
-    /// The viewport geometry changed: resize the live view (and the
-    /// session pty behind it) and repaint every row. Cell coordinates
-    /// shift with the layout, so any in-progress selection no longer
-    /// points at the text the user dragged over.
+    /// The viewport geometry changed: recompute pane rectangles, resize
+    /// every pane's view (and the session pty behind it), and repaint
+    /// every row. Cell coordinates shift with the layout, so any
+    /// in-progress selection no longer points at the dragged-over text.
     fn viewportChanged(self: *Ui) void {
         self.need_render = true;
-        if (self.view) |v| {
-            v.resize(self.layout.viewportRows(), self.layout.viewportCols()) catch |err| {
-                log.warn("viewport resize failed: {}", .{err});
-            };
-        }
+        self.relayoutPanes() catch |err| {
+            log.warn("pane relayout failed: {}", .{err});
+        };
         self.select_anchor = null;
         self.full_render = true;
     }
@@ -2502,21 +3016,27 @@ const Ui = struct {
         return @intCast(std.math.clamp(want, lo, hi));
     }
 
-    /// Create a session by re-running our own binary with `new -d`,
-    /// sized to the viewport so it is born at the geometry it will be
-    /// shown at. Otherwise the session starts at the daemon default and
-    /// is only corrected when the UI attaches, so its first prompt and
-    /// any early output land mis-sized until the next resize.
+    /// Create a session in the focused pane: C-a c. Sized to the pane so
+    /// it is born at the geometry it will be shown at.
+    fn createSession(self: *Ui) void {
+        self.spawnSessionInFocused();
+    }
+
+    /// Spawn a new detached session sized to the focused pane and attach
+    /// it there, by re-running our own binary with `new -d`. Sizing to
+    /// the pane up front avoids a mis-sized first prompt; otherwise the
+    /// session starts at the daemon default until the attach corrects it.
     ///
     /// The new session inherits the focused session's working directory
     /// (like Ghostty's new windows) so it opens where the user is. When
     /// that directory cannot be resolved or used, creation falls back to
     /// a plain `new` in boo's own directory so the keybind still works.
     ///
-    /// The exec drops every inherited descriptor (they are all
-    /// CLOEXEC), so the daemon cannot pin the UI's sockets open, and
-    /// naming falls back exactly like the CLI.
-    fn createSession(self: *Ui) void {
+    /// The exec drops every inherited descriptor (they are all CLOEXEC),
+    /// so the daemon cannot pin the UI's sockets open, and naming falls
+    /// back exactly like the CLI.
+    fn spawnSessionInFocused(self: *Ui) void {
+        const pane = self.focusedPane() orelse return;
         const exe = std.fs.selfExePathAlloc(self.alloc) catch {
             self.setMessage("create failed", .{});
             return;
@@ -2526,8 +3046,8 @@ const Ui = struct {
         // u16 is at most five digits; the buffers never overflow.
         var rows_buf: [6]u8 = undefined;
         var cols_buf: [6]u8 = undefined;
-        const rows = std.fmt.bufPrint(&rows_buf, "{d}", .{@max(self.layout.viewportRows(), 1)}) catch unreachable;
-        const cols = std.fmt.bufPrint(&cols_buf, "{d}", .{@max(self.layout.viewportCols(), 1)}) catch unreachable;
+        const rows = std.fmt.bufPrint(&rows_buf, "{d}", .{@max(pane.rect.h, 1)}) catch unreachable;
+        const cols = std.fmt.bufPrint(&cols_buf, "{d}", .{@max(pane.rect.w, 1)}) catch unreachable;
 
         const cwd = self.focusedCwd();
         defer if (cwd) |c| self.alloc.free(c);
@@ -2816,21 +3336,13 @@ const Ui = struct {
         const alloc = self.alloc;
         const l = self.layout;
 
-        // Grow/shrink the row cache to the current height.
+        // Grow/shrink the row cache to the current height. (Each pane's
+        // own viewport cache is sized by relayoutPanes.)
         while (self.row_cache.items.len < l.rows) {
             try self.row_cache.append(alloc, .empty);
         }
         while (self.row_cache.items.len > l.rows) {
             var row = self.row_cache.pop() orelse break;
-            row.deinit(alloc);
-        }
-
-        // The viewport cache tracks the same rows as the row cache.
-        while (self.viewport_cache.items.len < l.rows) {
-            try self.viewport_cache.append(alloc, .{});
-        }
-        while (self.viewport_cache.items.len > l.rows) {
-            var row = self.viewport_cache.pop() orelse break;
             row.deinit(alloc);
         }
 
@@ -2855,9 +3367,13 @@ const Ui = struct {
 
         const cursor = self.cursorSequence();
 
-        // The frame consumed this round's dirty bits; clear them so the
-        // next frame's viewport cache reuse reflects only new changes.
-        if (self.liveView()) |v| v.term.screens.active.pages.clearDirty();
+        // The frame consumed this round's dirty bits; clear them on every
+        // live pane so the next frame's viewport cache reuse reflects
+        // only new changes.
+        for (self.panes.items) |node| {
+            const v = node.data.leaf.view orelse continue;
+            v.term.screens.active.pages.clearDirty();
+        }
 
         if (body.items.len == 0 and !self.full_render) {
             // Row content unchanged; the cursor may still have moved.
@@ -2884,18 +3400,22 @@ const Ui = struct {
         var state: CursorState = .{};
         if (self.renameCursor()) |s| return s;
         if (self.gotoCursor()) |s| return s;
+        const pane = self.focusedPane() orelse return state;
         const v = self.liveView() orelse return state;
-        // The viewport is blank while the view is being seeded; keep the
+        // The pane is blank while the view is being seeded; keep the
         // cursor hidden until the attach repaint releases it.
-        if (self.awaiting_attach_repaint) return state;
+        if (pane.awaiting_attach_repaint) return state;
         // While scrolled back the cursor coordinates belong to the
         // bottom of the screen, not the history rows on display, so
         // keep the cursor hidden until the viewport snaps back.
         if (self.viewScrolled()) return state;
         const cursor = &v.term.screens.active.cursor;
-        const row: usize = @min(cursor.y, self.layout.viewportRows() -| 1);
+        const row: usize = @min(
+            @as(usize, cursor.y) + pane.rect.y,
+            self.layout.rows -| 1,
+        );
         const col: usize = @min(
-            @as(usize, cursor.x) + self.layout.viewportX(),
+            @as(usize, cursor.x) + pane.rect.x,
             self.layout.cols -| 1,
         );
         const text = std.fmt.bufPrint(&state.pos, "\x1b[{d};{d}H", .{
@@ -2977,11 +3497,11 @@ const Ui = struct {
             try out.appendSlice(alloc, "\u{2502}");
             try out.appendSlice(alloc, sgr_reset);
         }
-        try self.composeViewportCell(y, out);
+        try self.composeViewport(y, out);
     }
 
     const keybind_bar =
-        " c new  k kill  r rename  g goto  n/p switch  up/dn browse  lt/rt resize  s sidebar  d quit  C-a last  a literal  l redraw  esc cancel";
+        " c new  |- split  o/x pane  k kill  r rename  n/p switch  up/dn browse  lt/rt resize  d quit  C-a last  a literal  l redraw  esc cancel";
 
     /// Status content overlaid full-width on the last screen row
     /// while present: rename prompt, kill confirmation, the keybind
@@ -3052,8 +3572,103 @@ const Ui = struct {
         try appendClipped(alloc, out, "", w);
     }
 
-    /// Append the serialized bytes for viewport row `y`, reusing the
-    /// cached serialization when libghostty reports the row unchanged.
+    /// Move the cursor to a 0-based screen cell within the current row
+    /// string (rows are emitted with their own absolute positioning).
+    fn moveTo(self: *Ui, out: *std.ArrayList(u8), y: u16, x: u16) !void {
+        try out.print(self.alloc, "\x1b[{d};{d}H", .{ y + 1, x + 1 });
+    }
+
+    /// Compose the viewport region of screen row `y`: clear it, paint
+    /// each pane that intersects the row clipped to its rectangle, then
+    /// draw the dividers between panes on top.
+    fn composeViewport(self: *Ui, y: u16, out: *std.ArrayList(u8)) !void {
+        const alloc = self.alloc;
+
+        // Clear the whole viewport region (the cursor sits at viewportX,
+        // and the region always reaches the right edge). Clearing before
+        // drawing also avoids eating a right-edge cell left in the
+        // pending-wrap state, the reason EL runs before content.
+        try out.appendSlice(alloc, "\x1b[K");
+
+        for (self.panes.items) |node| {
+            const r = node.data.leaf.rect;
+            if (r.w == 0 or r.h == 0) continue;
+            if (y < r.y or y >= r.y + r.h) continue;
+            try self.composePaneRow(node, y, out);
+        }
+
+        // Dividers last, so they sit on top of the cleared region.
+        for (self.vborders.items) |b| {
+            if (y < b.y0 or y > b.y1) continue;
+            try self.moveTo(out, y, b.col);
+            try out.appendSlice(alloc, if (b.focus) sgr_reset else style_dim);
+            try out.appendSlice(alloc, "\u{2502}");
+            try out.appendSlice(alloc, sgr_reset);
+        }
+        for (self.hborders.items) |b| {
+            if (b.row != y) continue;
+            try self.moveTo(out, y, b.x0);
+            try out.appendSlice(alloc, if (b.focus) sgr_reset else style_dim);
+            var x = b.x0;
+            while (x <= b.x1) : (x += 1) try out.appendSlice(alloc, "\u{2500}");
+            try out.appendSlice(alloc, sgr_reset);
+        }
+    }
+
+    /// Paint one pane's slice of screen row `y`, positioned at the
+    /// pane's left edge. Live panes render terminal state; others show a
+    /// placard (or, for the single remaining pane, the splash).
+    fn composePaneRow(self: *Ui, node: *Node, y: u16, out: *std.ArrayList(u8)) !void {
+        const alloc = self.alloc;
+        const pane = &node.data.leaf;
+        const r = pane.rect;
+        const local_y = y - r.y;
+        try self.moveTo(out, y, r.x);
+
+        const v = pane.view orelse {
+            if (self.paneCount() <= 1) {
+                if (self.selected) |i| {
+                    if (self.sessions.items[i].attached) {
+                        return self.composePanePlacard(r, local_y, "attached elsewhere", "click the session to take it over", out);
+                    }
+                }
+                // Nothing is focusable (no sessions, or only this UI's
+                // host): the splash rather than a bare placard.
+                return self.composeSplash(r, local_y, out);
+            }
+            return self.composePanePlacard(r, local_y, "no session", "", out);
+        };
+
+        switch (v.state) {
+            .live => {},
+            .stolen => return self.composePanePlacard(r, local_y, "attached elsewhere", "click the session to steal it back", out),
+            .ended, .lost => return self.composePanePlacard(r, local_y, "session ended", "", out),
+        }
+
+        // While the view is still being seeded (history replay and
+        // repaint in flight) the pane stays blank, so a large replay
+        // never flashes partial scrollback before snapping to the live
+        // screen; the repaint's `.screen` releases it.
+        if (!pane.awaiting_attach_repaint and local_y < v.term.rows) {
+            try self.appendPaneViewportRow(pane, local_y, out);
+        }
+        try out.appendSlice(alloc, sgr_reset);
+
+        // An in-progress mouse selection (focused pane only) is
+        // highlighted by repainting the selected cells in reverse video.
+        if (node == self.focused) {
+            if (self.selectionSpan(local_y, v.term.cols)) |span| {
+                try self.moveTo(out, y, r.x + span.x0);
+                try out.appendSlice(alloc, style_selected);
+                try appendPlainSpan(alloc, &v.term, local_y, span.x0, span.x1, out);
+                try out.appendSlice(alloc, sgr_reset);
+            }
+        }
+    }
+
+    /// Append the serialized bytes for a pane's local viewport row,
+    /// reusing the cached serialization when libghostty reports the row
+    /// unchanged.
     ///
     /// A row is reused only when its libghostty identity (the page node
     /// and the offset within it) is unchanged and its dirty bit is
@@ -3062,17 +3677,24 @@ const Ui = struct {
     /// serialization; an in-place edit sets the dirty bit. `composeFrame`
     /// clears the dirty bits once per frame, so a clear bit means
     /// "unchanged since the last serialization".
-    fn appendViewportRow(self: *Ui, v: *View, y: u16, out: *std.ArrayList(u8)) !void {
+    fn appendPaneViewportRow(self: *Ui, pane: *Pane, local_y: u16, out: *std.ArrayList(u8)) !void {
         const alloc = self.alloc;
+        const v = pane.view orelse return;
         const screen = v.term.screens.active;
-        const pin = screen.pages.pin(.{ .viewport = .{ .x = 0, .y = y } }) orelse {
-            if (y < self.viewport_cache.items.len) {
-                self.viewport_cache.items[y].valid = false;
+        const pin = screen.pages.pin(.{ .viewport = .{ .x = 0, .y = local_y } }) orelse {
+            if (local_y < pane.viewport_cache.items.len) {
+                pane.viewport_cache.items[local_y].valid = false;
             }
             return;
         };
-        const entry = &self.viewport_cache.items[y];
-        const node: *const anyopaque = @ptrCast(pin.node);
+        if (local_y >= pane.viewport_cache.items.len) {
+            // Cache not grown to this row yet (a resize is pending);
+            // serialize directly this frame.
+            try appendTermRow(alloc, &v.term, local_y, out);
+            return;
+        }
+        const entry = &pane.viewport_cache.items[local_y];
+        const cache_node: *const anyopaque = @ptrCast(pin.node);
 
         if (viewportRowReusable(entry, pin, self.full_render)) {
             try out.appendSlice(alloc, entry.bytes.items);
@@ -3080,88 +3702,33 @@ const Ui = struct {
         }
 
         entry.bytes.clearRetainingCapacity();
-        try appendTermRow(alloc, &v.term, y, &entry.bytes);
-        entry.node = node;
+        try appendTermRow(alloc, &v.term, local_y, &entry.bytes);
+        entry.node = cache_node;
         entry.offset = pin.y;
         entry.valid = true;
         try out.appendSlice(alloc, entry.bytes.items);
     }
 
-    fn composeViewportCell(self: *Ui, y: u16, out: *std.ArrayList(u8)) !void {
-        const alloc = self.alloc;
-
-        // Erase before drawing. Erasing afterwards would eat the last
-        // cell of a row that touches the terminal's right edge: the
-        // cursor rests on that cell in the pending-wrap state, and EL
-        // erases from the cursor inclusive.
-        try out.appendSlice(alloc, "\x1b[K");
-
-        const v = self.view orelse {
-            if (self.selected) |i| {
-                if (self.sessions.items[i].attached) {
-                    try self.composeEmptyRow(y, "attached elsewhere", "click the session to take it over", out);
-                    return;
-                }
-            }
-            // Nothing is focusable (no sessions, or only this UI's
-            // host): the splash, rather than a placard with no
-            // actionable advice.
-            try self.composeNoSessions(y, out);
-            return;
-        };
-
-        switch (v.state) {
-            .live => {},
-            .stolen => {
-                try self.composeEmptyRow(y, "attached elsewhere", "click the session to steal it back", out);
-                return;
-            },
-            .ended, .lost => {
-                try self.composeEmptyRow(y, "session ended", "pick another session on the left", out);
-                return;
-            },
-        }
-
-        // While the view is still being seeded (history replay and
-        // repaint in flight) the viewport stays blank, so a large
-        // replay never flashes partial scrollback before snapping to
-        // the live screen; the repaint's `.screen` releases it.
-        if (!self.awaiting_attach_repaint and y < v.term.rows) {
-            try self.appendViewportRow(v, y, out);
-        }
-        try out.appendSlice(alloc, sgr_reset);
-
-        // An in-progress mouse selection is highlighted by repainting
-        // the selected cells in reverse video over the row content.
-        if (self.selectionSpan(y, v.term.cols)) |span| {
-            try out.print(alloc, "\x1b[{d};{d}H", .{
-                y + 1,
-                self.layout.viewportX() + span.x0 + 1,
-            });
-            try out.appendSlice(alloc, style_selected);
-            try appendPlainSpan(alloc, &v.term, y, span.x0, span.x1, out);
-            try out.appendSlice(alloc, sgr_reset);
-        }
-    }
-
-    fn composeEmptyRow(
+    /// A centered two-line placard within a pane rectangle, for panes
+    /// without a usable live view. The cursor is already at the pane's
+    /// left edge for this row.
+    fn composePanePlacard(
         self: *Ui,
-        y: u16,
-        comptime line1: []const u8,
-        comptime line2: []const u8,
+        rect: Rect,
+        local_y: u16,
+        line1: []const u8,
+        line2: []const u8,
         out: *std.ArrayList(u8),
     ) !void {
-        const l = self.layout;
-        const mid = l.viewportRows() / 2;
-        const text: []const u8 = if (y == mid)
+        const mid = rect.h / 2;
+        const text: []const u8 = if (local_y == mid)
             line1
-        else if (y == mid + 1)
+        else if (local_y == mid + 1)
             line2
         else
             return;
-        const vw = l.viewportCols();
-        if (text.len >= vw) return;
-        const pad = (vw - text.len) / 2;
+        if (text.len == 0 or text.len >= rect.w) return;
+        const pad = (rect.w - text.len) / 2;
         try out.appendSlice(self.alloc, style_dim);
         for (0..pad) |_| try out.append(self.alloc, ' ');
         try out.appendSlice(self.alloc, text);
@@ -3179,17 +3746,17 @@ const Ui = struct {
 
     /// Empty state when nothing is focusable: no sessions at all, or
     /// only ones this UI must not attach on its own. The wordmark art
-    /// centered as a block, then a hint underneath.
-    fn composeNoSessions(self: *Ui, y: u16, out: *std.ArrayList(u8)) !void {
+    /// centered in the pane, then a hint underneath. The cursor is
+    /// already at the pane's left edge for this row.
+    fn composeSplash(self: *Ui, rect: Rect, local_y: u16, out: *std.ArrayList(u8)) !void {
         const alloc = self.alloc;
-        const l = self.layout;
-        const vw = l.viewportCols();
+        const vw = rect.w;
 
         const art_h: u16 = ghost_art.len;
         const total: u16 = art_h + 3; // art, blank, two hint lines
-        const top = (l.viewportRows() -| total) / 2;
-        if (y < top) return;
-        const line = y - top;
+        const top = (rect.h -| total) / 2;
+        if (local_y < top) return;
+        const line = local_y - top;
 
         if (line < art_h) {
             var art_w: usize = 0;
@@ -3989,6 +4556,8 @@ test "ui: an empty viewport shows the splash, not a placard" {
     var ui: Ui = .{ .alloc = alloc, .dir = "", .tty = -1 };
     defer ui.sessions.deinit(alloc);
     ui.layout = .init(24, 100);
+    try ui.initPanes();
+    defer ui.deinitPanes();
 
     var host = "host".*;
     var no_title: [0]u8 = .{};
@@ -3999,7 +4568,7 @@ test "ui: an empty viewport shows the splash, not a placard" {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
     for (0..ui.layout.viewportRows()) |y| {
-        try ui.composeViewportCell(@intCast(y), &out);
+        try ui.composeViewport(@intCast(y), &out);
     }
     try std.testing.expect(std.mem.indexOf(u8, out.items, "(o o)") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "no session focused") == null);
@@ -4008,9 +4577,132 @@ test "ui: an empty viewport shows the splash, not a placard" {
     ui.selected = 0;
     out.clearRetainingCapacity();
     for (0..ui.layout.viewportRows()) |y| {
-        try ui.composeViewportCell(@intCast(y), &out);
+        try ui.composeViewport(@intCast(y), &out);
     }
     try std.testing.expect(std.mem.indexOf(u8, out.items, "attached elsewhere") != null);
+}
+
+fn testUi(alloc: std.mem.Allocator) !Ui {
+    var ui: Ui = .{ .alloc = alloc, .dir = "", .tty = -1 };
+    ui.layout = .init(24, 100);
+    try ui.initPanes();
+    return ui;
+}
+
+test "panes: a fresh ui has one pane filling the viewport" {
+    const alloc = std.testing.allocator;
+    var ui = try testUi(alloc);
+    defer ui.deinitPanes();
+
+    try std.testing.expectEqual(@as(usize, 1), ui.paneCount());
+    const r = ui.panes.items[0].data.leaf.rect;
+    // The single pane spans the whole viewport region (offset by the
+    // sidebar and its separator).
+    try std.testing.expectEqual(@as(u16, 25), r.x);
+    try std.testing.expectEqual(@as(u16, 0), r.y);
+    try std.testing.expectEqual(@as(u16, 75), r.w);
+    try std.testing.expectEqual(@as(u16, 24), r.h);
+}
+
+test "panes: a vertical split places two panes side by side" {
+    const alloc = std.testing.allocator;
+    var ui = try testUi(alloc);
+    defer ui.deinitPanes();
+
+    try std.testing.expect(ui.splitFocusedNode(.vertical));
+    try std.testing.expectEqual(@as(usize, 2), ui.paneCount());
+
+    // Left pane, a one-column divider, then the right pane; together
+    // they fill the 75-column viewport.
+    const left = ui.panes.items[0].data.leaf.rect;
+    const right = ui.panes.items[1].data.leaf.rect;
+    try std.testing.expectEqual(@as(u16, 25), left.x);
+    try std.testing.expectEqual(@as(u16, 37), left.w);
+    try std.testing.expectEqual(@as(u16, 24), left.h);
+    try std.testing.expectEqual(@as(u16, 63), right.x);
+    try std.testing.expectEqual(@as(u16, 37), right.w);
+    try std.testing.expectEqual(@as(usize, 1), ui.vborders.items.len);
+    try std.testing.expectEqual(@as(u16, 62), ui.vborders.items[0].col);
+    // The new (right) pane takes focus.
+    try std.testing.expectEqual(ui.panes.items[1], ui.focused.?);
+}
+
+test "panes: a horizontal split stacks two panes" {
+    const alloc = std.testing.allocator;
+    var ui = try testUi(alloc);
+    defer ui.deinitPanes();
+
+    try std.testing.expect(ui.splitFocusedNode(.horizontal));
+    try std.testing.expectEqual(@as(usize, 2), ui.paneCount());
+
+    const top = ui.panes.items[0].data.leaf.rect;
+    const bottom = ui.panes.items[1].data.leaf.rect;
+    try std.testing.expectEqual(@as(u16, 0), top.y);
+    try std.testing.expectEqual(@as(u16, 11), top.h);
+    try std.testing.expectEqual(@as(u16, 75), top.w);
+    try std.testing.expectEqual(@as(u16, 12), bottom.y);
+    try std.testing.expectEqual(@as(u16, 12), bottom.h);
+    try std.testing.expectEqual(@as(usize, 1), ui.hborders.items.len);
+    try std.testing.expectEqual(@as(u16, 11), ui.hborders.items[0].row);
+}
+
+test "panes: directional navigation moves focus to the neighbor" {
+    const alloc = std.testing.allocator;
+    var ui = try testUi(alloc);
+    defer ui.deinitPanes();
+
+    try std.testing.expect(ui.splitFocusedNode(.vertical));
+    const left = ui.panes.items[0];
+    const right = ui.panes.items[1];
+    try std.testing.expectEqual(right, ui.focused.?);
+
+    // Left from the right pane lands on the left pane, and back.
+    ui.navigatePane(.left);
+    try std.testing.expectEqual(left, ui.focused.?);
+    ui.navigatePane(.right);
+    try std.testing.expectEqual(right, ui.focused.?);
+    // No neighbor above keeps focus put.
+    ui.navigatePane(.up);
+    try std.testing.expectEqual(right, ui.focused.?);
+}
+
+test "panes: closing a pane gives its space back to the sibling" {
+    const alloc = std.testing.allocator;
+    var ui = try testUi(alloc);
+    defer ui.deinitPanes();
+
+    try std.testing.expect(ui.splitFocusedNode(.vertical));
+    try std.testing.expectEqual(@as(usize, 2), ui.paneCount());
+
+    // Close the focused (right) pane; the left pane reclaims the
+    // whole viewport.
+    ui.closeFocusedPane();
+    try std.testing.expectEqual(@as(usize, 1), ui.paneCount());
+    const r = ui.panes.items[0].data.leaf.rect;
+    try std.testing.expectEqual(@as(u16, 25), r.x);
+    try std.testing.expectEqual(@as(u16, 75), r.w);
+    try std.testing.expectEqual(@as(u16, 24), r.h);
+    try std.testing.expectEqual(ui.panes.items[0], ui.focused.?);
+}
+
+test "panes: nested split then collapse rebalances the tree" {
+    const alloc = std.testing.allocator;
+    var ui = try testUi(alloc);
+    defer ui.deinitPanes();
+
+    // Split vertically, then split the right pane horizontally.
+    try std.testing.expect(ui.splitFocusedNode(.vertical));
+    try std.testing.expect(ui.splitFocusedNode(.horizontal));
+    try std.testing.expectEqual(@as(usize, 3), ui.paneCount());
+
+    // Collapsing the focused (bottom-right) pane leaves the left pane
+    // and the top-right pane.
+    ui.closeFocusedPane();
+    try std.testing.expectEqual(@as(usize, 2), ui.paneCount());
+    // The left pane still occupies the left half.
+    const left = ui.panes.items[0].data.leaf.rect;
+    try std.testing.expectEqual(@as(u16, 25), left.x);
+    try std.testing.expectEqual(@as(u16, 37), left.w);
 }
 
 test "ui: goto matches prefer name prefixes over substrings" {
