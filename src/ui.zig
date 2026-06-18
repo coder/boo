@@ -243,6 +243,8 @@ pub const InputParser = struct {
     /// events and are dropped here instead of leaking into the
     /// now-focused session. Null when no command key is being released.
     swallow_cp: ?u32 = null,
+    /// The prefix key this parser intercepts. Defaults to C-a.
+    prefix: keys.Prefix = .{},
 
     const hold_max = 40;
 
@@ -319,7 +321,7 @@ pub const InputParser = struct {
                 continue;
             }
 
-            if (byte == keys.escape_byte and !self.in_paste) {
+            if (byte == self.prefix.byte and !self.in_paste) {
                 if (i > start) try handler.event(.{ .forward = input[start..i] });
                 self.pending_prefix = true;
                 i += 1;
@@ -486,7 +488,7 @@ pub const InputParser = struct {
             // command key; stay armed. A discrete second press is
             // the C-a C-a binding (focus last), exactly like a
             // second raw 0x01, and dispatches below.
-            if (cp == 'a' and ctrl_only and key.event == 2) {
+            if (cp == self.prefix.cp and ctrl_only and key.event == 2) {
                 self.pending_prefix = true;
                 return;
             }
@@ -534,7 +536,7 @@ pub const InputParser = struct {
             self.swallow_cp = null;
         }
 
-        if (cp == 'a' and ctrl_only) {
+        if (cp == self.prefix.cp and ctrl_only) {
             self.held_len = 0;
             // Releases are swallowed: the session never saw the press.
             if (!release) self.pending_prefix = true;
@@ -587,7 +589,7 @@ pub const InputParser = struct {
             });
         }
 
-        if (key.cp == 'a' and ctrl_only) {
+        if (key.cp == self.prefix.cp and ctrl_only) {
             self.held_len = 0;
             self.pending_prefix = true;
             return;
@@ -1049,7 +1051,14 @@ pub fn run(alloc: std.mem.Allocator, dir: []const u8) !void {
     const tty: posix.fd_t = 0;
     if (!posix.isatty(tty)) return error.NotATty;
 
-    var ui: Ui = .{ .alloc = alloc, .dir = dir, .tty = tty };
+    const prefix = keys.Prefix.fromEnv();
+    var ui: Ui = .{
+        .alloc = alloc,
+        .dir = dir,
+        .tty = tty,
+        .prefix = prefix,
+        .parser = .{ .prefix = prefix },
+    };
     defer ui.deinit();
 
     // Signal plumbing mirrors client.attach: WINCH relayouts,
@@ -1152,6 +1161,10 @@ const Ui = struct {
     view: ?*View = null,
 
     parser: InputParser = .{},
+    /// Prefix key, read from $BOO_PREFIX at launch and mirrored into
+    /// `parser`. Held here too for the keybind hints and command
+    /// dispatch in handlePrefix.
+    prefix: keys.Prefix = .{},
     /// When nonzero, the parser holds a lone ESC that is flushed as
     /// input once this deadline passes without follow-up bytes.
     esc_deadline: i64 = 0,
@@ -1692,28 +1705,36 @@ const Ui = struct {
             'n', 0x0e => self.focusOffset(1),
             'p', 0x10 => self.focusOffset(-1),
             's', 0x13 => self.toggleSidebar(),
-            keys.escape_byte => self.focusLast(),
             'l', 0x0c => {
                 // Re-seed the local terminal from daemon state and
                 // repaint everything.
                 if (self.liveView()) |v| {
-                    v.sendInput(&.{ keys.escape_byte, 'l' }) catch self.markViewLost();
+                    const seq = [_]u8{ self.prefix.byte, 'l' };
+                    v.sendInput(&seq) catch self.markViewLost();
                 }
                 self.full_render = true;
                 self.need_render = true;
             },
-            'a' => {
-                // Literal C-a: the daemon's own prefix parser turns
-                // C-a a into a raw 0x01 for the application.
-                if (self.liveView()) |v| {
-                    v.sendInput(&.{ keys.escape_byte, 'a' }) catch self.markViewLost();
-                }
-            },
             else => {
+                // The prefix's own key pressed twice: the control form
+                // (e.g. C-a C-a) focuses the last session, the plain
+                // letter (C-a a) sends a literal prefix byte to the
+                // application via the daemon's own parser. Checked
+                // after the fixed bindings so a prefix letter that
+                // collides with one (e.g. C-c) keeps that binding.
+                if (byte == self.prefix.byte) return self.focusLast();
+                if (byte == self.prefix.cp) {
+                    if (self.liveView()) |v| {
+                        const seq = [_]u8{ self.prefix.byte, self.prefix.cp };
+                        v.sendInput(&seq) catch self.markViewLost();
+                    }
+                    return;
+                }
+                const pfx = std.ascii.toUpper(self.prefix.cp);
                 if (std.ascii.isPrint(byte)) {
-                    self.setMessage("^A {c} is not bound (press Ctrl+A alone for keybinds)", .{byte});
+                    self.setMessage("^{c} {c} is not bound (press Ctrl+{c} alone for keybinds)", .{ pfx, byte, pfx });
                 } else {
-                    self.setMessage("^A ^{c} is not bound (press Ctrl+A alone for keybinds)", .{byte ^ 0x40});
+                    self.setMessage("^{c} ^{c} is not bound (press Ctrl+{c} alone for keybinds)", .{ pfx, byte ^ 0x40, pfx });
                 }
             },
         }
@@ -2980,8 +3001,11 @@ const Ui = struct {
         try self.composeViewportCell(y, out);
     }
 
-    const keybind_bar =
-        " c new  k kill  r rename  g goto  n/p switch  up/dn browse  lt/rt resize  s sidebar  d quit  C-a last  a literal  l redraw  esc cancel";
+    // Split around the two prefix-dependent bindings (focus-last and
+    // literal-send) so they can be rendered with the configured prefix.
+    const keybind_bar_head =
+        " c new  k kill  r rename  g goto  n/p switch  up/dn browse  lt/rt resize  s sidebar  d quit  ";
+    const keybind_bar_tail = "  l redraw  esc cancel";
 
     /// Status content overlaid full-width on the last screen row
     /// while present: rename prompt, kill confirmation, the keybind
@@ -3010,7 +3034,12 @@ const Ui = struct {
                 try text.print(alloc, " kill {s}? y/n", .{self.sessions.items[idx].name});
             }
         } else if (self.parser.pending_prefix) {
-            try text.appendSlice(alloc, keybind_bar);
+            try text.print(alloc, "{s}C-{c} last  {c} literal{s}", .{
+                keybind_bar_head,
+                self.prefix.cp,
+                self.prefix.cp,
+                keybind_bar_tail,
+            });
         } else if (self.message.items.len > 0) {
             try text.print(alloc, " {s}", .{self.message.items});
         } else if (self.resizing) {
@@ -3033,7 +3062,11 @@ const Ui = struct {
             // The bottom sidebar row always shows how to reach the
             // keybinds; the status overlay covers it while active.
             try out.appendSlice(alloc, style_dim);
-            try appendClipped(alloc, out, " Keybinds: Ctrl+A", w);
+            var buf: [32]u8 = undefined;
+            const hint = std.fmt.bufPrint(&buf, " Keybinds: Ctrl+{c}", .{
+                std.ascii.toUpper(self.prefix.cp),
+            }) catch " Keybinds";
+            try appendClipped(alloc, out, hint, w);
             try out.appendSlice(alloc, sgr_reset);
             return;
         }
@@ -3201,9 +3234,12 @@ const Ui = struct {
             return;
         }
 
+        var buf: [40]u8 = undefined;
         const text: []const u8 = switch (line) {
             art_h + 1 => "no sessions",
-            art_h + 2 => "Press Ctrl+A for Keybinds",
+            art_h + 2 => std.fmt.bufPrint(&buf, "Press Ctrl+{c} for Keybinds", .{
+                std.ascii.toUpper(self.prefix.cp),
+            }) catch "Press Ctrl+A for Keybinds",
             else => return,
         };
         if (text.len >= vw) return;

@@ -52,9 +52,10 @@ pub const overview =
     \\  name (e.g. 'boo attach bu' for "build").
     \\
     \\environment:
-    \\  BOO_DIR  socket directory
-    \\           (default: $XDG_RUNTIME_DIR/boo, else /tmp/boo-<uid>)
-    \\  BOO_LOG  append daemon and 'boo ui' logs to this file (debugging)
+    \\  BOO_DIR     socket directory
+    \\              (default: $XDG_RUNTIME_DIR/boo, else /tmp/boo-<uid>)
+    \\  BOO_LOG     append daemon and 'boo ui' logs to this file (debugging)
+    \\  BOO_PREFIX  prefix key as Ctrl+letter (default C-a; e.g. C-b)
     \\
 ;
 
@@ -162,6 +163,9 @@ pub const commands = [_]Entry{
         \\  C-a Esc cancel the armed prefix
         \\
         \\Pressing C-a alone lists these bindings in the bottom bar.
+        \\
+        \\The prefix defaults to C-a; set BOO_PREFIX (a Ctrl+letter such
+        \\as C-b) to change it. The bindings above then use that key.
         \\
         \\Everything else is typed into the focused session. Unlike a
         \\plain attach, pasted text may contain C-a bytes safely
@@ -322,6 +326,10 @@ pub const topics = [_]Entry{
         \\Control variants match GNU screen: C-a C-d detaches and
         \\C-a C-l redraws. Detaching leaves the session running;
         \\'boo attach' brings it back.
+        \\
+        \\The prefix defaults to C-a. Set BOO_PREFIX to a different
+        \\Ctrl+letter (e.g. C-b, ^b, or b) before creating a session to
+        \\change it; the session keeps the prefix it was created with.
         \\
         \\'boo ui' adds bindings for managing sessions; see
         \\'boo help ui'.

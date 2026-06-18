@@ -64,6 +64,9 @@ pub const Daemon = struct {
     win: ?*Window = null,
 
     conns: std.ArrayList(*Conn) = .empty,
+    /// Prefix key for this session, read from $BOO_PREFIX at startup.
+    /// Held so the parser can be reset to it on each (re)attach.
+    prefix: keys.Prefix = .{},
     key_parser: keys.Parser = .{},
 
     /// Owned replacements for opts.name and opts.socket_path after a
@@ -82,12 +85,15 @@ pub const Daemon = struct {
     quitting: bool = false,
 
     pub fn run(alloc: std.mem.Allocator, opts: Options) !void {
+        const prefix = keys.Prefix.fromEnv();
         var self: Daemon = .{
             .alloc = alloc,
             .opts = opts,
             .rows = opts.rows,
             .cols = opts.cols,
             .last_activity_ms = std.time.milliTimestamp(),
+            .prefix = prefix,
+            .key_parser = .{ .prefix = prefix },
         };
         defer self.deinit();
 
@@ -262,7 +268,7 @@ pub const Daemon = struct {
                     }
                 }
                 conn.attached = true;
-                self.key_parser = .{};
+                self.key_parser = .{ .prefix = self.prefix };
                 self.resizeWindow(size.rows, size.cols);
                 self.updatePassthrough();
                 // A ui view starts with an empty terminal; seed its
@@ -330,10 +336,13 @@ pub const Daemon = struct {
                 if (byte == 0x04) "detached-eof" else "detached",
             ),
             .redraw => try self.repaintTo(conn),
-            .unknown => |byte| if (std.ascii.isPrint(byte))
-                self.message(conn, "unknown key: ^A {c}", .{byte})
-            else
-                self.message(conn, "unknown key: ^A ^{c}", .{byte ^ 0x40}),
+            .unknown => |byte| {
+                const pfx = std.ascii.toUpper(self.prefix.cp);
+                if (std.ascii.isPrint(byte))
+                    self.message(conn, "unknown key: ^{c} {c}", .{ pfx, byte })
+                else
+                    self.message(conn, "unknown key: ^{c} ^{c}", .{ pfx, byte ^ 0x40 });
+            },
         }
     }
 

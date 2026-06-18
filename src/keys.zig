@@ -16,6 +16,46 @@ const std = @import("std");
 
 pub const escape_byte: u8 = 0x01; // C-a
 
+/// The configurable prefix key, derived from a single Ctrl+letter.
+/// `byte` is the legacy control encoding (e.g. 0x01 for C-a); `cp` is
+/// the lowercase letter codepoint, used to recognize the prefix under
+/// the kitty/modifyOtherKeys encodings and as the literal-send command
+/// key (`prefix <letter>` emits a raw `byte`). Defaults to C-a.
+pub const Prefix = struct {
+    byte: u8 = escape_byte,
+    cp: u8 = 'a',
+
+    /// Build a prefix from a letter (a-z, case-insensitive).
+    pub fn fromLetter(letter: u8) Prefix {
+        const lower = std.ascii.toLower(letter);
+        return .{ .byte = lower - 'a' + 1, .cp = lower };
+    }
+
+    /// Parse a BOO_PREFIX spec: `C-b`, `^B`, or a bare `b`
+    /// (case-insensitive). Returns null for anything that is not a
+    /// single Ctrl+letter.
+    pub fn parse(spec: []const u8) ?Prefix {
+        const letter: u8 = switch (spec.len) {
+            1 => spec[0],
+            2 => if (spec[0] == '^') spec[1] else return null,
+            3 => if ((spec[0] | 0x20) == 'c' and spec[1] == '-') spec[2] else return null,
+            else => return null,
+        };
+        if (!std.ascii.isAlphabetic(letter)) return null;
+        return fromLetter(letter);
+    }
+
+    /// Read the prefix from $BOO_PREFIX, falling back to C-a (with a
+    /// warning) when the variable is unset or malformed.
+    pub fn fromEnv() Prefix {
+        const spec = std.posix.getenv("BOO_PREFIX") orelse return .{};
+        return parse(spec) orelse blk: {
+            std.log.warn("ignoring invalid BOO_PREFIX '{s}' (use a Ctrl+letter, e.g. C-b)", .{spec});
+            break :blk .{};
+        };
+    }
+};
+
 /// Which keyboard protocols the client's real terminal currently has
 /// active, mirrored from the focused window or view. Gates which
 /// input encodings the parsers decode; everything else is held only
@@ -52,6 +92,8 @@ pub const Parser = struct {
     /// Protocol state of the most recent feed; gates which finals the
     /// hold grammar accepts and which sequences decode.
     prot: Protocols = .{},
+    /// The prefix key this parser intercepts. Defaults to C-a.
+    prefix: Prefix = .{},
 
     const held_max = 48;
 
@@ -107,7 +149,7 @@ pub const Parser = struct {
                     start = i;
                     continue;
                 }
-                if (byte == escape_byte) {
+                if (byte == self.prefix.byte) {
                     // The prefix key repeating (held a beat too long)
                     // or pressed again: stay armed instead of
                     // consuming the repeat as a command key, so
@@ -119,11 +161,11 @@ pub const Parser = struct {
                 self.pending = false;
                 i += 1;
                 start = i;
-                try dispatch(byte, handler);
+                try self.dispatch(byte, handler);
                 continue;
             }
 
-            if (byte == escape_byte) {
+            if (byte == self.prefix.byte) {
                 if (i > start) try handler.command(.{ .forward = input[start..i] });
                 self.pending = true;
                 i += 1;
@@ -189,24 +231,24 @@ pub const Parser = struct {
             if (release) return;
             // The prefix key repeating while held (or pressed again)
             // is not a command key; stay armed.
-            if (cp == 'a' and ctrl_only) return;
+            if (cp == self.prefix.cp and ctrl_only) return;
             // Modifier and lock keys are reported as keys of their
             // own under the kitty "report all keys" flag; holding or
             // tapping one while armed must not eat the command key.
             if (isModifierKey(key.cp)) return;
             self.pending = false;
             if (ctrl_only and cp >= 'a' and cp <= 'z') {
-                return dispatch(@intCast(cp & 0x1f), handler);
+                return self.dispatch(@intCast(cp & 0x1f), handler);
             }
             if (plain and cp >= 0x20 and cp <= 0x7f) {
-                return dispatch(@intCast(cp), handler);
+                return self.dispatch(@intCast(cp), handler);
             }
             return handler.command(.{
                 .unknown = if (cp <= 0x7f) @intCast(cp) else '?',
             });
         }
 
-        if (cp == 'a' and ctrl_only) {
+        if (cp == self.prefix.cp and ctrl_only) {
             self.held_len = 0;
             // Releases are swallowed: the window never saw the press.
             if (!release) self.pending = true;
@@ -233,20 +275,20 @@ pub const Parser = struct {
             self.held_len = 0;
             // The prefix key repeating (or pressed again) is not a
             // command key; stay armed, like the raw byte.
-            if (key.cp == 'a' and ctrl_only) return;
+            if (key.cp == self.prefix.cp and ctrl_only) return;
             self.pending = false;
             if (ctrl_only and key.cp >= 'a' and key.cp <= 'z') {
-                return dispatch(@intCast(key.cp & 0x1f), handler);
+                return self.dispatch(@intCast(key.cp & 0x1f), handler);
             }
             if (plain and key.cp >= 0x20 and key.cp <= 0x7f) {
-                return dispatch(@intCast(key.cp), handler);
+                return self.dispatch(@intCast(key.cp), handler);
             }
             return handler.command(.{
                 .unknown = if (key.cp <= 0x7f) @intCast(key.cp) else '?',
             });
         }
 
-        if (key.cp == 'a' and ctrl_only) {
+        if (key.cp == self.prefix.cp and ctrl_only) {
             self.held_len = 0;
             self.pending = true;
             return;
@@ -265,18 +307,25 @@ pub const Parser = struct {
         var rest = held;
         if (self.pending) {
             self.pending = false;
-            try dispatch(held[0], handler);
+            try self.dispatch(held[0], handler);
             rest = held[1..];
         }
         if (rest.len > 0) try handler.command(.{ .forward = rest });
     }
 
-    fn dispatch(byte: u8, handler: anytype) !void {
+    fn dispatch(self: *Parser, byte: u8, handler: anytype) !void {
         switch (byte) {
             'd', 0x04 => try handler.command(.{ .detach = byte }),
             'l', 0x0c => try handler.command(.redraw),
-            'a' => try handler.command(.{ .forward = &.{escape_byte} }),
-            else => try handler.command(.{ .unknown = byte }),
+            // The prefix's own letter (e.g. C-a a) sends a literal
+            // prefix byte. Checked after the fixed bindings so detach
+            // and redraw keep working even if the prefix is C-d or C-l.
+            else => if (byte == self.prefix.cp) {
+                const literal = [_]u8{self.prefix.byte};
+                try handler.command(.{ .forward = &literal });
+            } else {
+                try handler.command(.{ .unknown = byte });
+            },
         }
     }
 };
@@ -422,6 +471,57 @@ test "literal escape via C-a a" {
     try p.feed("\x01a", .{}, &h);
     try std.testing.expectEqualStrings("\x01", h.forwarded.items);
     try std.testing.expectEqual(@as(usize, 0), h.cmds.items.len);
+}
+
+test "Prefix.parse accepts C-x, ^X, and bare letters" {
+    try std.testing.expectEqual(@as(?Prefix, .{ .byte = 0x02, .cp = 'b' }), Prefix.parse("C-b"));
+    try std.testing.expectEqual(@as(?Prefix, .{ .byte = 0x02, .cp = 'b' }), Prefix.parse("c-B"));
+    try std.testing.expectEqual(@as(?Prefix, .{ .byte = 0x02, .cp = 'b' }), Prefix.parse("^B"));
+    try std.testing.expectEqual(@as(?Prefix, .{ .byte = 0x02, .cp = 'b' }), Prefix.parse("b"));
+    try std.testing.expectEqual(@as(?Prefix, .{ .byte = 0x01, .cp = 'a' }), Prefix.parse("C-a"));
+    try std.testing.expectEqual(@as(?Prefix, null), Prefix.parse("C-1"));
+    try std.testing.expectEqual(@as(?Prefix, null), Prefix.parse("^1"));
+    try std.testing.expectEqual(@as(?Prefix, null), Prefix.parse("xy"));
+    try std.testing.expectEqual(@as(?Prefix, null), Prefix.parse(""));
+    try std.testing.expectEqual(@as(?Prefix, null), Prefix.parse("Ctrl-b"));
+}
+
+test "custom prefix: raw C-b arms, C-b d detaches, default C-a is plain" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: Parser = .{ .prefix = Prefix.fromLetter('b') };
+    // C-a is no longer special: it and the following text pass through.
+    try p.feed("\x01x", .{}, &h);
+    try std.testing.expectEqualStrings("\x01x", h.forwarded.items);
+    try std.testing.expectEqual(@as(usize, 0), h.cmds.items.len);
+    // C-b arms; d detaches.
+    try p.feed("\x02d", .{}, &h);
+    try std.testing.expectEqual(@as(usize, 1), h.cmds.items.len);
+    try std.testing.expectEqual(Command{ .detach = 'd' }, h.cmds.items[0]);
+}
+
+test "custom prefix: C-b b sends a literal C-b" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: Parser = .{ .prefix = Prefix.fromLetter('b') };
+    try p.feed("\x02b", .{}, &h);
+    try std.testing.expectEqualStrings("\x02", h.forwarded.items);
+    try std.testing.expectEqual(@as(usize, 0), h.cmds.items.len);
+}
+
+test "custom prefix: kitty encoded Ctrl+B arms the prefix" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: Parser = .{ .prefix = Prefix.fromLetter('b') };
+    // Ctrl+B is codepoint 98, mods 5 (ctrl). Encoded Ctrl+A (97) must
+    // now pass through untouched.
+    try p.feed("\x1b[97;5u", .{ .kitty = true }, &h);
+    try std.testing.expectEqualStrings("\x1b[97;5u", h.forwarded.items);
+    h.forwarded.clearRetainingCapacity();
+    try p.feed("\x1b[98;5ud", .{ .kitty = true }, &h);
+    try std.testing.expectEqual(@as(usize, 1), h.cmds.items.len);
+    try std.testing.expectEqual(Command{ .detach = 'd' }, h.cmds.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
 }
 
 test "prefix split across feeds" {
