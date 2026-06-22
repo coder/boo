@@ -29,6 +29,7 @@ pub const overview =
     \\    attach, at, a <name>         attach a session (steals politely)
     \\    ui, i                        manage sessions in a full-screen UI
     \\    ls [--json]                  list sessions
+    \\    inspect <name> [--json]      show one session in detail
     \\
     \\  Interaction
     \\    send <name> [flags]          type into a session
@@ -192,6 +193,21 @@ pub const commands = [_]Entry{
         \\            "bell_idle_ms","title"}]
         \\          ("unread" flags unseen output; "bell_idle_ms" is the
         \\           age of a bell rung while away, -1 if none)
+        \\
+        ,
+    },
+    .{
+        .name = "inspect",
+        .body =
+        \\usage: boo inspect <name> [--json]
+        \\
+        \\Show one session in detail: name, attach state and client
+        \\count, child PID, command, working directory, terminal size,
+        \\idle time (and time since last output), screen mode, title, and
+        \\socket path. Accepts a unique name prefix.
+        \\
+        \\flags:
+        \\  --json  emit a single JSON object with the same fields
         \\
         ,
     },
