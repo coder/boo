@@ -866,11 +866,11 @@ fn freeEntries(alloc: std.mem.Allocator, entries: *std.ArrayList(Entry)) void {
 const sgr_reset = "\x1b[0m";
 const style_selected = "\x1b[7m";
 const style_dim = "\x1b[2m";
-/// Bold yellow: unread output that has settled, the "your turn" marker
+/// Bold blue: unread output that has settled, the "your turn" marker
 /// on a session row.
-const style_attention = "\x1b[1;33m";
+const style_attention = "\x1b[1;34m";
 /// The one-column glyph marking a session with unread output.
-const unread_marker = "\u{25CF}"; // ●
+const unread_marker = "\u{2022}"; // •
 
 /// Display width in terminal columns of one codepoint: 0 for
 /// combining and other zero-width marks, 2 for East Asian wide and
@@ -998,7 +998,7 @@ pub fn appendSessionRow(
     if (selected) try out.appendSlice(alloc, style_selected);
 
     // The leading status column, always exactly one display cell:
-    //   ●  unread output you have not viewed. Bold yellow once the
+    //   •  unread output you have not viewed. Bold blue once the
     //      session has gone idle (its output settled, so it is waiting
     //      on you), dim while it is still producing output.
     //   *  attached by another client.
@@ -4238,7 +4238,7 @@ test "sidebar marks a session with unread output" {
     var name_buf: [8]u8 = "work1234".*;
     var title_buf: [0]u8 = .{};
     // Attached elsewhere AND unread+idle at once, to prove unread wins
-    // and that idle selects the bold-yellow "your turn" style.
+    // and that idle selects the bold-blue "your turn" style.
     const entry: Entry = .{
         .name = &name_buf,
         .attached = true,
@@ -4248,7 +4248,7 @@ test "sidebar marks a session with unread output" {
         .title = &title_buf,
     };
 
-    // The marker is one display cell (the ● glyph), so the row is still
+    // The marker is one display cell (the • glyph), so the row is still
     // exactly 24 columns: 1 marker + 20 name + 3 " x ".
     try appendSessionRow(alloc, &out, entry, 24, false);
     const expected = style_attention ++ unread_marker ++ sgr_reset ++

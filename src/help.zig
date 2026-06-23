@@ -126,7 +126,7 @@ pub const commands = [_]Entry{
         \\terminal state.
         \\
         \\sidebar markers (left of the name):
-        \\  ●  unread output you have not viewed. Bold yellow once the
+        \\  •  unread output you have not viewed. Bold blue once the
         \\     session's output settles (it is waiting on you), dim
         \\     while it is still producing output. Clears when you focus
         \\     the session.

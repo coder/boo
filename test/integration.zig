@@ -1116,9 +1116,9 @@ test "ui: an unread session is marked in the sidebar" {
     var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
     defer ui.deinit();
     try ui.waitFor("aaa");
-    // The sidebar marks the unfocused unread session with the ● glyph
+    // The sidebar marks the unfocused unread session with the • glyph
     // once the periodic refresh picks up the daemon's unread flag.
-    try ui.waitFor("\u{25CF}");
+    try ui.waitFor("\u{2022}");
 }
 
 test "peek --json includes geometry, cursor, and screen content" {
