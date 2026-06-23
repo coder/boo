@@ -32,8 +32,12 @@ const windowpkg = @import("window.zig");
 
 const log = std.log.scoped(.ui);
 
-/// Refresh cadence for the sidebar's session list.
-const refresh_interval_ms: i64 = 1000;
+/// Poll cadence for the sidebar's session list. Only the focused
+/// session has a live socket; every other row's title, unread, and
+/// idle state is refreshed by re-polling on this interval (plus an
+/// immediate re-poll whenever the focused session changes its own
+/// title), so this bounds how stale a background row can look.
+const refresh_interval_ms: i64 = 250;
 /// Transient status messages stay visible this long.
 const message_ttl_ms: i64 = 4000;
 /// Render coalescing: at most one repaint per interval while output
