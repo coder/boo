@@ -364,11 +364,15 @@ pub const ControlResult = struct {
     text: []u8,
 };
 
-/// Send a single control command (-X) and wait for the reply.
+/// Send a single control command (-X) and wait for the reply. When
+/// `timeout_ms` is non-null, give up with `error.Timeout` if no reply
+/// arrives in that window, so a caller (notably `boo ui`) cannot hang
+/// forever on a daemon that has stopped answering.
 pub fn control(
     alloc: std.mem.Allocator,
     socket_path: []const u8,
     argv: []const []const u8,
+    timeout_ms: ?u32,
 ) !ControlResult {
     const sock = try connect(alloc, socket_path);
     defer posix.close(sock);
@@ -380,7 +384,20 @@ pub fn control(
     var decoder: protocol.Decoder = .init(alloc);
     defer decoder.deinit();
     var buf: [4096]u8 = undefined;
+    const deadline: ?i64 = if (timeout_ms) |ms|
+        std.time.milliTimestamp() + ms
+    else
+        null;
     while (true) {
+        if (deadline) |dl| {
+            const now = std.time.milliTimestamp();
+            if (now >= dl) return error.Timeout;
+            var fds = [_]posix.pollfd{
+                .{ .fd = sock, .events = posix.POLL.IN, .revents = 0 },
+            };
+            const ready = posix.poll(&fds, @intCast(dl - now)) catch return error.Timeout;
+            if (ready == 0) return error.Timeout;
+        }
         const n = posix.read(sock, &buf) catch 0;
         if (n == 0) return error.ConnectionLost;
         try decoder.feed(buf[0..n]);
@@ -430,4 +447,35 @@ test "ReleaseScan: non-release CSI and plain bytes never trigger" {
     // release of the trigger key.
     try std.testing.expect(!scan.feed("dddd"));
     try std.testing.expect(!scan.feed("\x1b[A\x1b[100;1:2u"));
+}
+
+test "control times out when the daemon never answers" {
+    const alloc = std.testing.allocator;
+
+    var name_buf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrint(
+        &name_buf,
+        "/tmp/boo-control-timeout-{x}.sock",
+        .{std.crypto.random.int(u32)},
+    );
+    std.fs.cwd().deleteFile(path) catch {};
+
+    // A listener that never accepts: connect() still succeeds via the
+    // backlog and the command write is buffered, so the reply read is
+    // what blocks. Without the timeout this call would hang forever
+    // (the boo ls / boo ui freeze); with it, it must give up.
+    const lfd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+    defer {
+        posix.close(lfd);
+        std.fs.cwd().deleteFile(path) catch {};
+    }
+    var addr: posix.sockaddr.un = .{ .family = posix.AF.UNIX, .path = undefined };
+    @memset(&addr.path, 0);
+    @memcpy(addr.path[0..path.len], path);
+    try posix.bind(lfd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un));
+    try posix.listen(lfd, 1);
+
+    const start = std.time.milliTimestamp();
+    try std.testing.expectError(error.Timeout, control(alloc, path, &.{"info"}, 150));
+    try std.testing.expect(std.time.milliTimestamp() - start >= 100);
 }

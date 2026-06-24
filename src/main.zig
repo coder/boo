@@ -177,10 +177,15 @@ pub const SessionInfo = struct {
 };
 
 /// Query a session daemon, deleting the socket when the daemon is gone.
-pub fn sessionInfo(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !?SessionInfo {
+/// A non-null `timeout_ms` bounds the control round-trip so a slow daemon
+/// cannot hang the caller; a timeout reports no info but leaves the socket
+/// in place, because a slow daemon is not a dead one.
+pub fn sessionInfo(alloc: std.mem.Allocator, dir: []const u8, name: []const u8, timeout_ms: ?u32) !?SessionInfo {
     const sock = try paths.socketPath(alloc, dir, name);
     defer alloc.free(sock);
-    const result = client.control(alloc, sock, &.{"info"}) catch {
+    const result = client.control(alloc, sock, &.{"info"}, timeout_ms) catch |err| {
+        // A timeout means the daemon is busy, not gone; keep the socket.
+        if (err == error.Timeout) return null;
         // Stale socket: the daemon is gone.
         std.fs.cwd().deleteFile(sock) catch {};
         return null;
@@ -237,7 +242,7 @@ fn mustControl(
 ) !client.ControlResult {
     const sock = try paths.socketPath(alloc, dir, name);
     defer alloc.free(sock);
-    return client.control(alloc, sock, argv) catch |err| switch (err) {
+    return client.control(alloc, sock, argv, null) catch |err| switch (err) {
         error.FileNotFound, error.ConnectionRefused, error.ConnectionLost => fail(
             exit_no_session,
             "no session named {s}",
@@ -452,7 +457,7 @@ fn cmdLs(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
         infos.deinit(alloc);
     }
     for (sessions) |name| {
-        const info = sessionInfo(alloc, dir, name) catch continue orelse continue;
+        const info = sessionInfo(alloc, dir, name, null) catch continue orelse continue;
         try infos.append(alloc, .{ .name = name, .info = info });
         name_width = @max(name_width, name.len);
         live += 1;
@@ -767,7 +772,7 @@ fn cmdWait(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
                 fail(exit_runtime, "malformed peek response", .{});
             if (std.mem.indexOf(u8, peek.screen, needle) != null) return;
         } else {
-            const info = try sessionInfo(alloc, dir, name) orelse
+            const info = try sessionInfo(alloc, dir, name, null) orelse
                 fail(exit_no_session, "no session named {s}", .{name});
             defer alloc.free(info.text);
             if (info.out_idle_ms >= idle_settle_ms) return;
@@ -810,7 +815,7 @@ fn cmdKill(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
         for (sessions) |name| {
             const sock = try paths.socketPath(alloc, dir, name);
             defer alloc.free(sock);
-            const result = client.control(alloc, sock, &.{"quit"}) catch {
+            const result = client.control(alloc, sock, &.{"quit"}, null) catch {
                 std.fs.cwd().deleteFile(sock) catch {};
                 continue;
             };

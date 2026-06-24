@@ -38,6 +38,12 @@ const log = std.log.scoped(.ui);
 /// immediate re-poll whenever the focused session changes its own
 /// title), so this bounds how stale a background row can look.
 const refresh_interval_ms: i64 = 250;
+/// Upper bound on a sidebar control round-trip (info, cwd, rename,
+/// quit). The daemon write-deadlock fix keeps these replies prompt, so
+/// this is a safety net: if a daemon ever stops answering, the ui gives
+/// up instead of freezing. A timed-out poll leaves the session in place
+/// because a slow daemon is not a dead one.
+const control_timeout_ms: u32 = 3000;
 /// Transient status messages stay visible this long.
 const message_ttl_ms: i64 = 4000;
 /// Render coalescing: at most one repaint per interval while output
@@ -2157,7 +2163,7 @@ const Ui = struct {
 
         const main = @import("main.zig");
         for (names) |name| {
-            const info = main.sessionInfo(self.alloc, self.dir, name) catch continue orelse continue;
+            const info = main.sessionInfo(self.alloc, self.dir, name, control_timeout_ms) catch continue orelse continue;
             defer self.alloc.free(info.text);
             try fresh.append(self.alloc, .{
                 .name = try self.alloc.dupe(u8, name),
@@ -2642,7 +2648,7 @@ const Ui = struct {
         if (idx >= self.sessions.items.len) return null;
         const sock = paths.socketPath(self.alloc, self.dir, self.sessions.items[idx].name) catch return null;
         defer self.alloc.free(sock);
-        const result = client.control(self.alloc, sock, &.{"cwd"}) catch return null;
+        const result = client.control(self.alloc, sock, &.{"cwd"}, control_timeout_ms) catch return null;
         if (!result.ok or result.text.len == 0) {
             self.alloc.free(result.text);
             return null;
@@ -2716,7 +2722,7 @@ const Ui = struct {
 
         const sock = paths.socketPath(self.alloc, self.dir, entry.name) catch return;
         defer self.alloc.free(sock);
-        const result = client.control(self.alloc, sock, &.{ "rename", new_name }) catch {
+        const result = client.control(self.alloc, sock, &.{ "rename", new_name }, control_timeout_ms) catch {
             self.setMessage("rename failed", .{});
             return;
         };
@@ -2739,7 +2745,12 @@ const Ui = struct {
 
         const sock = paths.socketPath(self.alloc, self.dir, name) catch return;
         defer self.alloc.free(sock);
-        const result = client.control(self.alloc, sock, &.{"quit"}) catch {
+        const result = client.control(self.alloc, sock, &.{"quit"}, control_timeout_ms) catch |err| {
+            if (err == error.Timeout) {
+                // Slow, not dead: keep the socket and tell the user.
+                self.setMessage("kill {s} timed out", .{name});
+                return;
+            }
             // The daemon is already gone; remove the stale socket.
             std.fs.cwd().deleteFile(sock) catch {};
             self.refreshSessions() catch {};
