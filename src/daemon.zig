@@ -376,6 +376,14 @@ pub const Daemon = struct {
         switch (msg.type) {
             .ui => conn.ui = true,
 
+            .bg_color => {
+                // The client probed its real terminal's background and
+                // reported it; the window uses it to answer OSC 11
+                // queries and the color-scheme DSR from the session.
+                const bg = protocol.RgbPayload.decode(msg.payload) catch return;
+                if (self.liveWindow()) |w| w.setBackground(bg);
+            },
+
             .attach => {
                 const size = try protocol.SizePayload.decode(msg.payload);
                 // Steal from any previously attached client.
@@ -662,9 +670,23 @@ pub const Daemon = struct {
         const detached = self.attachedConn() == null;
         if (detached) self.unread = true;
 
+        // Strip OSC 11 background queries up front and answer them from
+        // the reported terminal background. They must not also reach an
+        // attached client's real terminal, which would answer them a
+        // second time, so this runs before any passthrough forwarding.
+        // The filter only removes bytes, so the cleaned copy never
+        // outgrows the chunk; on the impossible overflow, fall back to
+        // the raw chunk rather than dropping output.
+        var clean_buf: [32 * 1024]u8 = undefined;
+        var clean_writer = std.Io.Writer.fixed(&clean_buf);
+        const cleaned = cleaned: {
+            win.filterColorQueries(chunk, &clean_writer) catch break :cleaned chunk;
+            break :cleaned clean_writer.buffered();
+        };
+
         const conn = (if (win.passthrough) self.attachedConn() else null) orelse {
             // Not passed through: the window answers queries itself.
-            win.feed(chunk);
+            win.feed(cleaned);
             self.noteBell(win, detached, now);
             return;
         };
@@ -680,16 +702,16 @@ pub const Daemon = struct {
         // without a 47/1047/1049 toggle) still has to repaint so the
         // client's `.screen` state stays authoritative.
         const was_alt = win.onAltScreen();
-        const result = win.alt_filter.feed(chunk, &writer) catch
+        const result = win.alt_filter.feed(cleaned, &writer) catch
             altscreen.Filter.Result{ .switched = true, .discard_start = 0 };
 
         // Bytes up to the discard point reach the client's real
         // terminal, which answers any queries among them. The repaint
         // re-renders the discarded tail from terminal state, but it
         // cannot answer queries, so the window must.
-        const split = result.discard_start orelse chunk.len;
-        win.feed(chunk[0..split]);
-        if (split < chunk.len) win.feedDiscarded(chunk[split..]);
+        const split = result.discard_start orelse cleaned.len;
+        win.feed(cleaned[0..split]);
+        if (split < cleaned.len) win.feedDiscarded(cleaned[split..]);
         self.noteBell(win, detached, now);
 
         const filtered = writer.buffered();

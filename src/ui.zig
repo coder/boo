@@ -697,6 +697,7 @@ pub const View = struct {
         socket_path: []const u8,
         rows: u16,
         cols: u16,
+        bg: ?protocol.RgbPayload,
     ) !*View {
         const self = try alloc.create(View);
         errdefer alloc.destroy(self);
@@ -748,6 +749,10 @@ pub const View = struct {
             .rows = @max(rows, 1),
             .cols = @max(cols, 1),
         }).encode());
+        // Tell the daemon the real terminal's background so the session
+        // can detect the theme via OSC 11 (see window.zig). Best effort:
+        // a session simply keeps its prior behavior without it.
+        if (bg) |color| protocol.writeMsg(sock, .bg_color, &color.encode()) catch {};
 
         return self;
     }
@@ -1134,6 +1139,14 @@ pub fn run(alloc: std.mem.Allocator, dir: []const u8) !void {
     defer client.restoreTty(tty, saved, restore_sequence, ui.eof_guard, ui.parser.swallow_cp orelse 0);
     try protocol.writeAll(1, enter_sequence);
 
+    // Probe the real terminal's background color so each attached view
+    // can report it to its daemon, letting sessions detect the theme
+    // (see window.zig). Input typed during the probe is fed through the
+    // parser before the loop so it is not lost.
+    var probe_scratch: [256]u8 = undefined;
+    var probe_leftover: usize = 0;
+    ui.term_bg = client.probeBackground(tty, pipe_fds[0], &probe_scratch, &probe_leftover);
+
     const ws = ptypkg.getSize(tty) catch ptypkg.makeWinsize(24, 80);
     ui.layout = .init(ws.row, ws.col);
     // Running inside a boo session: never attach the session hosting
@@ -1142,6 +1155,8 @@ pub fn run(alloc: std.mem.Allocator, dir: []const u8) !void {
 
     try ui.refreshSessions();
     if (ui.selected == null) ui.selectInitial();
+
+    if (probe_leftover > 0) ui.feedStartupInput(probe_scratch[0..probe_leftover]);
 
     try ui.loop(pipe_fds[0]);
 }
@@ -1184,6 +1199,9 @@ const Ui = struct {
     alloc: std.mem.Allocator,
     dir: []const u8,
     tty: posix.fd_t,
+    /// Real terminal background, probed once at startup and forwarded to
+    /// each view's daemon so sessions can detect the light/dark theme.
+    term_bg: ?protocol.RgbPayload = null,
 
     layout: Layout = .{ .rows = 24, .cols = 80, .sidebar_w = 24 },
     sessions: std.ArrayList(Entry) = .empty,
@@ -1399,6 +1417,19 @@ const Ui = struct {
     }
 
     // -- Terminal input ------------------------------------------------------
+
+    /// Feed input captured during the startup background probe through
+    /// the parser before the main loop, so a keystroke that raced
+    /// startup still reaches the ui.
+    fn feedStartupInput(self: *Ui, bytes: []const u8) void {
+        const Handler = struct {
+            ui: *Ui,
+            pub fn event(h: @This(), ev: InputEvent) !void {
+                try h.ui.handleEvent(ev);
+            }
+        };
+        self.parser.feed(bytes, .{}, Handler{ .ui = self }) catch {};
+    }
 
     fn readTty(self: *Ui, buf: []u8) !void {
         const n = posix.read(self.tty, buf) catch 0;
@@ -2295,6 +2326,7 @@ const Ui = struct {
             sock,
             self.layout.viewportRows(),
             self.layout.viewportCols(),
+            self.term_bg,
         ) catch |err| {
             self.setMessage("attach {s} failed: {s}", .{ name, @errorName(err) });
             return;

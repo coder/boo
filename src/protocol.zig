@@ -28,6 +28,14 @@ pub const MsgType = enum(u8) {
     /// and simply attaches the view with no history, so a new ui client
     /// stays compatible with an already-running older daemon.
     ui = 6,
+    /// The background color of the client's real terminal, as a
+    /// `RgbPayload`. The client probes its terminal once at startup and
+    /// reports the answer so the daemon can satisfy OSC 11 background
+    /// queries (and the color-scheme DSR) from inside the session, where
+    /// the application can no longer reach the real terminal. An older
+    /// daemon ignores the unknown type, so theme detection simply stays
+    /// as it was before this message existed.
+    bg_color = 7,
 
     // Daemon to client.
     output = 64,
@@ -66,6 +74,45 @@ pub const SizePayload = struct {
             .rows = std.mem.readInt(u16, payload[0..2], .little),
             .cols = std.mem.readInt(u16, payload[2..4], .little),
         };
+    }
+};
+
+/// A terminal color as three 16-bit channels, matching the precision a
+/// terminal reports for an OSC 10/11/12 query (`rgb:RRRR/GGGG/BBBB`).
+pub const RgbPayload = struct {
+    r: u16,
+    g: u16,
+    b: u16,
+
+    pub fn encode(self: RgbPayload) [6]u8 {
+        var buf: [6]u8 = undefined;
+        std.mem.writeInt(u16, buf[0..2], self.r, .little);
+        std.mem.writeInt(u16, buf[2..4], self.g, .little);
+        std.mem.writeInt(u16, buf[4..6], self.b, .little);
+        return buf;
+    }
+
+    pub fn decode(payload: []const u8) error{InvalidPayload}!RgbPayload {
+        if (payload.len != 6) return error.InvalidPayload;
+        return .{
+            .r = std.mem.readInt(u16, payload[0..2], .little),
+            .g = std.mem.readInt(u16, payload[2..4], .little),
+            .b = std.mem.readInt(u16, payload[4..6], .little),
+        };
+    }
+
+    /// Perceived luminance on a 0..255 scale (Rec. 601 weights), computed
+    /// from the high byte of each channel. Used to classify the
+    /// background as light or dark for the color-scheme DSR.
+    pub fn luminance(self: RgbPayload) u8 {
+        const r: u32 = self.r >> 8;
+        const g: u32 = self.g >> 8;
+        const b: u32 = self.b >> 8;
+        return @intCast((r * 299 + g * 587 + b * 114) / 1000);
+    }
+
+    pub fn isDark(self: RgbPayload) bool {
+        return self.luminance() < 128;
     }
 };
 
@@ -174,6 +221,19 @@ test "size payload roundtrip" {
     const dec = try SizePayload.decode(&enc);
     try std.testing.expectEqual(size, dec);
     try std.testing.expectError(error.InvalidPayload, SizePayload.decode("abc"));
+}
+
+test "rgb payload roundtrip and luminance" {
+    const white: RgbPayload = .{ .r = 0xffff, .g = 0xffff, .b = 0xffff };
+    const enc = white.encode();
+    try std.testing.expectEqual(white, try RgbPayload.decode(&enc));
+    try std.testing.expectError(error.InvalidPayload, RgbPayload.decode("abc"));
+
+    // White is light, black is dark.
+    try std.testing.expect(!white.isDark());
+    try std.testing.expect((RgbPayload{ .r = 0, .g = 0, .b = 0 }).isDark());
+    // A typical dark editor background.
+    try std.testing.expect((RgbPayload{ .r = 0x2828, .g = 0x2c2c, .b = 0x3434 }).isDark());
 }
 
 test "argv roundtrip" {

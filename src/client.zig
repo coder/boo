@@ -20,6 +20,12 @@ const restore_sequence = window.reset_state_sequence ++ "\x1b[?1049l";
 
 pub const Outcome = enum { detached, stolen, ended, lost };
 
+/// How long to wait for the terminal to answer the startup OSC 11
+/// background probe. Terminals that support it answer within a few
+/// milliseconds; the probe returns as soon as the reply arrives, so this
+/// bound only delays attach on a terminal that never answers.
+const probe_timeout_ms = 150;
+
 var signal_pipe: posix.fd_t = -1;
 
 fn handleSignal(sig: c_int) callconv(.c) void {
@@ -82,12 +88,27 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
     defer restoreTty(tty, saved, restore_sequence, eof_guard, 'd');
     try protocol.writeAll(1, enter_sequence);
 
-    // Handshake with our current size.
+    // Handshake with our current size first so the daemon sees the
+    // attach promptly. The background probe below blocks briefly; a kill
+    // or resize racing a slow attach would otherwise break the
+    // connection or miss the initial size.
     const ws = ptypkg.getSize(tty) catch ptypkg.makeWinsize(24, 80);
     try protocol.writeMsg(sock, .attach, &(protocol.SizePayload{
         .rows = ws.row,
         .cols = ws.col,
     }).encode());
+
+    // Probe the real terminal's background color so the daemon can
+    // answer OSC 11 theme queries from inside the session, where the
+    // application can no longer reach this terminal. The probe yields to
+    // a pending signal, and any keystrokes typed during it are forwarded
+    // as input afterward.
+    var probe_scratch: [256]u8 = undefined;
+    var leftover_len: usize = 0;
+    if (probeBackground(tty, pipe_fds[0], &probe_scratch, &leftover_len)) |color| {
+        protocol.writeMsg(sock, .bg_color, &color.encode()) catch {};
+    }
+    if (leftover_len > 0) protocol.writeMsg(sock, .input, probe_scratch[0..leftover_len]) catch {};
 
     var decoder: protocol.Decoder = .init(alloc);
     defer decoder.deinit();
@@ -173,6 +194,108 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
             }
         }
     }
+}
+
+/// Probe the real terminal for its background color via an OSC 11 query
+/// and parse the reply. Returns null if the terminal does not answer
+/// within `probe_timeout_ms` or a pending signal (resize/quit) on
+/// `signal_fd` cuts the probe short so the caller can service it. Bytes
+/// read while waiting that are not the reply (e.g. a keystroke typed
+/// during attach) are left in `scratch[0..leftover_len.*]` for the
+/// caller to forward as input. Pass -1 for `signal_fd` to skip the
+/// signal check.
+pub fn probeBackground(
+    tty: posix.fd_t,
+    signal_fd: posix.fd_t,
+    scratch: []u8,
+    leftover_len: *usize,
+) ?protocol.RgbPayload {
+    leftover_len.* = 0;
+    // The query goes to the terminal on stdout; the reply arrives on the
+    // input fd. For an attached client and the ui both are the same tty.
+    protocol.writeAll(posix.STDOUT_FILENO, "\x1b]11;?\x07") catch return null;
+
+    const deadline = std.time.milliTimestamp() + probe_timeout_ms;
+    var len: usize = 0;
+    while (len < scratch.len) {
+        const now = std.time.milliTimestamp();
+        if (now >= deadline) break;
+        var fds = [_]posix.pollfd{
+            .{ .fd = tty, .events = posix.POLL.IN, .revents = 0 },
+            .{ .fd = signal_fd, .events = posix.POLL.IN, .revents = 0 },
+        };
+        const ready = posix.poll(&fds, @intCast(deadline - now)) catch break;
+        if (ready == 0) break;
+        // A pending signal (resize or quit) must reach the caller's loop
+        // without delay; stop probing and leave it queued.
+        if (fds[1].revents != 0) break;
+        if (fds[0].revents == 0) continue;
+        const n = posix.read(tty, scratch[len..]) catch break;
+        if (n == 0) break;
+        len += n;
+        if (findOsc11Reply(scratch[0..len])) |span| {
+            const color = parseOsc11Reply(scratch[span.start..span.end]);
+            // Drop the reply from the buffer; keep anything else (typed
+            // input) as leftover for the caller to forward.
+            const removed = span.end - span.start;
+            std.mem.copyForwards(u8, scratch[span.start..], scratch[span.end..len]);
+            leftover_len.* = len - removed;
+            return color;
+        }
+    }
+    leftover_len.* = len;
+    return null;
+}
+
+const Osc11Span = struct { start: usize, end: usize };
+
+/// Locate a complete OSC 11 reply (`ESC ] 11 ; ... BEL|ST`) in `data`,
+/// returning the byte span it occupies, terminator included.
+fn findOsc11Reply(data: []const u8) ?Osc11Span {
+    const marker = "\x1b]11;";
+    const start = std.mem.indexOf(u8, data, marker) orelse return null;
+    const body = data[start + marker.len ..];
+    if (std.mem.indexOfScalar(u8, body, 0x07)) |bel| {
+        return .{ .start = start, .end = start + marker.len + bel + 1 };
+    }
+    if (std.mem.indexOf(u8, body, "\x1b\\")) |st| {
+        return .{ .start = start, .end = start + marker.len + st + 2 };
+    }
+    return null;
+}
+
+/// Parse an OSC 11 reply (`ESC ] 11 ; rgb:R/G/B` with a BEL or ST
+/// terminator) into a 16-bit RGB. Each channel may be 1-4 hex digits and
+/// is scaled to 16-bit. Returns null for anything it does not recognize.
+pub fn parseOsc11Reply(data: []const u8) ?protocol.RgbPayload {
+    const marker = "\x1b]11;";
+    const start = std.mem.indexOf(u8, data, marker) orelse return null;
+    var body = data[start + marker.len ..];
+    if (std.mem.indexOfScalar(u8, body, 0x07)) |bel| {
+        body = body[0..bel];
+    } else if (std.mem.indexOf(u8, body, "\x1b\\")) |st| {
+        body = body[0..st];
+    }
+    const rgb_prefix = "rgb:";
+    if (!std.mem.startsWith(u8, body, rgb_prefix)) return null;
+    var it = std.mem.splitScalar(u8, body[rgb_prefix.len..], '/');
+    const r = parseChannel(it.next() orelse return null) orelse return null;
+    const g = parseChannel(it.next() orelse return null) orelse return null;
+    const b = parseChannel(it.next() orelse return null) orelse return null;
+    if (it.next() != null) return null;
+    return .{ .r = r, .g = g, .b = b };
+}
+
+fn parseChannel(s: []const u8) ?u16 {
+    if (s.len == 0 or s.len > 4) return null;
+    const v = std.fmt.parseInt(u16, s, 16) catch return null;
+    const wide: u32 = v;
+    return switch (s.len) {
+        1 => @intCast(wide * 0x1111), // 0xF  -> 0xFFFF
+        2 => @intCast(wide * 0x101), // 0xFF -> 0xFFFF
+        3 => @intCast((wide * 0xffff) / 0xfff), // 0xFFF -> 0xFFFF
+        else => @intCast(wide), // already 16-bit
+    };
 }
 
 /// Configure a termios for raw byte-at-a-time input. Shared with the
@@ -447,6 +570,34 @@ test "ReleaseScan: non-release CSI and plain bytes never trigger" {
     // release of the trigger key.
     try std.testing.expect(!scan.feed("dddd"));
     try std.testing.expect(!scan.feed("\x1b[A\x1b[100;1:2u"));
+}
+
+test "parseOsc11Reply: BEL and ST terminators, various channel widths" {
+    // 16-bit channels, BEL-terminated (ghostty's format).
+    try std.testing.expectEqual(
+        protocol.RgbPayload{ .r = 0x1234, .g = 0x5678, .b = 0x9abc },
+        parseOsc11Reply("\x1b]11;rgb:1234/5678/9abc\x07").?,
+    );
+    // ST-terminated, 2-digit channels scaled to 16-bit.
+    try std.testing.expectEqual(
+        protocol.RgbPayload{ .r = 0xffff, .g = 0x0000, .b = 0x8080 },
+        parseOsc11Reply("\x1b]11;rgb:ff/00/80\x1b\\").?,
+    );
+    // A reply embedded among other bytes still parses.
+    try std.testing.expect(parseOsc11Reply("x\x1b]11;rgb:0000/0000/0000\x07y") != null);
+    // A query is not a reply, and junk is rejected.
+    try std.testing.expect(parseOsc11Reply("\x1b]11;?\x07") == null);
+    try std.testing.expect(parseOsc11Reply("garbage") == null);
+    try std.testing.expect(parseOsc11Reply("\x1b]11;rgb:00/00\x07") == null); // too few channels
+}
+
+test "findOsc11Reply: only a fully terminated reply is located" {
+    // Incomplete (no terminator yet): not found.
+    try std.testing.expect(findOsc11Reply("\x1b]11;rgb:1111/2222/3333") == null);
+    // BEL-terminated reply: span covers the terminator (exclusive end).
+    const span = findOsc11Reply("ab\x1b]11;rgb:1111/2222/3333\x07cd").?;
+    try std.testing.expectEqual(@as(usize, 2), span.start);
+    try std.testing.expectEqual(@as(usize, 26), span.end);
 }
 
 test "control times out when the daemon never answers" {

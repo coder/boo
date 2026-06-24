@@ -7,6 +7,7 @@ const std = @import("std");
 const posix = std.posix;
 const vt = @import("ghostty-vt");
 const altscreen = @import("altscreen.zig");
+const oscquery = @import("oscquery.zig");
 const ptypkg = @import("pty.zig");
 const protocol = @import("protocol.zig");
 
@@ -43,6 +44,21 @@ pub const Window = struct {
     /// (see `feedDiscarded`); forces daemon-side query responses even
     /// when passing through.
     feeding_discarded: bool = false,
+
+    /// Background color of the real terminal, reported by an attached
+    /// client. Lets the daemon answer OSC 11 background queries and the
+    /// color-scheme DSR from inside the session, where the application
+    /// can no longer reach the real terminal. Null until a client
+    /// reports it.
+    term_bg: ?protocol.RgbPayload = null,
+    /// An OSC 11 background query arrived before any client had reported
+    /// a background color. Answered as soon as one is reported, so a
+    /// session that queries the theme the instant it starts still gets
+    /// an answer once the attaching client probes its terminal.
+    bg_query_pending: bool = false,
+    /// Strips OSC 11 background queries from the child's output so the
+    /// daemon answers each exactly once (see oscquery.zig).
+    color_filter: oscquery.Filter = .{},
 
     /// Strips alternate-screen toggles from passthrough output; the
     /// daemon repaints from terminal state on screen switches instead.
@@ -97,7 +113,7 @@ pub const Window = struct {
         handler.effects = .{
             .write_pty = effectWritePty,
             .bell = effectBell,
-            .color_scheme = null,
+            .color_scheme = effectColorScheme,
             .device_attributes = effectDeviceAttributes,
             .enquiry = null,
             .size = effectSize,
@@ -142,6 +158,10 @@ pub const Window = struct {
     // ghostty-vt root, so derive it from the effects callback signature.
     const DeviceAttributes = EffectReturn("device_attributes");
 
+    // The color scheme effect returns an optional ColorScheme; recover
+    // the enum the same way as the device attributes type above.
+    const ColorScheme = @typeInfo(EffectReturn("color_scheme")).optional.child;
+
     fn EffectReturn(comptime field_name: []const u8) type {
         const Effects = Stream.Handler.Effects;
         const field = std.meta.fieldInfo(
@@ -159,6 +179,16 @@ pub const Window = struct {
     fn effectDeviceAttributes(handler: *Stream.Handler) DeviceAttributes {
         _ = handler;
         return .{};
+    }
+
+    /// Answer the color-scheme DSR (CSI ? 996 n) from the reported
+    /// background's luminance. Returns null (no reply) until a client
+    /// reports a background, matching ghostty-vt's behavior for an
+    /// unknown color scheme.
+    fn effectColorScheme(handler: *Stream.Handler) ?ColorScheme {
+        const self = fromHandler(handler);
+        const bg = self.term_bg orelse return null;
+        return if (bg.isDark()) .dark else .light;
     }
 
     fn effectSize(handler: *Stream.Handler) ?vt.size_report.Size {
@@ -195,6 +225,52 @@ pub const Window = struct {
     pub fn writeInput(self: *Window, bytes: []const u8) !void {
         if (self.pty_fd < 0) return error.WindowDead;
         try protocol.writeAll(self.pty_fd, bytes);
+    }
+
+    /// Copy `input` to `writer` with OSC 11 background queries removed,
+    /// answering each one. The query is answered with the background a
+    /// client reported; until one is known the query is recorded and
+    /// answered later by `setBackground`. Removing the query keeps it
+    /// from also reaching an attached client's real terminal, which
+    /// would answer it a second time.
+    pub fn filterColorQueries(
+        self: *Window,
+        input: []const u8,
+        writer: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        const result = try self.color_filter.feed(input, writer);
+        for (0..result.background_queries) |_| self.answerBackgroundQuery();
+    }
+
+    fn answerBackgroundQuery(self: *Window) void {
+        const bg = self.term_bg orelse {
+            self.bg_query_pending = true;
+            return;
+        };
+        self.writeBackgroundReply(bg);
+    }
+
+    /// Record the real terminal's background color and answer any query
+    /// that arrived before it was known.
+    pub fn setBackground(self: *Window, bg: protocol.RgbPayload) void {
+        self.term_bg = bg;
+        if (self.bg_query_pending) {
+            self.bg_query_pending = false;
+            self.writeBackgroundReply(bg);
+        }
+    }
+
+    fn writeBackgroundReply(self: *Window, bg: protocol.RgbPayload) void {
+        if (self.pty_fd < 0) return;
+        var buf: [40]u8 = undefined;
+        const reply = std.fmt.bufPrint(
+            &buf,
+            "\x1b]11;rgb:{x:0>4}/{x:0>4}/{x:0>4}\x07",
+            .{ bg.r, bg.g, bg.b },
+        ) catch return;
+        protocol.writeAll(self.pty_fd, reply) catch |err| {
+            log.warn("window: failed writing OSC 11 reply: {}", .{err});
+        };
     }
 
     pub fn resize(self: *Window, rows: u16, cols: u16) !void {
@@ -586,4 +662,87 @@ test "title set via OSC is tracked and emitted sanitized" {
     writer = std.Io.Writer.fixed(&buf);
     try writeTitle("a\x1b\x07b\x7f!", &writer);
     try std.testing.expectEqualStrings("\x1b]2;ab!\x07", writer.buffered());
+}
+
+/// Build a childless window whose PTY master is the write end of a pipe,
+/// so a test can read back whatever the window writes to the child.
+fn testWindowWithPipe(alloc: std.mem.Allocator, read_fd: *posix.fd_t) !Window {
+    const fds = try posix.pipe();
+    read_fd.* = fds[0];
+    return .{
+        .alloc = alloc,
+        .pty_fd = fds[1],
+        .child_pid = -1,
+        .command_title = "test",
+        .last_output_ms = 0,
+        .term = try vt.Terminal.init(alloc, .{ .cols = 20, .rows = 5 }),
+        .stream = undefined,
+    };
+}
+
+test "OSC 11 background query is answered from the reported background" {
+    const alloc = std.testing.allocator;
+    var read_fd: posix.fd_t = undefined;
+    var win = try testWindowWithPipe(alloc, &read_fd);
+    defer posix.close(read_fd);
+    defer posix.close(win.pty_fd);
+    defer win.term.deinit(alloc);
+
+    // A query before any background is known is deferred, not dropped.
+    var sink: [16]u8 = undefined;
+    var w = std.Io.Writer.fixed(&sink);
+    try win.filterColorQueries("\x1b]11;?\x07", &w);
+    try std.testing.expectEqualStrings("", w.buffered()); // query stripped
+    try std.testing.expect(win.bg_query_pending);
+
+    // Learning the background answers the pending query.
+    win.setBackground(.{ .r = 0xffff, .g = 0xffff, .b = 0xffff });
+    try std.testing.expect(!win.bg_query_pending);
+    var buf: [64]u8 = undefined;
+    const n = try posix.read(read_fd, &buf);
+    try std.testing.expectEqualStrings("\x1b]11;rgb:ffff/ffff/ffff\x07", buf[0..n]);
+
+    // A later query is answered immediately, now that the color is known.
+    w = std.Io.Writer.fixed(&sink);
+    try win.filterColorQueries("\x1b]11;?\x07", &w);
+    const n2 = try posix.read(read_fd, &buf);
+    try std.testing.expectEqualStrings("\x1b]11;rgb:ffff/ffff/ffff\x07", buf[0..n2]);
+}
+
+test "color-scheme DSR answered from background luminance" {
+    const alloc = std.testing.allocator;
+    var read_fd: posix.fd_t = undefined;
+    var win = try testWindowWithPipe(alloc, &read_fd);
+    defer posix.close(read_fd);
+    defer posix.close(win.pty_fd);
+    defer win.term.deinit(alloc);
+
+    // Wire the real handler so CSI ? 996 n routes through effectColorScheme.
+    var handler: Window.Stream.Handler = .init(&win.term);
+    handler.effects = .{
+        .write_pty = Window.effectWritePty,
+        .bell = null,
+        .color_scheme = Window.effectColorScheme,
+        .device_attributes = null,
+        .enquiry = null,
+        .size = null,
+        .title_changed = null,
+        .pwd_changed = null,
+        .xtversion = null,
+    };
+    win.stream = .initAlloc(alloc, handler);
+    defer win.stream.deinit();
+
+    // A light background reports color scheme 2 (light).
+    win.setBackground(.{ .r = 0xffff, .g = 0xffff, .b = 0xffff });
+    win.feed("\x1b[?996n");
+    var buf: [32]u8 = undefined;
+    const n = try posix.read(read_fd, &buf);
+    try std.testing.expectEqualStrings("\x1b[?997;2n", buf[0..n]);
+
+    // A dark background reports color scheme 1 (dark).
+    win.setBackground(.{ .r = 0x1e1e, .g = 0x1e1e, .b = 0x2222 });
+    win.feed("\x1b[?996n");
+    const n2 = try posix.read(read_fd, &buf);
+    try std.testing.expectEqualStrings("\x1b[?997;1n", buf[0..n2]);
 }
