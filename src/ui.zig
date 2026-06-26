@@ -25,6 +25,7 @@ const vt = @import("ghostty-vt");
 
 const client = @import("client.zig");
 const keys = @import("keys.zig");
+const osc52 = @import("osc52.zig");
 const paths = @import("paths.zig");
 const protocol = @import("protocol.zig");
 const ptypkg = @import("pty.zig");
@@ -668,6 +669,15 @@ pub const InputParser = struct {
 
 // -- Focused session view ----------------------------------------------------
 
+/// Sink for `osc52.Filter`: writes a forwarded clipboard sequence to
+/// the real terminal (fd 1), the same destination as the ui's own
+/// selection copy.
+const ClipboardSink = struct {
+    pub fn clipboard(_: ClipboardSink, seq: []const u8) void {
+        protocol.writeAll(1, seq) catch {};
+    }
+};
+
 /// The attach connection and local terminal state of the focused
 /// session. Heap-allocated and pinned: the stream handler keeps a
 /// pointer to `term`, and effects callbacks recover the View with
@@ -688,6 +698,10 @@ pub const View = struct {
     /// `.screen` messages. Decides whether a wheel over the viewport
     /// pages local scrollback or sends arrow keys.
     app_alt: bool = false,
+    /// Recovers application clipboard writes (OSC 52) from the output
+    /// stream so a copy inside the session reaches the real terminal
+    /// (see osc52.zig and feedOutput).
+    clip: osc52.Filter = .{},
 
     pub const State = enum { live, ended, stolen, lost };
     pub const Stream = vt.TerminalStream;
@@ -767,6 +781,7 @@ pub const View = struct {
         self.stream.deinit();
         self.term.deinit(self.alloc);
         self.decoder.deinit();
+        self.clip.deinit(self.alloc);
         self.alloc.destroy(self);
     }
 
@@ -826,6 +841,12 @@ pub const View = struct {
     }
 
     pub fn feedOutput(self: *View, bytes: []const u8) void {
+        // The view-canvas stream below parses OSC 52 but has no
+        // clipboard effect, so an application's own clipboard write
+        // would be dropped. Forward it to the real terminal first, the
+        // same path the ui's selection copy uses, so a copy inside a
+        // session reaches the user's clipboard over SSH.
+        self.clip.feed(self.alloc, bytes, ClipboardSink{}) catch {};
         self.stream.nextSlice(bytes);
     }
 

@@ -1624,6 +1624,34 @@ test "ui: dragging in the viewport selects text and copies it via osc 52" {
     try ui.waitFor("copied");
 }
 
+test "ui: an application's own OSC 52 clipboard write reaches the real terminal" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // boo ui renders sessions from terminal state rather than passing
+    // bytes through, and the view-canvas has no clipboard effect, so an
+    // application's own OSC 52 clipboard write is parsed and dropped
+    // unless the ui forwards it to the real terminal.
+    try h.startDetached("clip", &.{"sh"});
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("clip");
+
+    // Confirm the session is focused and rendering before the copy.
+    try h.sendLine("clip", "printf 'CLIPREADY\\n'");
+    try ui.waitFor("CLIPREADY");
+    ui.clearOutput();
+
+    // The application copies "HELLO" to the clipboard via OSC 52. The
+    // sequence must reach the ui's real terminal verbatim. The echoed
+    // command line carries the literal text "\\033]52..." (a backslash,
+    // not a real ESC), so only the forwarded sequence matches the wait.
+    try h.sendLine("clip", "printf '\\033]52;c;SEVMTE8=\\007'");
+    try ui.waitFor("\x1b]52;c;SEVMTE8=\x07");
+}
+
 test "ui: mouse events forward natively when the application asks for them" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
