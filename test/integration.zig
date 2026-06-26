@@ -1210,6 +1210,78 @@ test "ui: a session that rang the bell is marked your turn" {
     try ui.waitFor("\u{25CF}");
 }
 
+test "inspect: shows detailed fields for a session" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("work", &.{"cat"});
+
+    const res = try h.run(&.{ "inspect", "work" });
+    defer alloc.free(res.stdout);
+    defer alloc.free(res.stderr);
+    try std.testing.expect(res.term == .Exited and res.term.Exited == 0);
+
+    // The detailed view names the session, its command, its working
+    // directory (absolute), and the screen mode a plain 'cat' is in.
+    try std.testing.expect(std.mem.indexOf(u8, res.stdout, "work") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.stdout, "cat") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.stdout, "detached") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.stdout, "primary") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.stdout, "/") != null);
+}
+
+test "inspect: --json emits the session's fields" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("js", &.{"cat"});
+
+    const res = try h.run(&.{ "inspect", "js", "--json" });
+    defer alloc.free(res.stdout);
+    defer alloc.free(res.stderr);
+    try std.testing.expect(res.term == .Exited and res.term.Exited == 0);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, res.stdout, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("js", obj.get("name").?.string);
+    try std.testing.expectEqual(false, obj.get("attached").?.bool);
+    try std.testing.expectEqual(@as(i64, 0), obj.get("clients").?.integer);
+    try std.testing.expect(obj.get("pid").?.integer > 0);
+    try std.testing.expectEqual(@as(i64, 24), obj.get("rows").?.integer);
+    try std.testing.expectEqual(@as(i64, 80), obj.get("cols").?.integer);
+    try std.testing.expectEqualStrings("cat", obj.get("command").?.string);
+    try std.testing.expectEqualStrings("primary", obj.get("screen").?.string);
+    try std.testing.expect(obj.get("idle_ms").?.integer >= 0);
+    try std.testing.expect(obj.get("out_idle_ms").?.integer >= 0);
+    try std.testing.expect(std.mem.startsWith(u8, obj.get("cwd").?.string, "/"));
+    try std.testing.expectEqualStrings("cat", obj.get("title").?.string);
+}
+
+test "inspect: unknown session exits 3" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.runExit(&.{ "inspect", "ghost" }, 3);
+}
+
+test "inspect: resolves a unique prefix" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("alpha", &.{"cat"});
+
+    const res = try h.run(&.{ "inspect", "al" });
+    defer alloc.free(res.stdout);
+    defer alloc.free(res.stderr);
+    try std.testing.expect(res.term == .Exited and res.term.Exited == 0);
+    try std.testing.expect(std.mem.indexOf(u8, res.stdout, "alpha") != null);
+}
+
 test "peek --json includes geometry, cursor, and screen content" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);

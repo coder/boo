@@ -67,6 +67,7 @@ pub fn main() !void {
     if (eql(cmd, "attach") or eql(cmd, "at") or eql(cmd, "a")) return cmdAttach(alloc, rest);
     if (eql(cmd, "ui") or eql(cmd, "i")) return cmdUi(alloc, rest);
     if (eql(cmd, "ls") or eql(cmd, "list")) return cmdLs(alloc, rest);
+    if (eql(cmd, "inspect")) return cmdInspect(alloc, rest);
     if (eql(cmd, "send")) return cmdSend(alloc, rest);
     if (eql(cmd, "peek")) return cmdPeek(alloc, rest);
     if (eql(cmd, "wait")) return cmdWait(alloc, rest);
@@ -501,6 +502,113 @@ fn cmdLs(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
         defer alloc.free(line);
         try out.appendSlice(alloc, line);
     }
+    try stdoutWrite(out.items);
+}
+
+fn cmdInspect(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
+    var json = false;
+    var name_arg: ?[]const u8 = null;
+    for (args) |arg| {
+        if (isHelpFlag(arg)) return printHelpPage("inspect");
+        if (std.mem.eql(u8, arg, "--json")) {
+            json = true;
+        } else if (arg.len > 0 and arg[0] == '-') {
+            usageFail("inspect", "unknown flag '{s}'", .{arg});
+        } else if (name_arg == null) {
+            name_arg = arg;
+        } else {
+            usageFail("inspect", "unexpected argument '{s}'", .{arg});
+        }
+    }
+    const want = name_arg orelse usageFail("inspect", "usage: boo inspect <name> [--json]", .{});
+
+    const dir = try paths.socketDir(alloc);
+    defer alloc.free(dir);
+    const name = try resolveSession(alloc, dir, want);
+    defer alloc.free(name);
+
+    const result = try mustControl(alloc, dir, name, &.{"inspect"});
+    defer alloc.free(result.text);
+    if (!result.ok) fail(exit_runtime, "inspect failed: {s}", .{result.text});
+
+    const sock = try paths.socketPath(alloc, dir, name);
+    defer alloc.free(sock);
+
+    if (json) {
+        try inspectJson(alloc, result.text, sock);
+    } else {
+        try inspectHuman(alloc, result.text, sock);
+    }
+}
+
+/// Look up a value in the daemon's key<TAB>value-per-line inspect
+/// payload. Each line is split on its first tab only, so a value may
+/// itself contain spaces or tabs. Returns "" when the key is absent.
+fn inspectField(text: []const u8, key: []const u8) []const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const tab = std.mem.indexOfScalar(u8, line, '\t') orelse continue;
+        if (std.mem.eql(u8, line[0..tab], key)) return line[tab + 1 ..];
+    }
+    return "";
+}
+
+fn inspectHuman(alloc: std.mem.Allocator, text: []const u8, sock: []const u8) !void {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    const state: []const u8 = if (std.mem.eql(u8, inspectField(text, "state"), "Attached"))
+        "attached"
+    else
+        "detached";
+    const idle_ms = std.fmt.parseInt(i64, inspectField(text, "idle_ms"), 10) catch 0;
+    const out_idle_ms = std.fmt.parseInt(i64, inspectField(text, "out_idle_ms"), 10) catch 0;
+    var ibuf: [32]u8 = undefined;
+    var obuf: [32]u8 = undefined;
+
+    try out.print(alloc, "Session:     {s}\n", .{inspectField(text, "name")});
+    try out.print(alloc, "State:       {s}\n", .{state});
+    try out.print(alloc, "Clients:     {s}\n", .{inspectField(text, "clients")});
+    try out.print(alloc, "PID:         {s}\n", .{inspectField(text, "pid")});
+    try out.print(alloc, "Command:     {s}\n", .{inspectField(text, "command")});
+    try out.print(alloc, "Directory:   {s}\n", .{inspectField(text, "cwd")});
+    try out.print(alloc, "Size:        {s}x{s}\n", .{ inspectField(text, "rows"), inspectField(text, "cols") });
+    try out.print(alloc, "Idle:        {s} (output {s})\n", .{ fmtIdle(&ibuf, idle_ms), fmtIdle(&obuf, out_idle_ms) });
+    try out.print(alloc, "Screen:      {s}\n", .{inspectField(text, "screen")});
+    try out.print(alloc, "Title:       {s}\n", .{inspectField(text, "title")});
+    try out.print(alloc, "Socket:      {s}\n", .{sock});
+    try stdoutWrite(out.items);
+}
+
+fn inspectJson(alloc: std.mem.Allocator, text: []const u8, sock: []const u8) !void {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    const attached = std.mem.eql(u8, inspectField(text, "state"), "Attached");
+    const clients = std.fmt.parseInt(i64, inspectField(text, "clients"), 10) catch 0;
+    const pid = std.fmt.parseInt(i64, inspectField(text, "pid"), 10) catch 0;
+    const rows = std.fmt.parseInt(i64, inspectField(text, "rows"), 10) catch 0;
+    const cols = std.fmt.parseInt(i64, inspectField(text, "cols"), 10) catch 0;
+    const idle_ms = std.fmt.parseInt(i64, inspectField(text, "idle_ms"), 10) catch 0;
+    const out_idle_ms = std.fmt.parseInt(i64, inspectField(text, "out_idle_ms"), 10) catch 0;
+
+    try out.appendSlice(alloc, "{\"name\":");
+    try appendJsonString(alloc, &out, inspectField(text, "name"));
+    const head = try std.fmt.allocPrint(alloc, ",\"attached\":{},\"clients\":{d},\"pid\":{d},\"command\":", .{ attached, clients, pid });
+    defer alloc.free(head);
+    try out.appendSlice(alloc, head);
+    try appendJsonString(alloc, &out, inspectField(text, "command"));
+    try out.appendSlice(alloc, ",\"cwd\":");
+    try appendJsonString(alloc, &out, inspectField(text, "cwd"));
+    const mid = try std.fmt.allocPrint(alloc, ",\"rows\":{d},\"cols\":{d},\"idle_ms\":{d},\"out_idle_ms\":{d},\"screen\":", .{ rows, cols, idle_ms, out_idle_ms });
+    defer alloc.free(mid);
+    try out.appendSlice(alloc, mid);
+    try appendJsonString(alloc, &out, inspectField(text, "screen"));
+    try out.appendSlice(alloc, ",\"title\":");
+    try appendJsonString(alloc, &out, inspectField(text, "title"));
+    try out.appendSlice(alloc, ",\"socket\":");
+    try appendJsonString(alloc, &out, sock);
+    try out.appendSlice(alloc, "}\n");
     try stdoutWrite(out.items);
 }
 

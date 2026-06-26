@@ -565,6 +565,66 @@ pub const Daemon = struct {
                 }
             }
             conn.send(.ok, out.items);
+        } else if (std.mem.eql(u8, cmd, "inspect")) {
+            // A richer report than `info`, for `boo inspect`: one
+            // key<TAB>value per line. The client splits each line on its
+            // first tab only, so cwd, command, and title values may
+            // themselves contain spaces.
+            var clients: usize = 0;
+            for (self.conns.items) |c| {
+                if (c.attached and !c.closed) clients += 1;
+            }
+            const w = self.liveWindow();
+            const idle: i64 = @max(0, now - self.last_activity_ms);
+            const out_idle: i64 = if (w) |lw| @max(0, now - lw.last_output_ms) else 0;
+            const pid: posix.pid_t = if (w) |lw| lw.child_pid else 0;
+            const screen: []const u8 = if (w) |lw|
+                (if (lw.onAltScreen()) "alt" else "primary")
+            else
+                "primary";
+
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(self.alloc);
+            try out.print(self.alloc, "name\t{s}\n", .{self.owned_name orelse self.opts.name});
+            try out.print(self.alloc, "state\t{s}\n", .{if (clients > 0) "Attached" else "Detached"});
+            try out.print(self.alloc, "clients\t{d}\n", .{clients});
+            try out.print(self.alloc, "pid\t{d}\n", .{pid});
+
+            // command: the requested argv, or the resolved shell for a
+            // session started with no command.
+            try out.appendSlice(self.alloc, "command\t");
+            if (self.opts.argv.len > 0) {
+                for (self.opts.argv, 0..) |a, i| {
+                    if (i > 0) try out.append(self.alloc, ' ');
+                    try out.appendSlice(self.alloc, a);
+                }
+            } else if (w) |lw| {
+                try out.appendSlice(self.alloc, lw.command_title);
+            }
+            try out.append(self.alloc, '\n');
+
+            try out.appendSlice(self.alloc, "cwd\t");
+            if (w) |lw| {
+                var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+                if (cwd.ofPid(&cwd_buf, lw.child_pid)) |d| try out.appendSlice(self.alloc, d);
+            }
+            try out.append(self.alloc, '\n');
+
+            try out.print(self.alloc, "rows\t{d}\n", .{self.rows});
+            try out.print(self.alloc, "cols\t{d}\n", .{self.cols});
+            try out.print(self.alloc, "idle_ms\t{d}\n", .{idle});
+            try out.print(self.alloc, "out_idle_ms\t{d}\n", .{out_idle});
+            try out.print(self.alloc, "screen\t{s}\n", .{screen});
+
+            // title last; sanitized, so it carries no tabs or newlines.
+            try out.appendSlice(self.alloc, "title\t");
+            if (w) |lw| {
+                for (lw.title()) |byte| {
+                    if (byte < 0x20 or byte == 0x7f) continue;
+                    try out.append(self.alloc, byte);
+                }
+            }
+            conn.send(.ok, out.items);
         } else if (std.mem.eql(u8, cmd, "cwd")) {
             // Report the session command's current working directory so
             // a new session created from `boo ui` can be born there.
