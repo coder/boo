@@ -70,8 +70,14 @@ pub const Filter = struct {
             var advance = true;
 
             if (self.buf.items.len == 0) {
-                // Ground: only ESC can begin a candidate.
-                if (byte == 0x1b) try self.buf.append(alloc, byte);
+                // Ground: only ESC can begin a candidate. Skip the run
+                // of non-ESC bytes to the next ESC in one vectorized pass.
+                if (byte != 0x1b) {
+                    const rel = std.mem.indexOfScalar(u8, input[i..], 0x1b) orelse input.len - i;
+                    i += rel;
+                    continue;
+                }
+                try self.buf.append(alloc, byte);
             } else if (self.buf.items.len < prefix.len) {
                 // Matching the fixed prefix one byte at a time.
                 if (byte == prefix[self.buf.items.len]) {
@@ -101,13 +107,27 @@ pub const Filter = struct {
                 try self.buf.append(alloc, byte);
                 self.emit(sink);
                 self.reset();
-            } else if (self.buf.items.len >= max_seq) {
-                // Oversized: drop it (see max_seq).
-                self.reset();
-                advance = false;
             } else {
-                try self.buf.append(alloc, byte);
-                if (byte == 0x1b) self.esc_pending = true;
+                // Body: base64 data up to a BEL or ST terminator. Neither
+                // terminator byte occurs in base64, so accumulate the
+                // whole run in one copy instead of byte by byte.
+                const rest = input[i..];
+                const run = std.mem.indexOfAny(u8, rest, &[_]u8{ 0x07, 0x1b }) orelse rest.len;
+                if (run == 0) {
+                    // The byte is ESC (BEL is handled above); it may open ST.
+                    try self.buf.append(alloc, byte);
+                    self.esc_pending = true;
+                } else if (self.buf.items.len + run > max_seq) {
+                    // Oversized: drop it. The skipped tail is base64 plus
+                    // a terminator, never a new OSC 52 prefix (see max_seq).
+                    self.reset();
+                    i += run;
+                    continue;
+                } else {
+                    try self.buf.appendSlice(alloc, rest[0..run]);
+                    i += run;
+                    continue;
+                }
             }
 
             if (advance) i += 1;

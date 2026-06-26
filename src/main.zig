@@ -1130,6 +1130,7 @@ test {
     _ = @import("pty.zig");
     _ = @import("altscreen.zig");
     _ = @import("oscquery.zig");
+    _ = @import("osc52.zig");
     _ = @import("window.zig");
     _ = @import("daemon.zig");
     _ = @import("client.zig");
